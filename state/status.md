@@ -23,8 +23,9 @@ _Last updated: 2026-07-21 (remote session)_
 
 ## Open decisions
 
-- **Model provider keys** — report ready for review:
-  [`docs/model-shortlist.md`](../docs/model-shortlist.md) /
+- **Model provider keys + budget** — reports ready for review:
+  [`docs/model-shortlist.md`](../docs/model-shortlist.md) +
+  [`docs/cost-model.md`](../docs/cost-model.md) /
   [`outbox/0001-model-key-request.md`](outbox/0001-model-key-request.md).
-  (Suggested: Anthropic + Google now, OpenAI soon.) Does not block M0.
+  (Suggested: Anthropic + Google now, OpenAI soon; start ~$200–300/mo.) Does not block M0.
 - WhatsApp provisioning (Cloud API vs Twilio) + tunnel (cloudflared / tailscale).

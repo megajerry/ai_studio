@@ -5,6 +5,9 @@ trade-offs, so the studio's model router ([ADR-0005](decisions/0005-model-regist
 has good options mapped to roles. **This is a request for your review** — pick the
 providers you want; I'll seed the registry from your choices.
 
+> **For the economics** (ballpark $/month, cost drivers, and levers), see the
+> companion [cost & ROI model](cost-model.md).
+
 > **Snapshot: 2026-07-21.** The frontier reprices and reshuffles roughly monthly
 > (four frontier releases landed in the six weeks before this snapshot). Treat all
 > numbers as approximate and verify on each provider's official pricing page
