@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# AI Studio — one-command bootstrap for the host Mac.
+# Brings up the M0 infra spine and verifies it. Idempotent.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+# 1. Container runtime present?
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker is not available/running. See PREREQS.md (Docker Desktop / OrbStack / colima)." >&2
+  exit 1
+fi
+if docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi
+
+# 2. Secrets/config present?
+if [[ ! -f .env ]]; then
+  echo "No .env found. Run onboarding first:  ./scripts/onboarding.sh" >&2
+  echo "(It creates a git-ignored .env with the required passwords.)" >&2
+  exit 1
+fi
+# shellcheck disable=SC1091
+set -a; source .env 2>/dev/null || true; set +a
+missing=()
+[[ -z "${POSTGRES_PASSWORD:-}" ]] && missing+=("POSTGRES_PASSWORD")
+[[ -z "${MINIO_ROOT_PASSWORD:-}" ]] && missing+=("MINIO_ROOT_PASSWORD")
+if (( ${#missing[@]} )); then
+  echo "Missing required secrets in .env: ${missing[*]}" >&2
+  echo "Run: ./scripts/onboarding.sh" >&2
+  exit 1
+fi
+
+# 3. Up.
+echo "Starting AI Studio infra (Layer 0)…"
+$DC up -d
+
+# 4. Verify.
+exec "$REPO_ROOT/scripts/healthcheck.sh"
