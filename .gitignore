@@ -12,6 +12,11 @@ secrets.env
 config.local.*
 .ai_studio/
 
+# Runtime inbound messages captured by the Spokesman may contain personal info
+# (sender numbers, message bodies) — keep them out of git (ADR-0011).
+state/inbox/whatsapp-inbound.jsonl
+state/inbox/whatsapp-*.jsonl
+
 # --- Python ---
 __pycache__/
 *.py[cod]

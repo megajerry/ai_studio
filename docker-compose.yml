@@ -112,6 +112,39 @@ services:
       timeout: 5s
       retries: 5
 
+  # WhatsApp Spokesman — stakeholder channel (ADR-0006). Opt-in only: it starts
+  # solely with `docker compose --profile spokesman up`, so the M0 spine is
+  # unaffected by a plain `docker compose up`. Config/secrets come from .env.
+  spokesman:
+    profiles: ["spokesman"]
+    build:
+      context: .
+      dockerfile: spokesman/Dockerfile
+    restart: unless-stopped
+    environment:
+      SPOKESMAN_PORT: ${SPOKESMAN_PORT:-8080}
+      SPOKESMAN_DRY_RUN: ${SPOKESMAN_DRY_RUN:-0}
+      GRAPH_API_BASE: ${GRAPH_API_BASE:-https://graph.facebook.com}
+      GRAPH_API_VERSION: ${GRAPH_API_VERSION:-v21.0}
+      AI_STUDIO_STATE_DIR: /app/state
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_BUSINESS_ACCOUNT_ID: ${WHATSAPP_BUSINESS_ACCOUNT_ID:-}
+      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
+      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
+      STAKEHOLDER_WHATSAPP_NUMBER: ${STAKEHOLDER_WHATSAPP_NUMBER:-}
+    ports:
+      - "${SPOKESMAN_PORT:-8080}:${SPOKESMAN_PORT:-8080}"
+    volumes:
+      # Inbound messages / status summaries integrate with the git state tree
+      # (ADR-0007). The runtime inbound log is git-ignored.
+      - ./state:/app/state
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,os; urllib.request.urlopen('http://localhost:'+os.environ.get('SPOKESMAN_PORT','8080')+'/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_data:
   redis_data:
