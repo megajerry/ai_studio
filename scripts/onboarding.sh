@@ -75,8 +75,10 @@ echo "== Local infra credentials (auto-generated if blank) =="
 prompt_var POSTGRES_PASSWORD  "Postgres password"  genpass
 prompt_var MINIO_ROOT_USER    "MinIO root user"    plain
 prompt_var MINIO_ROOT_PASSWORD "MinIO root password" genpass
+prompt_var GRAFANA_ADMIN_PASSWORD "Grafana admin password" genpass
 
 VAL[AI_STUDIO_ENV]="${AI_STUDIO_ENV:-dev}"
+VAL[MINIO_ROOT_USER]="${VAL[MINIO_ROOT_USER]:-aistudio}"
 
 # Write atomically with tight permissions.
 TMP="$(mktemp)"
@@ -88,7 +90,7 @@ TMP="$(mktemp)"
            WHATSAPP_PHONE_NUMBER_ID WHATSAPP_BUSINESS_ACCOUNT_ID WHATSAPP_ACCESS_TOKEN \
            WHATSAPP_APP_SECRET WHATSAPP_VERIFY_TOKEN STAKEHOLDER_WHATSAPP_NUMBER \
            TUNNEL_PROVIDER CLOUDFLARED_TUNNEL_TOKEN \
-           POSTGRES_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD; do
+           POSTGRES_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD GRAFANA_ADMIN_PASSWORD; do
     printf '%s=%s\n' "$k" "${VAL[$k]:-}"
   done
 } > "$TMP"

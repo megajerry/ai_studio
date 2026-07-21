@@ -131,7 +131,15 @@ is next.
 
 ## Getting started
 
-Nothing to run yet. Phase 1 will be a single `docker compose up` on the target
-Mac. This repo is developed from a remote session; the target host is a separate
-machine, so `state/` (git) is the cross-machine substrate until the host is live
-(see [`state/README.md`](state/README.md)).
+On the target Mac (see [`PREREQS.md`](PREREQS.md)):
+
+```bash
+git clone <repo> && cd ai_studio
+./scripts/onboarding.sh     # collect secrets/config into a git-ignored .env
+./bootstrap                 # start the M0 infra spine + health check (or: make up)
+```
+
+M0 (the infra spine) is implemented; the supervisor, agent runtime, and Spokesman
+arrive in later milestones. This repo is developed from a remote session; the
+target host is a separate machine, so `state/` (git) is the cross-machine
+substrate until the host is live (see [`state/README.md`](state/README.md)).

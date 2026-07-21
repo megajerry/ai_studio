@@ -10,14 +10,16 @@ _Last updated: 2026-07-21 (remote session)_
 
 | Workstream | Status | Notes |
 | --- | --- | --- |
-| Productivity (this repo) | 🟡 bootstrapping | Architecture + ADRs written; M0 infra spine not yet built. |
+| Productivity (this repo) | 🟡 bootstrapping | Architecture + ADRs written; onboarding flow + **M0 infra spine implemented** (docker-compose + bootstrap + health check) — **pending verification on the host** (not runnable from the remote session). |
 
 ## Next up
 
-- **Genesis task for the host agent:** [`inbox/0001-genesis.md`](inbox/0001-genesis.md).
-- M0 — infra spine only (Docker Compose: Postgres, Redis, Qdrant, MinIO, OTel,
-  Prometheus, Grafana) so a fresh clone on the host can bootstrap. The supervisor
-  + scheduler are a later milestone (they need the event/task model first).
+- **Genesis task for the host agent:** [`inbox/0001-genesis.md`](inbox/0001-genesis.md)
+  — run `./scripts/onboarding.sh` then `./bootstrap` to verify M0 on the host.
+- **Spokesman / WhatsApp channel** (stakeholder priority) — blocked on WhatsApp
+  Business provisioning (needs stakeholder credentials + a public tunnel).
+- M1 — event log / task queue (Postgres schema), then M2 (policy + tools),
+  M3 (supervisor + scheduler + first on-demand role agent end-to-end).
 
 ## Open decisions
 

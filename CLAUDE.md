@@ -85,8 +85,15 @@ on the target machine can bootstrap and run it.
 
 ## Local dev
 
-Phase 1 target is a single `docker compose up` on the Mac. Commands will be
-documented here as they land. Until then, there is no build/test/run command.
+Phase 1 target is a single `docker compose up` on the Mac. **M0 (infra spine) is
+implemented:**
+
+- `./scripts/onboarding.sh` — collect secrets/config into git-ignored `.env`.
+- `./bootstrap` (or `make up`) — start the infra spine + run the health check.
+- `make ps | logs | health | down | clean` — day-to-day ops.
+
+M0 must be verified on the host (it can't run from the remote session). Later
+milestones (supervisor, scheduler, runtime, Spokesman) add their own commands.
 
 ## Conventions
 
