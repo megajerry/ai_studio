@@ -1,0 +1,48 @@
+# --- Secrets & local config ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Node (for any dashboards / MCP servers in JS) ---
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+.next/
+dist-ssr/
+
+# --- Docker / data volumes (local-first source of truth lives outside git) ---
+data/
+volumes/
+*.sqlite
+*.db
+
+# --- Observability / logs ---
+logs/
+*.log
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
