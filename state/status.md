@@ -16,8 +16,11 @@ _Last updated: 2026-07-21 (remote session)_
 
 - **Genesis task for the host agent:** [`inbox/0001-genesis.md`](inbox/0001-genesis.md)
   — run `./scripts/onboarding.sh` then `./bootstrap` to verify M0 on the host.
-- **Spokesman / WhatsApp channel** (stakeholder priority) — blocked on WhatsApp
-  Business provisioning (needs stakeholder credentials + a public tunnel).
+- **Spokesman / WhatsApp channel** — **v1 built** (containerized FastAPI:
+  signature-verified webhook, alarm/approve/inform routing + digest, inbox/status
+  state integration; runs in dry-run with no creds). See
+  [`docs/spokesman-whatsapp.md`](../docs/spokesman-whatsapp.md). Remaining: WhatsApp
+  Business provisioning (stakeholder credentials + a public tunnel) + host verify.
 - M1 — event log / task queue (Postgres schema), then M2 (policy + tools),
   M3 (supervisor + scheduler + first on-demand role agent end-to-end).
 
