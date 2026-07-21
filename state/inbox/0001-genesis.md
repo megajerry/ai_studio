@@ -15,9 +15,10 @@ doing anything, read, in order:
 
 ## Your first task: build M0 (the infra spine)
 
-Layers 0–1 of the bootstrap sequence do not exist yet. There is no runtime to
-spawn agents *from* until you build it. So the genesis task is to **implement
-M0**, following the lifecycle in `CONTRIBUTING.md`:
+None of the bootstrap sequence is built yet, and there is no runtime to spawn
+agents *from* until you build it. **M0 is Layer 0 only — the infra spine** (the
+supervisor/scheduler come in a later milestone). So the genesis task is to
+**implement M0**, following the lifecycle in `CONTRIBUTING.md`:
 
 - Branch `infra/compose` (agent-identity `infra`, task `compose`).
 - Deliver: `docker-compose.yml` (Postgres + heartbeats, Redis, Qdrant, MinIO,

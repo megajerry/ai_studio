@@ -8,8 +8,9 @@
 We want roles and reusable workflows packaged as portable, reviewable units, not
 as ad-hoc prompt strings ("skills, not prompts"). "Agent Skills" — a `SKILL.md`
 (YAML frontmatter + instructions + optional scripts/templates) loaded on demand —
-originated at Anthropic, was released as an **open standard**, and is now adopted
-across Claude Code, opencode, Codex, Gemini CLI, and Cursor. Curated libraries
+originated at Anthropic, was released as an **open standard**, and is being adopted
+by a growing set of agent tools (e.g. Claude Code, opencode, Codex, Gemini CLI,
+Cursor — verify current per-tool support before relying on it). Curated libraries
 exist (`anthropics/skills`, `VoltAgent/awesome-agent-skills`), including a PM
 suite to study (`alirezarezvani/claude-skills`).
 

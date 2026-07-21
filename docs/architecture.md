@@ -101,6 +101,13 @@ Task Created → Queue → PM (confidence gate) → Executor(s) via Tools
 
 No role mutates state directly; changes flow through **verify → commit**.
 
+**Lifecycle & genesis.** Only a few processes are always-on singletons (infra, the
+supervisor, a scheduler, the PM pulse, the Spokesman); every role agent is spawned
+**on-demand per task** and torn down after — "spawn an agent" means "enqueue a
+task." How the host cold-starts and brings the studio up is specified in
+[ADR-0009](decisions/0009-agent-lifecycle-and-genesis.md) and the runbook
+[`bootstrap-sequence.md`](bootstrap-sequence.md).
+
 ## 5. Tool layer & permissions
 
 Agents can never `rm -rf` or shell out. They may **only invoke tools**

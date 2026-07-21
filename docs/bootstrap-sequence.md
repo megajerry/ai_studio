@@ -5,9 +5,13 @@ human) follows on a fresh clone of this repo on the target Mac. It answers "how 
 all the agents get spawned?" — see [ADR-0009](decisions/0009-agent-lifecycle-and-genesis.md)
 for the lifecycle model.
 
-> **Status:** target sequence. Layers 0–1 are not built yet (that is **M0**, the
-> next milestone). Until then, the *first* genesis task is literally "build M0" —
-> see [`../state/inbox/0001-genesis.md`](../state/inbox/0001-genesis.md).
+> **Status:** target sequence. None of this is built yet, and the milestones do
+> **not** map one-to-one onto the layers below. **M0** (the next milestone)
+> delivers **Layer 0 only** — the infra spine. **Layer 1** (supervisor +
+> scheduler) and **Layers 2–3** (PM pulse + on-demand roles) land in later
+> milestones (M1–M3), because the supervisor needs the event/task model first.
+> The *first* genesis task is "build M0" — see
+> [`../state/inbox/0001-genesis.md`](../state/inbox/0001-genesis.md).
 
 ## The mental model
 

@@ -15,8 +15,9 @@ _Last updated: 2026-07-21 (remote session)_
 ## Next up
 
 - **Genesis task for the host agent:** [`inbox/0001-genesis.md`](inbox/0001-genesis.md).
-- M0 — infra spine (Docker Compose: Postgres, Redis, Qdrant, scheduler,
-  supervisor, observability) so a fresh clone on the host can bootstrap.
+- M0 — infra spine only (Docker Compose: Postgres, Redis, Qdrant, MinIO, OTel,
+  Prometheus, Grafana) so a fresh clone on the host can bootstrap. The supervisor
+  + scheduler are a later milestone (they need the event/task model first).
 
 ## Open decisions
 
