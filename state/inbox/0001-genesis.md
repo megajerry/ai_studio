@@ -12,6 +12,15 @@ doing anything, read, in order:
 4. [`CONTRIBUTING.md`](../../CONTRIBUTING.md) — the branch→review→merge lifecycle
 5. [`docs/bootstrap-sequence.md`](../../docs/bootstrap-sequence.md) — how you cold-start
 6. `docs/decisions/` — the ADRs (why things are the way they are)
+7. [`docs/onboarding.md`](../../docs/onboarding.md) — cold-start secrets/config
+
+## Step 0: onboarding (secrets & personal config)
+
+Before anything that touches an external service, run `./scripts/onboarding.sh`
+to collect API keys / WhatsApp credentials / your WhatsApp number / infra
+passwords into a git-ignored local file. **This is a public repo — never commit
+credentials or personal info** (ADR-0011). You can build M0 infra before you have
+model keys; onboarding is required before the model router or WhatsApp channel.
 
 ## Your first task: build M0 (the infra spine)
 
