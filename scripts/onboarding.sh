@@ -67,6 +67,8 @@ prompt_var WHATSAPP_APP_SECRET           "WhatsApp app secret"               sec
 prompt_var WHATSAPP_VERIFY_TOKEN         "Webhook verify token (you choose)" secret
 prompt_var STAKEHOLDER_WHATSAPP_NUMBER   "Your WhatsApp number (LOCAL ONLY)" plain
 
+prompt_var SPOKESMAN_API_TOKEN "Spokesman control-plane token (gates /notify + /digest/flush)" genpass
+
 echo "== Public webhook tunnel =="
 prompt_var TUNNEL_PROVIDER          "Tunnel provider (cloudflared|tailscale|ngrok)" plain
 prompt_var CLOUDFLARED_TUNNEL_TOKEN "Cloudflared tunnel token"                      secret
@@ -89,6 +91,7 @@ TMP="$(mktemp)"
            ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_API_KEY VOYAGE_API_KEY EMBEDDINGS_PROVIDER \
            WHATSAPP_PHONE_NUMBER_ID WHATSAPP_BUSINESS_ACCOUNT_ID WHATSAPP_ACCESS_TOKEN \
            WHATSAPP_APP_SECRET WHATSAPP_VERIFY_TOKEN STAKEHOLDER_WHATSAPP_NUMBER \
+           SPOKESMAN_API_TOKEN \
            TUNNEL_PROVIDER CLOUDFLARED_TUNNEL_TOKEN \
            POSTGRES_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD GRAFANA_ADMIN_PASSWORD; do
     printf '%s=%s\n' "$k" "${VAL[$k]:-}"

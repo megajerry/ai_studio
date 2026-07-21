@@ -139,7 +139,15 @@ git clone <repo> && cd ai_studio
 ./bootstrap                 # start the M0 infra spine + health check (or: make up)
 ```
 
-M0 (the infra spine) is implemented; the supervisor, agent runtime, and Spokesman
-arrive in later milestones. This repo is developed from a remote session; the
-target host is a separate machine, so `state/` (git) is the cross-machine
-substrate until the host is live (see [`state/README.md`](state/README.md)).
+M0 (the infra spine) is implemented; the supervisor and agent runtime arrive in
+later milestones. The **Spokesman WhatsApp channel (v1)** is implemented as an
+opt-in compose service — see the runbook
+[`docs/spokesman-whatsapp.md`](docs/spokesman-whatsapp.md):
+
+```bash
+docker compose --profile spokesman up -d spokesman   # opt-in; M0 up is unaffected
+```
+
+This repo is developed from a remote session; the target host is a separate
+machine, so `state/` (git) is the cross-machine substrate until the host is live
+(see [`state/README.md`](state/README.md)).
