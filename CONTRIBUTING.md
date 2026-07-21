@@ -35,8 +35,10 @@ Any actor that intends to change this repo follows this loop:
    **approves**. The reviewer is a separate actor from the author — never
    self-approve.
 
-4. **Merge & clean up.** Once approved, merge into `main`, then **archive/delete
-   the feature branch**. Keep `main` the single source of truth.
+4. **Merge & clean up.** Once approved, merge into `main`, **push `main`**
+   (push after review/QA — don't wait to be asked), then **archive/delete the
+   feature branch** (locally and on the remote). Keep `main` the single source of
+   truth.
 
 ## Rules
 
