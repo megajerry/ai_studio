@@ -37,6 +37,9 @@ class Settings:
     graph_api_base: str
     graph_api_version: str
 
+    # --- Control-plane auth (gates /notify + /digest/flush) ---
+    api_token: str
+
     # --- Behavior ---
     dry_run: bool
     port: int
@@ -86,6 +89,7 @@ def load_settings() -> Settings:
         stakeholder_number=os.environ.get("STAKEHOLDER_WHATSAPP_NUMBER", ""),
         graph_api_base=os.environ.get("GRAPH_API_BASE", "https://graph.facebook.com"),
         graph_api_version=os.environ.get("GRAPH_API_VERSION", "v21.0"),
+        api_token=os.environ.get("SPOKESMAN_API_TOKEN", ""),
         dry_run=_bool("SPOKESMAN_DRY_RUN", default=False),
         port=int(os.environ.get("SPOKESMAN_PORT", "8080")),
         state_dir=state_dir,

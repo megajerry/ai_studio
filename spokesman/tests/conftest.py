@@ -12,9 +12,12 @@ APP_SECRET = "test-app-secret"
 VERIFY_TOKEN = "test-verify-token"
 PHONE_NUMBER_ID = "1234567890"
 STAKEHOLDER = "15550001111"
+API_TOKEN = "test-api-token"
 
 
-def make_settings(state_dir: Path, *, dry_run: bool = True) -> Settings:
+def make_settings(
+    state_dir: Path, *, dry_run: bool = True, api_token: str = API_TOKEN
+) -> Settings:
     return Settings(
         phone_number_id=PHONE_NUMBER_ID,
         access_token="test-token",
@@ -23,6 +26,7 @@ def make_settings(state_dir: Path, *, dry_run: bool = True) -> Settings:
         stakeholder_number=STAKEHOLDER,
         graph_api_base="https://graph.facebook.com",
         graph_api_version="v21.0",
+        api_token=api_token,
         dry_run=dry_run,
         port=8080,
         state_dir=state_dir,

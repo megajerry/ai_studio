@@ -21,6 +21,9 @@ from .config import Settings
 # Runtime inbound log filename (git-ignored — see .gitignore).
 INBOUND_LOG_NAME = "whatsapp-inbound.jsonl"
 
+# Cap the stored message body (hygiene; the log is short-lived working state).
+MAX_STORED_TEXT = 4000
+
 
 def mask_number(number: str | None) -> str:
     """Mask a phone number to its last 4 digits (never store the full value)."""
@@ -77,7 +80,7 @@ def record_inbound(settings: Settings, messages: list[InboundMessage]) -> Path |
                 "channel": "whatsapp",
                 "message_id": msg.message_id,
                 "from": mask_number(msg.sender),
-                "text": msg.text,
+                "text": msg.text[:MAX_STORED_TEXT],
                 "wa_timestamp": msg.timestamp,
             }
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
