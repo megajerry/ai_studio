@@ -66,11 +66,13 @@ break one, stop and flag it.
 ## Development lifecycle (mandatory)
 
 Agents and humans both follow the loop in [`CONTRIBUTING.md`](CONTRIBUTING.md):
-**branch → iterate → review-agent approves → merge → delete branch.** Never
-commit to `main`; branch as `<agent-workflow-identity>/<task-summary>`
-(e.g. `builder/search-tool`). Reviews are done by a *separate* review agent —
-never self-approve. A change isn't done until a fresh `git clone` on the target
-machine can bootstrap and run it.
+**branch → iterate (commit often) → review-agent approves → merge → delete
+branch.** Never commit to `main`; branch as `<agent-workflow-identity>/<task-summary>`
+(e.g. `builder/search-tool`). **Commit early and often on your branch and push it**
+— those in-branch commits are progress snapshots and revert points and need no
+review; **only the merge to `main` triggers a review round**, done by a *separate*
+review agent (never self-approve). A change isn't done until a fresh `git clone`
+on the target machine can bootstrap and run it.
 
 ## Local dev
 
