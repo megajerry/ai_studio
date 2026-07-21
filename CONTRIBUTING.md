@@ -22,20 +22,30 @@ Any actor that intends to change this repo follows this loop:
 
    Examples: `bootstrap/scaffold`, `infra/compose`, `builder/search-tool`.
 
-2. **Iterate.** The owning agent develops and self-checks on the branch until it
-   believes the change is ready for review (builds/health-checks pass, docs and
-   any ADRs updated).
+2. **Iterate — commit early and often.** The owning agent develops and self-checks
+   on the branch, **committing frequently** as it goes. Every meaningful step gets
+   its own commit — for traceability, progress snapshots, and the ability to
+   revert. **Push the branch** after commits so progress is visible on the remote.
+   No review is needed for these in-branch commits; keep going until the change is
+   ready (builds/health-checks pass, docs and any ADRs updated).
 
-3. **Review.** Open a PR, then **spawn a dedicated review agent**. The reviewer
-   and the owning agent iterate until the reviewer **approves**. The reviewer is
-   a separate actor from the author — never self-approve.
+3. **Review — only at merge.** The review round is triggered **only by the merge
+   back to `main`**, not by in-branch commits. Open a PR, then **spawn a dedicated
+   review agent**. The reviewer and the owning agent iterate until the reviewer
+   **approves**. The reviewer is a separate actor from the author — never
+   self-approve.
 
-4. **Merge & clean up.** Once approved, merge into `main`, then **archive/delete
-   the feature branch**. Keep `main` the single source of truth.
+4. **Merge & clean up.** Once approved, merge into `main`, **push `main`**
+   (push after review/QA — don't wait to be asked), then **archive/delete the
+   feature branch** (locally and on the remote). Keep `main` the single source of
+   truth.
 
 ## Rules
 
-- **`main` is protected by convention.** All changes arrive via reviewed PRs.
+- **`main` is protected by convention.** All changes arrive via reviewed PRs;
+  only the merge to `main` needs review, and merges are never self-approved.
+- **Commit often on your branch; push it.** Frequent commits are the expected
+  progress record (snapshots + revert points), reviewed only when merged.
 - **One task per branch.** Keep branches small and focused so review is cheap.
 - **Record architecture-affecting decisions** as an ADR in `docs/decisions/`
   within the same PR (see [`docs/decisions/0001-...`](docs/decisions/0001-record-architecture-decisions.md)).
