@@ -45,12 +45,8 @@ services:
       - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
-    healthcheck:
-      # qdrant images are distroless; use the built-in HTTP healthcheck endpoint.
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q healthz <&3"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # No container healthcheck: the qdrant image is distroless (no shell/curl),
+    # so scripts/healthcheck.sh probes /healthz from the host instead.
 
   minio:
     image: minio/minio:latest
@@ -64,11 +60,8 @@ services:
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "mc ready local || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # No container healthcheck: the server image has no preconfigured `mc` alias
+    # and may lack curl; scripts/healthcheck.sh probes /minio/health/live from the host.
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
