@@ -203,7 +203,9 @@ The starting substrate is deliberately light (see §4):
 - **Scheduler** — cron/launchd wake-ups (a tool the PM uses)
 - **Supervisor** — the non-LLM liveness guarantee
 - **Agent Runtime** — role agents
-- **Observability** — OpenTelemetry + Prometheus + Grafana (from day one)
+- **Observability** — OpenTelemetry + Prometheus + Grafana (from day one). What to
+  capture (token usage, cost, sessions, session trajectory, latency, reliability,
+  routing, budget) is specified in [ADR-0012](decisions/0012-telemetry-metrics.md).
 - **MinIO** — object storage
 - **Reverse proxy / tunnel** — remote access for the stakeholder channel (§9)
 
