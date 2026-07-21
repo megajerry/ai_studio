@@ -1,4 +1,4 @@
-# --- Secrets & local config ---
+# --- Secrets & local config (NEVER commit real credentials / personal info) ---
 .env
 .env.*
 !.env.example
@@ -6,6 +6,11 @@
 *.key
 secrets/
 .secrets/
+secrets.env
+*.secrets.env
+*.local
+config.local.*
+.ai_studio/
 
 # --- Python ---
 __pycache__/

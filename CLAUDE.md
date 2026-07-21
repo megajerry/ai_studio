@@ -34,6 +34,11 @@ break one, stop and flag it.
    changes flow `Planner → Task Graph → Executor → Verifier → Commit`.
 5. **Secrets never reach an agent.** They live in the secret manager; tools call
    external services on the agent's behalf.
+   - **This is a public repo: no personal info or credentials, ever.** Real values
+     are collected by `scripts/onboarding.sh` on cold-start and stored in a
+     git-ignored local file (`.env` or an external `AI_STUDIO_SECRETS` path).
+     Personal info (e.g. the stakeholder's phone number) is local-only too. See
+     ADR-0011.
 6. **Everything emits events + traces.** Any new action must be observable and
    replayable from the event log.
 7. **Local-first.** The Mac is the source of truth; cloud components are
