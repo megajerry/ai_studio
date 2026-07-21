@@ -62,6 +62,10 @@ break one, stop and flag it.
 - **Coding worker:** opencode, treated as a replaceable Worker.
 - **Cross-machine (dev):** `state/` in git is the shared substrate until the host
   is live (ADR-0007).
+- **Off-host agent (ADR-0010):** an intermittent remote worker (like this session)
+  that shares state only via git and holds no host secrets. The host can delegate
+  non-urgent, host-resource-free work to it via `state/offhost/` but **never blocks
+  on it** (local fallback + timeout always).
 
 ## Development lifecycle (mandatory)
 

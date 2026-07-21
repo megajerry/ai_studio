@@ -12,6 +12,9 @@ source of truth. See [ADR-0007](../docs/decisions/0007-cross-machine-state.md).
 - `outbox/` — results / questions **from the host** back to the remote session.
 - `events/` — append-only event snapshots (JSONL) exported for auditing/replay.
 - `lessons/` — the durable lessons corpus (Retro output), injected into future work.
+- `offhost/` — async delegation queue to the **off-host agent** (an intermittent
+  remote worker); see [`offhost/README.md`](offhost/README.md) and
+  [ADR-0010](../docs/decisions/0010-offhost-remote-agent.md).
 
 ## Rules
 

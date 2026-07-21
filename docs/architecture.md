@@ -244,6 +244,17 @@ async message bus** ([ADR-0007](decisions/0007-cross-machine-state.md)):
 
 See [`../state/README.md`](../state/README.md).
 
+### The off-host agent (an intermittent remote worker)
+
+Beyond the host, work can also run on an **off-host agent** — a capable agent
+session on a *different* machine that shares state only through git, is **not
+always available**, and holds no host secrets ([ADR-0010](decisions/0010-offhost-remote-agent.md)).
+The PM uses it as a **capacity lever**: when host compute is tight, it delegates
+non-urgent, host-resource-free work (research, design, docs, code drafting,
+review) via `state/offhost/requests/` and collects results from
+`state/offhost/results/`. The host **never blocks on it** — every delegated item
+has a local fallback and a timeout.
+
 ## 11. "Assemble, don't build" — candidate components
 
 The moat is *how we define experiments, evaluate signal, allocate resources, and
