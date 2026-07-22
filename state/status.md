@@ -2,6 +2,16 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
+**Real per-workstream budget enforcement** (branch `runtime/budget`, awaiting
+merge): `runtime/budget.py` + migration `0010_budgets.sql` (idempotent) — per
+`(workstream, period)` `cap_usd`/`cap_tokens` read against **real accrued
+`model.call` cost**, enforced at the single model-call site; over cap →
+`budget.exceeded` + a 🛑 "raise budget" approval + `OverBudget` (never a silent
+overspend), under cap → `budget.checkpoint`; policy `BudgetContext` now gates on
+token **and** USD real spend. Evidence: `DATABASE_URL=… pytest runtime/tests/
+spokesman/tests/` = **410 passed, 0 skips**; `python -m runtime.demo` exits 0 (four
+acts green). Docs: [`runtime/budget.md`](../runtime/budget.md).
+
 ## Latest (branch `runtime/task-lifecycle`, ADR-0015 — complete, awaiting merge)
 
 **Canonical task-lifecycle state machine.** Task state is now one canonical

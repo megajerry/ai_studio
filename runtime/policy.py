@@ -51,21 +51,57 @@ class Effect(str, Enum):
 
 
 class BudgetContext(BaseModel):
-    """Optional cost context for a call (ADR-0012 budget enforcement).
+    """Optional cost context for a call (ADR-0006/0012 budget enforcement).
 
-    ``would_exceed`` is true when committing this call's estimated cost would
-    push cumulative spend past the cap.
+    ``would_exceed`` is true when committing this call's estimated cost would push
+    cumulative spend past **either** cap. Both a token cap and a USD cap are
+    supported (either or both may be set); a resource whose cap is ``None`` is
+    unconstrained. ``spent_*`` should be the REAL accrued per-workstream spend —
+    :func:`runtime.budget.budget_context` builds one from the ``model.call`` log so
+    the policy engine gates on actual spend, not a single task's dry-run tokens.
     """
 
     spent_tokens: int = 0
     budget_tokens: Optional[int] = None
     estimated_tokens: int = 0
+    spent_usd: float = 0.0
+    budget_usd: Optional[float] = None
+    estimated_usd: float = 0.0
 
     @property
     def would_exceed(self) -> bool:
-        if self.budget_tokens is None:
-            return False
-        return self.spent_tokens + self.estimated_tokens > self.budget_tokens
+        if (
+            self.budget_tokens is not None
+            and self.spent_tokens + self.estimated_tokens > self.budget_tokens
+        ):
+            return True
+        if (
+            self.budget_usd is not None
+            and self.spent_usd + self.estimated_usd > self.budget_usd
+        ):
+            return True
+        return False
+
+    def exceed_reason(self) -> str:
+        """Leak-free description of which cap would be broken (numbers only)."""
+        parts: list[str] = []
+        if (
+            self.budget_tokens is not None
+            and self.spent_tokens + self.estimated_tokens > self.budget_tokens
+        ):
+            parts.append(
+                f"tokens {self.spent_tokens}+{self.estimated_tokens} "
+                f"> {self.budget_tokens}"
+            )
+        if (
+            self.budget_usd is not None
+            and self.spent_usd + self.estimated_usd > self.budget_usd
+        ):
+            parts.append(
+                f"usd {self.spent_usd:.6f}+{self.estimated_usd:.6f} "
+                f"> {self.budget_usd:.6f}"
+            )
+        return "; ".join(parts) if parts else "within budget"
 
 
 class PolicyRequest(BaseModel):
@@ -176,14 +212,12 @@ def decide(request: PolicyRequest, config: PolicyConfig) -> Decision:
         )
 
     # 2. Budget — an over-budget call escalates for approval (ADR-0006/0012).
+    #    Uses the REAL accrued per-workstream spend when the budget context was
+    #    built from the model.call log (runtime.budget.budget_context).
     if request.budget is not None and request.budget.would_exceed:
         return Decision(
             effect=Effect.NEEDS_APPROVAL,
-            reason=(
-                "budget would be exceeded "
-                f"({request.budget.spent_tokens}+{request.budget.estimated_tokens} "
-                f"> {request.budget.budget_tokens})"
-            ),
+            reason="budget would be exceeded: " + request.budget.exceed_reason(),
             **common,
         )
 
