@@ -1,0 +1,172 @@
+# AI Studio — model registry + routing policy (EXAMPLE / documented default).
+#
+# Rules are DATA, not code (ADR-0005). runtime/model/registry.py loads this file;
+# runtime/model/router.py routes against the `routing:` block below.
+#
+# Resolution order (runtime.model.registry.resolve_registry_path):
+#   1. $AI_STUDIO_MODELS_FILE   (explicit path)
+#   2. runtime/models.yaml       (real catalog, git-ignored)
+#   3. runtime/models.example.yaml  (this file — committed fallback)
+#
+# Copy this to runtime/models.yaml and edit for a real deployment. This file
+# contains NO secrets: a model spec never holds an API key. Keys are `.env`
+# entries (ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY, ...) read INSIDE
+# the provider adapters only (ADR-0011). The registry is provider-agnostic.
+#
+# Prices are USD per 1M tokens, input / output. Snapshot: 2026-07-21 from
+# docs/model-shortlist.md — the frontier reprices ~monthly; the Sourcing agent
+# (ADR-0005) keeps this current through the normal PR + review loop. Verify on
+# each provider's pricing page before committing budget.
+
+# --- models: the versioned catalog -----------------------------------------
+models:
+  # PM / planner / hardest reasoning (quality first).
+  - id: claude-opus-4.8
+    provider: anthropic
+    tier: pm
+    price_in: 5.0
+    price_out: 25.0
+    cache_read_multiplier: 0.1        # Opus cached input ~$0.50 vs $5
+    context_window: 1000000
+    task_fit: [planning, reasoning, coding, agentic]
+    provenance: docs/model-shortlist.md
+    provenance_date: "2026-07-21"
+
+  - id: gemini-3.1-pro
+    provider: google
+    tier: pm
+    price_in: 2.0                     # ≤200k tokens; rises to ~4/18 above 200k
+    price_out: 12.0
+    context_window: 1000000
+    task_fit: [planning, reasoning, multimodal, value]
+    provenance: docs/model-shortlist.md
+    provenance_date: "2026-07-21"
+
+  # Executor / everyday work (balance).
+  - id: claude-sonnet-5
+    provider: anthropic
+    tier: mid
+    price_in: 3.0                     # post-intro rate (intro was 2/10)
+    price_out: 15.0
+    context_window: 1000000
+    task_fit: [execution, coding, agentic]
+    provenance: docs/model-shortlist.md
+    provenance_date: "2026-07-21"
+
+  - id: gemini-3.5-flash
+    provider: google
+    tier: mid
+    price_in: 1.5
+    price_out: 9.0
+    context_window: 1000000
+    task_fit: [execution, multimodal, high-volume]
+    provenance: docs/model-shortlist.md
+    provenance_date: "2026-07-21"
+
+  # Budget open-weight executor via a per-token open-weight API (Together /
+  # DeepInfra / Fireworks — "usage-based GPU rental abstracted to tokens",
+  # docs/cost-model.md §7). No dedicated adapter yet -> served in dry-run until
+  # one is wired; that is the intended keyless default.
+  - id: deepseek-v4.5
+    provider: openweight
+    tier: mid
+    price_in: 0.27
+    price_out: 0.85
+    context_window: 128000
+    task_fit: [execution, coding, budget, self-host-alt]
+    provenance: docs/cost-model.md
+    provenance_date: "2026-07-21"
+
+  # Router / classifier / extraction / high-volume (cheap & fast).
+  - id: claude-haiku-4.5
+    provider: anthropic
+    tier: cheap
+    price_in: 1.0
+    price_out: 5.0
+    context_window: 200000
+    task_fit: [classification, routing, extraction, high-volume]
+    provenance: docs/model-shortlist.md
+    provenance_date: "2026-07-21"
+
+  - id: gemini-3.1-flash-lite
+    provider: google
+    tier: cheap
+    price_in: 0.125
+    price_out: 0.75
+    context_window: 1000000
+    task_fit: [classification, routing, extraction, high-volume]
+    provenance: docs/model-shortlist.md
+    provenance_date: "2026-07-21"
+
+  # Embeddings (required for memory; Anthropic has none). Output price is 0 —
+  # embeddings only consume input tokens.
+  - id: text-embedding-005
+    provider: google
+    tier: embedding
+    price_in: 0.006
+    price_out: 0.0
+    context_window: 2048
+    task_fit: [embeddings, memory, retrieval]
+    provenance: docs/model-shortlist.md
+    provenance_date: "2026-07-21"
+
+# --- routing policy: (task_type, quality) -> tier -> ordered model chain -----
+# The router (runtime/model/router.py) is DETERMINISTIC: it resolves a tier from
+# the task_type + quality bar, then picks the first model id in that tier's chain
+# that exists in the catalog. Every routing decision is logged as a `model.routed`
+# event (ADR-0005). quality bar vocabulary: high | standard | low.
+routing:
+  # Per-task-type overrides. Unlisted task types fall through to `default`.
+  task_types:
+    plan:                # PM / planner work — quality first.
+      high: pm
+      standard: pm
+      low: mid
+    code:                # coding: premium for hard, mid/cheap otherwise.
+      high: pm
+      standard: mid
+      low: cheap
+    execute:             # general agentic execution.
+      high: pm
+      standard: mid
+      low: cheap
+    research:
+      high: pm
+      standard: mid
+      low: cheap
+    classify:            # classification / routing / triage — cheap & fast.
+      high: mid
+      standard: cheap
+      low: cheap
+    extract:
+      high: mid
+      standard: cheap
+      low: cheap
+    summarize:
+      high: mid
+      standard: cheap
+      low: cheap
+    embed:               # embeddings are their own tier (no quality axis).
+      high: embedding
+      standard: embedding
+      low: embedding
+
+  # Fallback when a task_type is not listed above.
+  default:
+    high: pm
+    standard: mid
+    low: cheap
+
+  # tier -> ordered model-id preference (the fallback chain; first present wins).
+  tiers:
+    pm: [claude-opus-4.8, gemini-3.1-pro]
+    mid: [claude-sonnet-5, gemini-3.5-flash, deepseek-v4.5]
+    cheap: [claude-haiku-4.5, gemini-3.1-flash-lite]
+    embedding: [text-embedding-005]
+
+  # When a call would exceed budget, route down to the cheaper tier instead of
+  # spending (ADR-0006/0012). No entry (or a self-map) => cannot downshift, so
+  # the router raises OverBudget. embedding has no cheaper alternative.
+  downshift:
+    pm: mid
+    mid: cheap

@@ -48,6 +48,7 @@ from .policy import (
 # re-exporting them from the package triggers a double-import RuntimeWarning
 # under `-m`. Import `sweep` / `tick_once` from those submodules directly.
 from .tasks import (
+    add_spent_tokens,
     claim_task,
     complete_task,
     enqueue_task,
@@ -71,6 +72,7 @@ __all__ = [
     "EventType",
     "Task",
     "TaskStatus",
+    "add_spent_tokens",
     "append_event",
     "build_database_url",
     "can_connect",

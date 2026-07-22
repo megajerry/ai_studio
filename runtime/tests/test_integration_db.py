@@ -22,6 +22,7 @@ from runtime.models import Assignee, TaskStatus, make_event
 from runtime.scheduler import PM_TICK_TYPE, tick_once
 from runtime.supervisor import sweep
 from runtime.tasks import (
+    add_spent_tokens,
     claim_task,
     complete_task,
     enqueue_task,
@@ -261,3 +262,50 @@ def test_tick_once_enqueues_then_skips(conn, ws):
     claim_task(conn, worker_id="pm", workstream=ws)
     complete_task(conn, first.id, status=TaskStatus.DONE)
     assert tick_once(conn, workstream=ws) is not None
+
+
+# --- model-call spent-token accounting (M3b) --------------------------------
+
+
+def test_add_spent_tokens_accumulates(conn, ws):
+    t = enqueue_task(conn, workstream=ws, type="t")
+    assert add_spent_tokens(conn, t.id, 100).spent_tokens == 100
+    assert add_spent_tokens(conn, t.id, 50).spent_tokens == 150
+    # Emits no event — the model.call event already carries per-call tokens.
+    assert [e.type for e in read_events(conn, task_id=t.id)] == ["task.created"]
+
+
+def test_add_spent_tokens_missing_task_returns_none(conn):
+    assert add_spent_tokens(conn, uuid4(), 10) is None
+
+
+def test_call_model_records_spend_and_event(conn, ws, monkeypatch):
+    # End-to-end keyless: route → dry-run complete → cost → model.call event →
+    # task.spent_tokens increment, all against a live DB via DbEventSink.
+    from runtime.enforce import DbEventSink
+    from runtime.model.call import call_model
+
+    for env in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY", "MODELS_DRY_RUN"):
+        monkeypatch.delenv(env, raising=False)
+
+    t = enqueue_task(conn, workstream=ws, type="t")
+    claim_task(conn, worker_id="w1", workstream=ws)
+    sink = DbEventSink(conn)
+    comp = call_model(
+        "exec",
+        "execute",
+        [{"role": "user", "content": "do the thing " * 30}],
+        workstream=ws,
+        registry=None,
+        sink=sink,
+        task_id=t.id,
+        conn=conn,
+    )
+    assert comp.provider == "dryrun"
+    types = [e.type for e in read_events(conn, task_id=t.id)]
+    assert "model.routed" in types and "model.call" in types
+    with conn.cursor() as cur:
+        cur.execute("SELECT spent_tokens FROM tasks WHERE id = %s", (t.id,))
+        spent = cur.fetchone()["spent_tokens"]
+    conn.commit()
+    assert spent == comp.usage.total_tokens

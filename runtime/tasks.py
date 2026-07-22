@@ -210,6 +210,39 @@ def complete_task(
     return task
 
 
+def add_spent_tokens(
+    conn: psycopg.Connection, task_id: UUID, tokens: int
+) -> Optional[Task]:
+    """Increment a task's ``spent_tokens`` by ``tokens`` (telemetry; ADR-0012).
+
+    Called by the instrumented model-call wrapper (:func:`runtime.model.call.call_model`)
+    after each LLM call so a task's cumulative token spend is tracked live for
+    budget enforcement. Unlike :func:`complete_task` this does **not** change
+    status and is not guarded to ``in_progress`` — spend is recorded wherever the
+    task is. Returns the updated task, or ``None`` if the task does not exist.
+    Emits no event: the ``model.call`` event (from the wrapper) already carries
+    per-call tokens + cost, so incrementing the counter here would double-log.
+    """
+    if tokens < 0:
+        raise ValueError("tokens must be non-negative")
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE tasks
+                SET spent_tokens = spent_tokens + %s,
+                    updated_at = now()
+                WHERE id = %s
+                RETURNING {_TASK_COLUMNS}
+                """,
+                (tokens, task_id),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return Task.model_validate(row)
+
+
 def find_stale_tasks(
     conn: psycopg.Connection, threshold_seconds: float
 ) -> list[Task]:

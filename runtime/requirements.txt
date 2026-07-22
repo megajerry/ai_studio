@@ -4,8 +4,12 @@
 # psycopg 3 (sync) with the binary build so no local libpq is required.
 psycopg[binary]>=3.2,<4.0
 pydantic>=2.7,<3.0
-# M2 policy engine reads its rules-as-data config from YAML.
+# M2 policy engine + M3b model registry read their rules-as-data config from YAML.
 PyYAML>=6.0,<7.0
+# M3b provider adapters (anthropic/openai/google) call provider HTTP APIs.
+# Imported lazily inside each adapter, so the keyless dry-run path never needs
+# it; only real (keyed) calls do. Same pin as the Spokesman.
+httpx>=0.27,<1.0
 
 # Dev/test:
 #   pip install pytest
