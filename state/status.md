@@ -19,12 +19,14 @@ review → approve → merge; fail → reviewer_blocked → in_progress retry / 
 know what's parallel (`ready_tasks`) vs blocked (`waiting_tasks`); the PM sets
 edges when decomposing (cycles rejected). **Lifecycle telemetry**: append-only
 `task_transitions` (from/to/agent/latency) + `task_lifecycle` / `task_cost` /
-`agent_rollup` / `model_rollup`. `grab_task`'s optional `filter` is a **structured,
-parameterized** `{column: value}` mapping over an allowlist (values bound as
-params, never raw SQL — injection-safe). Docs: [ADR-0015](decisions/0015-task-lifecycle-state-machine.md)
-+ [`docs/task-lifecycle.md`](task-lifecycle.md). Evidence (rebased on the merged
+`agent_rollup` / `model_rollup`. Both `grab_task` knobs are **injection-safe**:
+`filter` is a structured `{column: value}` mapping (allowlist, values bound as
+params) and `sort` is an allowlist parse into `(column, direction[, nulls])` tokens
+(ORDER BY built only from validated tokens, never raw SQL). Docs:
+[ADR-0015](decisions/0015-task-lifecycle-state-machine.md) +
+[`docs/task-lifecycle.md`](task-lifecycle.md). Evidence (rebased on the merged
 Docker-sandbox `main`): `DATABASE_URL=… pytest runtime/tests/ spokesman/tests/` =
-**393 passed, 0 skips**; `python -m runtime.demo` exits 0 (four acts green, showing
+**395 passed, 0 skips**; `python -m runtime.demo` exits 0 (four acts green, showing
 the canonical `ready_for_review → approved → merged` trail). Follow-up (separate):
 DB-outage resilience + remote host-restricted DB access.
 
