@@ -9,14 +9,30 @@ services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    # Host-restricted remote access (ADR-0017). The wrapper renders pg_hba.conf
+    # from the PG_ALLOWED_HOSTS allowlist at start, then hands off to the stock
+    # entrypoint pointed at it (scram-sha-256, never trust / 0.0.0.0/0).
+    entrypoint: ["/usr/local/bin/pg-entrypoint-wrapper.sh"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-aistudio}
       POSTGRES_DB: ${POSTGRES_DB:-aistudio}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/onboarding.sh to set POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---auth-host=scram-sha-256}
+      # Space/comma-separated CIDR allowlist of authorized LAN hosts (scram-sha-256).
+      # EMPTY (default) = local/internal only, no LAN exposure. NEVER 0.0.0.0/0.
+      PG_ALLOWED_HOSTS: ${PG_ALLOWED_HOSTS:-}
+      PG_LISTEN_ADDRESSES: ${PG_LISTEN_ADDRESSES:-*}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Bind the published port to PG_BIND_IP (default 127.0.0.1 — local-first, NOT
+      # the internet). For LAN access set PG_BIND_IP to the host's LAN IP and add
+      # the client to PG_ALLOWED_HOSTS + the firewall. See docs/db-operations.md.
+      - "${PG_BIND_IP:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Host-restricted remote access config (read-only). ADR-0017.
+      - ./infra/postgres/pg_hba.conf.template:/etc/postgresql/pg_hba.conf.template:ro
+      - ./infra/postgres/render-pg-hba.sh:/usr/local/bin/render-pg-hba.sh:ro
+      - ./infra/postgres/docker-entrypoint-wrapper.sh:/usr/local/bin/pg-entrypoint-wrapper.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aistudio} -d ${POSTGRES_DB:-aistudio}"]
       interval: 10s
@@ -144,6 +160,16 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+# Fixed internal subnet so Postgres' pg_hba can trust the compose network by CIDR
+# (172.28.0.0/16) while keeping remote LAN access a strict allowlist (ADR-0017).
+# Host tools reach Postgres through the published port, SNAT'd to this subnet's
+# gateway — hence the matching `host ... 172.28.0.0/16` rule in pg_hba.conf.template.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${PG_INTERNAL_SUBNET:-172.28.0.0/16}
 
 volumes:
   postgres_data:
