@@ -15,23 +15,16 @@ Learning loop (Retro → lessons → injected) · deterministic event replay (bu
 · concurrency/hardening · human-in-loop approvals · review-rigor doctrine
 (ADR-0014) · **real PM** (understand → confidence gate → decompose) · Reviewer /
 Whistle-blower role · **Researcher role** · WhatsApp Spokesman + **Spokesman↔runtime
-wiring** · **Docker sandbox runner** (network-off/non-root/read-only/cap-drop/
-resource+timeout/scoped-mount/no-secret-env) · **Task-lifecycle state machine +
-dependency DAG + telemetry** (ADR-0015: 9-state guarded machine, grab-by-sort,
-Verifier-as-Reviewer, prereq DAG, task_transitions + rollups; migration 0008) ·
-**Real per-workstream budget enforcement** (migration 0010: real accrued-spend
-caps → over-cap = `budget.exceeded` + 🛑 + `OverBudget`, no silent overspend) ·
-**DB-outage resilience + remote host-restricted access** (ADR-0017:
-`connect_with_retry`/`DBUnavailable` degraded mode; supervisor reconnect grace
-window; loopback-default bind + env `pg_hba` scram allowlist, never trust/`0.0.0.0/0`)
-· **Experiment primitive** (ADR-0016: `runtime/experiment/`; hypothesis + metric +
-budget + guarded `proposed→running→evaluated→kept|scaled|killed`; evidence-based
-kill/scale — over-budget/missed→killed, met→kept, strongly-met→scaled + 🛑;
-migration 0009) · **Coding-worker dispatch** (architecture §14: `work.code`/
-`prototype` → policy-gated `coding` tool → opencode INSIDE the sandbox; `code.run`
-🔴/approval-gated via `invoke`; opencode swappable via `CODING_WORKER_CMD`;
-loop-free worker path; env-allowlist-only, no host secrets) · onboarding/secrets ·
-model shortlist + cost model · ADRs 0001–0017.
+wiring** · **Docker sandbox runner** · **Task-lifecycle state machine + dependency
+DAG + telemetry** (ADR-0015; migration 0008) · **Real per-workstream budget
+enforcement** (migration 0010) · **DB-outage resilience + remote host-restricted
+access** (ADR-0017) · **Experiment primitive** (ADR-0016; migration 0009) ·
+**Coding-worker dispatch** (opencode inside the sandbox; `code.run` 🔴) ·
+**Role-customization seams** (`runtime/roles/prompt.py` `compose_role_prompt`
+[base→charter→overlay→skills→lessons→task, behavior-preserving] + `roles/checkers.py`
+pluggable verify-checker registry [structured criterion, marker back-compat,
+evidence-based, e.g. `video_audit`]) · onboarding/secrets · model shortlist +
+cost model · ADRs 0001–0017.
 
 ## 🔄 In progress
 
@@ -40,13 +33,13 @@ model shortlist + cost model · ADRs 0001–0017.
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
 1. **Workstream-bootstrap primitive** (makes starting a vertical config-not-code) —
-   a workstream config/registration (name/objective/budget/policy grants/tool+skill
-   set/memory-seed/DB-scope/object-store bucket) + the **role prompt-assembly layer**
-   (shared role base + workstream charter + per-role overlay + skills + lessons +
-   task) + a **pluggable verify-checker registry** (structured criterion → domain
-   check, e.g. `video_audit`) + the **cross-workstream request contract** (typed
-   `feature_request` + receiving-PM intake/triage/prioritize/approve/decompose +
-   symmetric escalation). Captured by the vertical-isolation ADR.
+   NOW just the config/registration record + coordination, since the seams are done
+   (role prompt-assembly ✅, verify-checker registry ✅): a workstream config
+   (name/objective/budget/policy grants/tool+skill set/memory-seed/DB-scope/
+   object-store bucket) that supplies the charter/overlay/checkers to the runtime,
+   + the **cross-workstream request contract** (typed `feature_request` +
+   receiving-PM intake/triage/prioritize/approve/decompose + symmetric escalation).
+   Captured by the vertical-isolation ADR.
 2. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
    product→own repo, definition→platform (this repo).
 3. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
@@ -54,7 +47,7 @@ model shortlist + cost model · ADRs 0001–0017.
 4. **Adaptive orchestration intensity** — generalize scaling of review/retro/
    research by recent error rate + budget/telemetry (today: on_fail/on_risk).
 5. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
-   M1's `EventType` enum).
+   M1's `EventType` enum). Do last / alone (touches many modules).
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)
 
@@ -74,14 +67,13 @@ model shortlist + cost model · ADRs 0001–0017.
   embeddings land.
 - `find_grant`/read-path commit coupling on non-autocommit connections (harmless).
 - `state/status.md` should keep an evidence-based (command + count) status line.
-- Budget pre-call USD estimate uses input-only pricing (conservative under-count;
-  real accrued spend dominates) — tighten if strict USD conservatism wanted.
+- Budget pre-call USD estimate uses input-only pricing (conservative under-count).
 - `call.py` budget step-comment numbering is off-by-one (cosmetic).
 
 ## Context (from the PM audit, 2026-07-22)
 
 Verdict was **AT-RISK**: the *platform substrate* is A-grade and verified, but the
 *venture-studio value layer* had not begun and the PM was a stub. The real-PM +
-experiment-primitive milestones close that gap; a first real vertical remains the
-path to an actual venture studio. Everything is still **dry-run/keyless** until
-go-live keys are provided.
+experiment-primitive + role-customization-seam milestones close most of that gap;
+a first real vertical (needs a product decision) remains the path to an actual
+venture studio. Everything is still **dry-run/keyless** until go-live keys.

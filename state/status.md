@@ -27,6 +27,22 @@ host-restricted access (ADR-0017) are all merged. Experiment primitive (ADR-0016
 is approved and merging next. See [`state/backlog.md`](backlog.md) for the full
 Done list and what remains.
 
+## In flight (branch `runtime/role-seams` — awaiting review/merge)
+
+**Vertical-customization seams** (the prompt-assembly layer + verify-checker
+registry halves of the Workstream-bootstrap primitive). One role prompt assembler
+`runtime/roles/prompt.py` `compose_role_prompt` layers shared base → workstream
+charter → per-role overlay → skills → lessons → task (bounded/delimited,
+behavior-preserving with no charter/overlay); PM/Executor/Verifier refactored onto
+it and accept config-driven `charter`/`overlay`. A pluggable verify-checker
+registry `runtime/roles/checkers.py` (`Checker`/`CheckerRegistry`/`ArtifactRef`)
+lets the Verifier dispatch a STRUCTURED criterion `{check, require}` to a
+registered checker and decide on FACTS (ADR-0014); the default `marker` checker
+keeps back-compat, a vertical registers e.g. `video_audit`. Learning/retro/
+reviewer/telemetry untouched. Docs: `runtime/roles-customization.md`. Evidence:
+`DATABASE_URL=… pytest runtime/tests/ spokesman/tests/` = **475 passed, 0 skips**;
+`python -m runtime.demo` exits 0 (four acts green).
+
 ## Latest (branch `runtime/task-lifecycle`, ADR-0015 — complete, awaiting merge)
 
 **Canonical task-lifecycle state machine.** Task state is now one canonical

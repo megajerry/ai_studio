@@ -35,14 +35,16 @@ from typing import Any, Optional
 
 from pydantic import BaseModel
 
-from ..enforce import EventSink, InvokeStatus, NullEventSink, invoke
+from ..enforce import EventSink, NullEventSink
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
 from ..policy import PolicyConfig
-from ..skills import SkillRegistry, compose_prompt
+from ..skills import SkillRegistry
 from ..tools import ToolRegistry
+from .checkers import DEFAULT_REGISTRY, ArtifactRef, CheckerRegistry, resolve_criterion
 from .executor import ExecutorResult
+from .prompt import compose_role_prompt
 
 #: Role events for the verify→commit decision.
 EVENT_VERIFY_PASSED = "verify.passed"
@@ -62,25 +64,44 @@ _VERIFY_PROMPT = (
 _VERIFY_SKILL_QUERY = "verify validate review audit check evidence correctness"
 
 
-def _compose_verify_prompt(criterion: str, skills: Optional[SkillRegistry]) -> str:
-    """Base verify prompt + any relevant, REVIEWED skills (on-demand injection).
+def _compose_verify_prompt(
+    criterion: str,
+    skills: Optional[SkillRegistry],
+    *,
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
+) -> str:
+    """Base verify prompt + charter/overlay + any relevant, REVIEWED skills.
 
-    With no registry the prompt is the inline base (behavior-preserving). With
-    one, only skills relevant to validation are selected and only the reviewed
-    ones are injected (:func:`runtime.skills.compose_prompt`) — this is how the
-    ``rigorous-review`` doctrine reaches the Verifier's prompt.
+    Assembled through the shared :func:`runtime.roles.prompt.compose_role_prompt`
+    so the Verifier layers the same way every role does. With no registry and no
+    charter/overlay the prompt is the inline base (behavior-preserving). With a
+    registry, only skills relevant to validation are selected and only the reviewed
+    ones are injected — this is how the ``rigorous-review`` doctrine (ADR-0014)
+    reaches the Verifier's prompt. Charter/overlay are the vertical's config-driven
+    framing (default ``None`` → omitted).
     """
     base = _VERIFY_PROMPT.format(criterion=criterion)
-    if skills is None:
-        return base
-    return compose_prompt(base, skills.select(_VERIFY_SKILL_QUERY))
+    selected = skills.select(_VERIFY_SKILL_QUERY) if skills is not None else None
+    return compose_role_prompt(
+        base,
+        workstream_charter=charter,
+        role_overlay=overlay,
+        skills=selected,
+    )
 
 
 class VerifyResult(BaseModel):
-    """The gate's verdict."""
+    """The gate's verdict.
+
+    ``facts`` carries the concrete evidence the dispatched checker observed
+    (ADR-0014) for traceability; it defaults to empty so callers that only read
+    ``passed``/``reason`` are unaffected.
+    """
 
     passed: bool
     reason: str
+    facts: dict = {}
 
 
 def verify(
@@ -93,6 +114,9 @@ def verify(
     config: Optional[PolicyConfig] = None,
     model_registry: Optional[Registry] = None,
     skills: Optional[SkillRegistry] = None,
+    checkers: CheckerRegistry = DEFAULT_REGISTRY,
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
 ) -> VerifyResult:
     """Independently verify ``result`` against ``task``'s success criterion.
 
@@ -100,10 +124,15 @@ def verify(
     ``registry`` must contain the same ``filesystem`` tool (same root) the
     Executor wrote to, so the Verifier reads the real artifact.
 
-    The verdict is decided on **evidence** — the re-read artifact's real contents
-    (:func:`_check`), NOT the Executor's ``result.ok`` claim. ``skills`` (optional)
-    supplies the ``rigorous-review`` doctrine, injected into the traceability
-    prompt; with no registry the prompt is the inline base (behavior-preserving).
+    The verdict is decided on **evidence** — the FACTS a dispatched checker
+    observes (:func:`_check`), NOT the Executor's ``result.ok`` claim. The
+    criterion is structured (``payload["check"] = {"check": name, "require": …}``)
+    and dispatched through ``checkers`` (default: the horizontal ``marker`` check);
+    a bare marker is back-compat sugar (:func:`runtime.roles.checkers.resolve_criterion`),
+    so a vertical injects a domain check (e.g. ``video_audit``) by passing its own
+    registry — no Verifier change. ``skills`` (optional) supplies the
+    ``rigorous-review`` doctrine; ``charter``/``overlay`` are the vertical's
+    config-driven prompt framing (default ``None`` → behavior-preserving).
     """
     sink = sink or NullEventSink()
     payload = task.payload or {}
@@ -111,8 +140,8 @@ def verify(
     marker = (payload.get("marker") or getattr(result, "marker", None) or "")
 
     # Model judgement (dry-run, keyless) — logged for traceability. The prompt is
-    # the Verifier persona + the relevant reviewed skill(s) (ADR-0008/0014).
-    prompt = _compose_verify_prompt(criterion, skills)
+    # the Verifier persona + charter/overlay + the relevant reviewed skill(s).
+    prompt = _compose_verify_prompt(criterion, skills, charter=charter, overlay=overlay)
     call_model(
         role="verifier",
         task_type="verify",
@@ -124,7 +153,7 @@ def verify(
         workstream=task.workstream,
     )
 
-    verdict = _check(task, result, marker, sink, registry, config)
+    verdict = _check(conn, task, result, marker, sink, registry, config, checkers)
 
     sink.emit(
         make_event(
@@ -138,43 +167,36 @@ def verify(
 
 
 def _check(
+    conn: Any,
     task: Task,
     result: ExecutorResult,
     marker: str,
     sink: EventSink,
     registry: ToolRegistry,
     config: Optional[PolicyConfig],
+    checkers: CheckerRegistry,
 ) -> VerifyResult:
-    """Deterministic evidence gate: re-read the artifact and confirm the marker.
+    """Evidence gate: dispatch to the criterion's checker and decide on its FACTS.
 
-    The decision rests on the artifact's REAL contents observed here — never on
-    ``result.ok`` (the Executor's claim of success). A result that claims success
-    but whose artifact lacks the marker (fails the criterion) still FAILS: evidence
-    beats the claim (ADR-0014).
+    Resolves the (possibly structured) criterion to a ``(check, require)`` pair
+    (:func:`runtime.roles.checkers.resolve_criterion`) and runs the registered
+    checker. The decision rests on the FACTS the checker OBSERVED — never on
+    ``result.ok`` (the Executor's claim). A result that claims success but whose
+    artifact fails the check still FAILS: evidence beats the claim (ADR-0014). The
+    default ``marker`` checker preserves the historical marker-in-file gate;
+    verticals register domain checks on the same seam. An unknown ``check`` name
+    raises :class:`runtime.roles.checkers.UnknownChecker` (clear misconfig error).
     """
-    artifact_path = getattr(result, "artifact_path", None)
-    if not artifact_path:
-        return VerifyResult(passed=False, reason="no artifact produced by executor")
-    if not marker:
-        return VerifyResult(passed=False, reason="no success marker defined")
-
-    read = invoke(
-        role="verifier",
-        tool_name="filesystem",
+    payload = task.payload or {}
+    name, require = resolve_criterion(payload, fallback_marker=marker)
+    ref = ArtifactRef(
         registry=registry,
+        path=getattr(result, "artifact_path", None),
         config=config,
-        events=sink,
-        workstream=task.workstream,
-        task_id=task.id,
-        op="read",
-        path=artifact_path,
+        sink=sink,
+        result=result,
     )
-    if read.status is not InvokeStatus.EXECUTED or not (read.result and read.result.ok):
-        return VerifyResult(
-            passed=False, reason=f"could not read artifact ({read.status.value})"
-        )
-
-    content = read.result.output or ""
-    if marker in content:
-        return VerifyResult(passed=True, reason=f"artifact contains marker {marker!r}")
-    return VerifyResult(passed=False, reason=f"marker {marker!r} not found in artifact")
+    outcome = checkers.run(name, conn, task, ref, require)
+    return VerifyResult(
+        passed=outcome.passed, reason=outcome.reason, facts=outcome.facts
+    )

@@ -28,8 +28,10 @@ from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
 from ..policy import PolicyConfig
+from ..skills import SkillRegistry
 from ..tools import ToolRegistry
-from .lessons import inject_lessons
+from .lessons import recall_lesson_texts
+from .prompt import compose_role_prompt
 
 #: Role event: the Executor finished producing a result for a work task.
 EVENT_EXECUTOR_ACTED = "executor.acted"
@@ -38,6 +40,9 @@ _EXEC_PROMPT = (
     "You are the studio Executor. Carry out this task and describe what you "
     "produced in one line. Goal: {goal}. Success criterion: {criterion}."
 )
+
+#: Selection query for the Executor's skills (on-demand injection, ADR-0008).
+_EXEC_SKILL_QUERY = "execute build implement produce artifact do the work"
 
 
 class ExecutorResult(BaseModel):
@@ -64,13 +69,18 @@ def run_executor(
     registry: ToolRegistry,
     config: Optional[PolicyConfig] = None,
     model_registry: Optional[Registry] = None,
+    skills: Optional[SkillRegistry] = None,
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
 ) -> ExecutorResult:
     """Do ``task`` and return an :class:`ExecutorResult` (does not commit it).
 
     ``registry`` is the *tool* registry (must contain a ``filesystem`` tool bound
     to the scratch root); ``model_registry`` is the optional model catalog for
     ``call_model``. Both are injected so the role is testable with a temp dir and
-    a keyless dry-run model.
+    a keyless dry-run model. ``skills`` (optional) supplies on-demand skills and
+    ``charter``/``overlay`` the vertical's config-driven prompt framing (all
+    default absent → behavior-preserving).
     """
     sink = sink or NullEventSink()
     payload = task.payload or {}
@@ -79,13 +89,18 @@ def run_executor(
     marker = payload.get("marker") or f"studio-ok:{task.id}"
 
     # 1. Model call (dry-run, keyless) — the "execution" reasoning step. The prompt
-    #    is the Executor persona plus any durable lessons prior retros distilled for
-    #    this workstream (ADR-0003), auto-injected before the role acts.
-    prompt = inject_lessons(
+    #    is assembled through the shared role assembler: Executor persona + charter/
+    #    overlay (vertical config) + relevant reviewed skills (ADR-0008) + any
+    #    durable lessons prior retros distilled for this workstream (ADR-0003),
+    #    auto-injected before the role acts.
+    lessons = recall_lesson_texts(conn, task.workstream, f"{goal} {criterion}")
+    selected = skills.select(_EXEC_SKILL_QUERY) if skills is not None else None
+    prompt = compose_role_prompt(
         _EXEC_PROMPT.format(goal=goal, criterion=criterion),
-        conn,
-        task.workstream,
-        f"{goal} {criterion}",
+        workstream_charter=charter,
+        role_overlay=overlay,
+        skills=selected,
+        lessons=lessons,
     )
     completion = call_model(
         role="executor",

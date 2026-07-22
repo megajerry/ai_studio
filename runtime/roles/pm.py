@@ -47,9 +47,10 @@ from ..model.call import call_model as _call_model
 from ..model.providers.dryrun import PLAN_GOAL_OPT
 from ..model.registry import Registry
 from ..models import Task, make_event
-from ..skills import SkillRegistry, compose_prompt
+from ..skills import SkillRegistry
 from ..task_state import assert_acyclic
-from .lessons import inject_lessons
+from .lessons import recall_lesson_texts
+from .prompt import compose_role_prompt
 
 log = logging.getLogger("runtime.roles.pm")
 
@@ -114,17 +115,31 @@ def _confidence_threshold() -> float:
         return DEFAULT_CONFIDENCE_THRESHOLD
 
 
-def _compose_plan_prompt(goal: str, skills: Optional[SkillRegistry]) -> str:
-    """Base plan prompt + any relevant, REVIEWED skills (on-demand injection).
+def _compose_plan_prompt(
+    goal: str,
+    skills: Optional[SkillRegistry],
+    lessons: Optional[list[str]] = None,
+    *,
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
+) -> str:
+    """Assemble the PM's plan prompt through the shared role assembler.
 
-    With no registry the prompt is the inline base (behavior-preserving). With
-    one, only skills relevant to PM planning are selected and only the reviewed
-    ones are injected (:func:`runtime.skills.compose_prompt`).
+    Layers base persona → charter → overlay → relevant reviewed skills → recalled
+    lessons, via :func:`runtime.roles.prompt.compose_role_prompt`. With no registry,
+    no lessons, and no charter/overlay the prompt is the inline base
+    (behavior-preserving). ``charter``/``overlay`` are the vertical's config-driven
+    framing (default ``None``).
     """
     base = _PLAN_PROMPT.format(goal=goal)
-    if skills is None:
-        return base
-    return compose_prompt(base, skills.select(_PM_SKILL_QUERY))
+    selected = skills.select(_PM_SKILL_QUERY) if skills is not None else None
+    return compose_role_prompt(
+        base,
+        workstream_charter=charter,
+        role_overlay=overlay,
+        skills=selected,
+        lessons=lessons,
+    )
 
 
 # --- The structured plan contract -------------------------------------------
@@ -278,18 +293,23 @@ def _obtain_plan(
     registry: Optional[Registry],
     skills: Optional[SkillRegistry],
     call_model: Callable[..., Any],
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
 ) -> Plan:
     """Assemble the prompt, call the model, and parse a :class:`Plan` from it.
 
-    The prompt is the PM persona + relevant reviewed skills (ADR-0008) + any
-    durable lessons prior retros distilled for this workstream (ADR-0003,
-    auto-injected). The ``plan_goal`` option lets the keyless dry-run provider
-    return the deterministic structured plan; a real model reads the goal from the
-    prompt and returns the same schema.
+    The prompt is the PM persona + charter/overlay (vertical config) + relevant
+    reviewed skills (ADR-0008) + any durable lessons prior retros distilled for
+    this workstream (ADR-0003, auto-injected) — all layered by the shared
+    :func:`runtime.roles.prompt.compose_role_prompt`. The ``plan_goal`` option lets
+    the keyless dry-run provider return the deterministic structured plan; a real
+    model reads the goal from the prompt and returns the same schema.
     """
-    prompt = _compose_plan_prompt(goal, skills)
-    prompt = inject_lessons(
-        prompt, conn, task.workstream, f"{goal} success criteria decomposition"
+    lessons = recall_lesson_texts(
+        conn, task.workstream, f"{goal} success criteria decomposition"
+    )
+    prompt = _compose_plan_prompt(
+        goal, skills, lessons, charter=charter, overlay=overlay
     )
     completion = call_model(
         role="pm",
@@ -313,6 +333,8 @@ def run_pm_tick(
     *,
     registry: Optional[Registry] = None,
     skills: Optional[SkillRegistry] = None,
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
     enqueue: Callable[..., Task] = None,  # type: ignore[assignment]
     call_model: Callable[..., Any] = _call_model,
     request_approval: Callable[..., Any] = _request_approval,
@@ -333,6 +355,7 @@ def run_pm_tick(
     plan = _obtain_plan(
         conn, task, goal, sink,
         registry=registry, skills=skills, call_model=call_model,
+        charter=charter, overlay=overlay,
     )
     threshold = _confidence_threshold()
 

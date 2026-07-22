@@ -69,6 +69,37 @@ def compose_lessons(
     return "\n".join(blocks).rstrip() + "\n"
 
 
+def recall_lesson_texts(
+    conn: Any,
+    workstream: Optional[str],
+    query: str,
+    *,
+    k: int = DEFAULT_LIMIT,
+    min_score: Optional[float] = None,
+    recall: Callable[..., list] = _recall_lessons,
+) -> list[str]:
+    """Recall the lesson TEXTS most relevant to ``query`` (workstream-scoped).
+
+    The recall half of :func:`inject_lessons`, exposed so the shared prompt
+    assembler (:mod:`runtime.roles.prompt`) can layer lessons alongside charter /
+    overlay / skills without re-implementing recall. Returns ``[]`` when there is
+    no ``conn``/``workstream``, when nothing is recalled, or when recall fails —
+    so a role is never blocked by the learning layer. See :func:`inject_lessons`
+    for the ``min_score`` floor semantics.
+    """
+    if conn is None or not workstream:
+        return []
+    # Only thread min_score when set, so a custom `recall` seam whose signature
+    # predates the floor keeps working (behavior-preserving when min_score=None).
+    extra = {} if min_score is None else {"min_score": min_score}
+    try:
+        items = recall(conn, workstream, query, k=k, **extra)
+    except Exception:  # pragma: no cover - defensive: never let recall break a role
+        logger.exception("lesson recall failed; proceeding with base prompt")
+        return []
+    return [getattr(it, "text", "") for it in items]
+
+
 def inject_lessons(
     base_prompt: str,
     conn: Any,
@@ -91,15 +122,7 @@ def inject_lessons(
     relevant lessons; ``None`` (default) applies no floor (behavior-preserving).
     See :data:`RECOMMENDED_MIN_SCORE` for the suggested production value.
     """
-    if conn is None or not workstream:
-        return base_prompt
-    # Only thread min_score when set, so a custom `recall` seam whose signature
-    # predates the floor keeps working (behavior-preserving when min_score=None).
-    extra = {} if min_score is None else {"min_score": min_score}
-    try:
-        items = recall(conn, workstream, query, k=k, **extra)
-    except Exception:  # pragma: no cover - defensive: never let recall break a role
-        logger.exception("lesson recall failed; proceeding with base prompt")
-        return base_prompt
-    texts = [getattr(it, "text", "") for it in items]
+    texts = recall_lesson_texts(
+        conn, workstream, query, k=k, min_score=min_score, recall=recall
+    )
     return compose_lessons(base_prompt, texts, limit=limit)
