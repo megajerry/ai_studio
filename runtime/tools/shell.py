@@ -49,6 +49,21 @@ class ShellTool(Tool):
         #: Injected later when the Docker sandbox lands; ``None`` = refuse.
         self.sandbox = sandbox
 
+    @classmethod
+    def with_docker_sandbox(cls, **runner_kwargs) -> "ShellTool":
+        """Build a :class:`ShellTool` backed by a :class:`DockerSandboxRunner`.
+
+        Convenience wiring for the concrete Docker sandbox (config resolves from
+        ``SANDBOX_*`` env / ``runner_kwargs``). Docker is imported **lazily** here
+        and is not required at module import; a container is only ever launched
+        when :meth:`execute` runs — which, because ``shell.exec`` is 🔴, only
+        happens after the policy engine resolves a human approval. The tier gate
+        and the refuse-without-sandbox guard are both unchanged.
+        """
+        from ..sandbox import DockerSandboxRunner
+
+        return cls(sandbox=DockerSandboxRunner(**runner_kwargs))
+
     def execute(self, **kwargs) -> ToolResult:
         command = kwargs.get("command")
         if not command:
