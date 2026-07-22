@@ -138,12 +138,18 @@ def _handle_pm_tick(
     plan = run_pm(conn, task, sink, registry=model_registry, skills=skills, enqueue=enqueue)
     heartbeat(conn, task.id, worker_id)
     complete(conn, task.id, result=plan.model_dump(), status=TaskStatus.DONE)
+    if plan.decision == "planned":
+        detail = f"decomposed into {plan.work_item_count} work item(s): {plan.work_task_ids}"
+    elif plan.decision == "pushback":
+        detail = f"pushed back (🛑 approval {plan.approval_id}): {plan.reason}"
+    else:  # needs_clarification
+        detail = f"needs clarification: {plan.reason}"
     return RunResult(
         task_id=str(task.id),
         task_type=task.type,
         kind="pm",
         outcome="done",
-        detail=f"enqueued work task {plan.work_task_id}",
+        detail=detail,
     )
 
 

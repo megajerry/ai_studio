@@ -15,7 +15,7 @@ to the dry-run provider when no key is present.
 
 | File | Purpose |
 | --- | --- |
-| `roles/pm.py` | `run_pm_tick` — plan + confidence gate, enqueue ONE work task; emits `pm.planned` |
+| `roles/pm.py` | `run_pm_tick` — understand → confidence-gate → **decompose**: parse a structured `Plan` from `call_model(task_type=plan)`, then enqueue ONE `work.*` task **per work item** (emits `pm.planned` w/ count+ids); or push back (`pm.pushback` + 🛑 approval) / clarify (`pm.needs_clarification`) |
 | `roles/executor.py` | `run_executor` — DO the work: a policy-gated `filesystem` write + a `call_model` dry-run call |
 | `roles/verifier.py` | `verify` — INDEPENDENT verify→commit gate (read-only); returns pass/fail |
 | `roles/retro.py` | `run_retro` — distill 1-3 durable **lessons** from an episode's trail into Knowledge memory; emits `retro.completed` (count only) |
@@ -38,11 +38,15 @@ to the dry-run provider when no key is present.
 scheduler.tick_once ──enqueue──> pm.tick
         │
         ▼  worker.run_once (claim pm.tick)
-   PM: confidence gate (call_model role=pm task_type=plan)  ──emits──> model.routed, model.call
-       define success criterion + marker
-       enqueue ONE work.demo task (payload: goal, criterion, marker)  ──emits──> pm.planned, task.created
+   PM: obtain a structured Plan (call_model role=pm task_type=plan)  ──emits──> model.routed, model.call
+       parse JSON → Plan{restated_goal, success_criteria, confidence, feasible, work_items}
+       CONFIDENCE GATE:
+         · not feasible          → pm.pushback + 🛑 approval (request_approval)   [NO work]
+         · confidence < threshold → pm.needs_clarification                        [NO work]
+         · else → DECOMPOSE: enqueue ONE work.* task per work_item
+                  (payload: goal, criterion, marker) ──emits──> pm.planned (count+ids), task.created ×N
         │
-        ▼  worker.run_once (claim work.demo)   [heartbeats around each phase]
+        ▼  worker.run_once (claim each work.* task)   [heartbeats around each phase]
    Executor: call_model(role=exec task_type=execute)         ──emits──> model.routed, model.call
              invoke(role=executor, filesystem, op=write ...)  ──emits──> policy.decision, tool.invoked
    Verifier: call_model(role=verifier task_type=verify)      ──emits──> model.routed, model.call
@@ -53,6 +57,30 @@ scheduler.tick_once ──enqueue──> pm.tick
         └─ fail → complete_task(status=failed) + bounded re-enqueue (attempt+1)
                                                               ──emits──> task.finished, work.retry
 ```
+
+**The PM contract — understand → gate → decompose (ADR-0003).** The PM is the
+supervisor and the only role that plans. It does not hard-code a single work task;
+it obtains a **structured `Plan`** (a `pydantic` model: `restated_goal`,
+`success_criteria`, a self-scored `confidence` ∈ [0,1], `feasible` + `reason`, and
+`work_items`) by parsing the planning `call_model` output (defensively — unparseable
+output degrades to a safe low-confidence fallback, never a crash). It then runs the
+**confidence gate**:
+
+- **not feasible** → *push back* (a first-class output, ADR-0003): emit
+  `pm.pushback` and raise a 🛑 human approval via `approvals.request_approval`
+  (objective/scope concern, ADR-0006). No work is enqueued.
+- **confidence < `PM_CONFIDENCE_THRESHOLD`** (env, default `0.6`) or nothing to
+  decompose → *clarify*: emit `pm.needs_clarification` instead of executing.
+- **otherwise** → *decompose*: enqueue ONE `work.*` task **per `WorkItem`**, each
+  carrying its own concrete, marker-based `criterion` in the payload so the
+  Verifier still checks a real artifact per item; emit `pm.planned` with the item
+  **count + task ids** (never prompt/secret text).
+
+Keyless, the plan comes from the dry-run provider's deterministic
+`build_dry_run_plan` (2–3 marker-based items derived from the goal); a real model
+wired later returns the same JSON schema from the natural-language prompt, so no PM
+code changes. `call_model`, `enqueue`, and `request_approval` are injectable seams
+so every gate branch is unit-tested with no database.
 
 **verify → commit is enforced**: a `work.*` task never becomes `done` until the
 Verifier returns `passed`. The Verifier is a *separate* role, granted only
@@ -187,6 +215,8 @@ verification) — it never hangs.
 - `WORKER_MAX_WORK_ATTEMPTS` — verify-fail re-enqueues before failing (default 2).
 - `WORKER_RETRO` — when a terminal work task triggers a Retro: `on_fail`
   (default) | `always` | `off` (the learning-loop trigger; adaptive-lite).
+- `PM_CONFIDENCE_THRESHOLD` — the PM confidence gate threshold (default `0.6`);
+  a plan scoring below it yields `pm.needs_clarification` instead of executing.
 - `MODELS_DRY_RUN=1` — force keyless dry-run (the demo sets this).
 
 ## Verify

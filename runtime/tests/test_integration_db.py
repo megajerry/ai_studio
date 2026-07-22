@@ -392,10 +392,74 @@ def test_worker_full_loop_pm_to_done(conn, ws, tmp_path, monkeypatch):
     r1 = run_once(conn, "it-worker", sink, registry=registry, config=config, workstream=ws)
     assert r1 is not None and r1.kind == "pm" and r1.outcome == "done"
 
-    r2 = run_once(conn, "it-worker", sink, registry=registry, config=config, workstream=ws)
-    assert r2 is not None and r2.kind == "work" and r2.outcome == "done"
+    # The PM decomposed the goal into N>1 real work tasks in the live queue.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM tasks WHERE workstream = %s AND type LIKE 'work.%%'",
+            (ws,),
+        )
+        n_work = cur.fetchone()["n"]
+    conn.commit()
+    assert n_work > 1, f"expected decomposition into >1 work items, got {n_work}"
+
+    # Drain every decomposed work item → each reaches verified done.
+    done = 0
+    while True:
+        r = run_once(conn, "it-worker", sink, registry=registry, config=config, workstream=ws)
+        if r is None:
+            break
+        assert r.kind == "work" and r.outcome == "done"
+        done += 1
+    assert done == n_work
 
     types = [e.type for e in read_events(conn, workstream=ws)]
     for required in ("task.created", "pm.planned", "model.routed", "model.call",
                      "policy.decision", "tool.invoked", "task.finished"):
         assert required in types, f"missing {required} in {types}"
+
+
+def test_pm_pushback_creates_approval_and_enqueues_no_work(conn, ws, monkeypatch):
+    """Against a live DB: an INFEASIBLE plan makes the PM push back — it raises a
+    real 🛑 approval row and enqueues NO work (the confidence gate's pushback arm)."""
+    from runtime.approvals import STATUS_PENDING, pending_approvals
+    from runtime.enforce import DbEventSink
+    from runtime.roles.pm import run_pm_tick
+
+    for env in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setenv("MODELS_DRY_RUN", "1")
+
+    sink = DbEventSink(conn)
+    tick = tick_once(conn, workstream=ws)
+    assert tick is not None
+    claimed = claim_task(conn, worker_id="pm", workstream=ws)
+    assert claimed is not None
+
+    infeasible = {
+        "restated_goal": "delete all of production",
+        "confidence": 0.95, "feasible": False,
+        "reason": "destructive + out of scope", "work_items": [],
+    }
+    plan = run_pm_tick(
+        conn, claimed, sink,
+        call_model=lambda **kw: type("C", (), {"text": __import__("json").dumps(infeasible)})(),
+    )
+    assert plan.decision == "pushback" and plan.approval_id
+
+    # No work.* task was enqueued for this workstream.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM tasks WHERE workstream = %s AND type LIKE 'work.%%'",
+            (ws,),
+        )
+        assert cur.fetchone()["n"] == 0
+    conn.commit()
+
+    # A real 🛑 approval row exists, pending, for this pm.tick.
+    pend = [a for a in pending_approvals(conn) if a.task_id == claimed.id]
+    assert pend and pend[0].tier == "🛑" and pend[0].status == STATUS_PENDING
+    assert pend[0].role == "pm"
+
+    types = [e.type for e in read_events(conn, workstream=ws)]
+    assert "pm.pushback" in types and "approval.requested" in types
+    assert "pm.planned" not in types
