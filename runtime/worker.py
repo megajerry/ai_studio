@@ -51,7 +51,7 @@ from .approvals import (
     get_approval,
 )
 from .db import connect
-from .enforce import DbEventSink, EventSink, InvokeStatus, NullEventSink
+from .enforce import DbEventSink, EventSink, InvokeStatus, NullEventSink, invoke
 from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
 from .roles.executor import run_executor
@@ -72,7 +72,7 @@ from .tasks import (
     requeue_blocked_task,
     transition,
 )
-from .tools import FilesystemTool, ShellTool, ToolRegistry
+from .tools import CodingTool, FilesystemTool, ShellTool, ToolRegistry
 
 log = logging.getLogger("runtime.worker")
 
@@ -87,6 +87,16 @@ EVENT_REVIEW_TRIGGERED = "review.triggered"
 
 #: Event emitted when a task blocked on a 🔴 approval is re-queued after a grant.
 EVENT_APPROVAL_RESUMED = "approval.resumed"
+
+#: Coding-worker dispatch (architecture §14). A "Need Prototype" task routes to the
+#: policy-gated `coding` tool, which runs opencode INSIDE the sandbox. Kept distinct
+#: from the generic `work.*` dev/review loop so the coding path has no retry loop.
+CODE_TASK_TYPES = ("work.code", "prototype")
+
+#: Role the coding dispatch runs as — the Builder (§14: it only knows "Need
+#: Prototype"). It is granted `code.run` in the policy; the 🔴 tier still forces a
+#: human approval before opencode ever runs.
+CODE_WORKER_ROLE = "builder"
 
 DEFAULT_IDLE_SLEEP_S = 5.0
 DEFAULT_MAX_WORK_ATTEMPTS = 2
@@ -125,7 +135,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "work" | "retro" | "review" | "research" | "unknown"
+    #: "pm" | "work" | "code" | "retro" | "review" | "research" | "unknown"
     kind: str
     #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
@@ -139,6 +149,10 @@ def build_registry(scratch_dir: str) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(FilesystemTool(root=scratch_dir))
     reg.register(ShellTool())
+    # The coding worker (opencode) dispatch tool. Registered WITHOUT a sandbox by
+    # default — like ShellTool it then refuses to run on the host; a real host
+    # wires `CodingTool.with_docker_sandbox(...)` (see runtime/coding-worker.md).
+    reg.register(CodingTool())
     return reg
 
 
@@ -532,6 +546,91 @@ def _handle_review(
     )
 
 
+def _handle_code(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    registry: ToolRegistry,
+    config: Optional[PolicyConfig],
+    heartbeat: Heartbeater,
+    complete: Completer,
+    block: Blocker,
+    worker_id: str,
+    invoke_tool: Callable[..., Any] = invoke,
+) -> RunResult:
+    """Dispatch a "Need Prototype" coding task to the coding worker (architecture §14).
+
+    A single, loop-free pass: the Builder invokes the policy-gated ``coding`` tool,
+    which runs opencode **inside the sandbox** (never the host). Because
+    ``code.run`` is 🔴, the very first :func:`invoke` returns NEEDS_APPROVAL and the
+    task is parked ``blocked`` on that approval — :func:`resume_approved` re-queues
+    it once a human grants it, and on that retry ``invoke`` finds the grant and the
+    coding worker actually runs (one grant = one run). No verify/retry loop lives
+    here: the worker's own exit status is the pass/fail signal.
+    """
+    heartbeat(conn, task.id, worker_id)
+    payload = task.payload or {}
+    goal = payload.get("goal", "")
+    workspace = payload.get("workspace")
+
+    # Policy-gated dispatch. conn opts into the persisted approval loop (find grant
+    # / pend). The tool NEVER runs on the host — it refuses without a sandbox.
+    result = invoke_tool(
+        role=CODE_WORKER_ROLE,
+        tool_name="coding",
+        registry=registry,
+        config=config,
+        events=sink,
+        conn=conn,
+        workstream=task.workstream,
+        task_id=task.id,
+        goal=goal,
+        workspace=workspace,
+    )
+    heartbeat(conn, task.id, worker_id)
+
+    # 🔴 human-in-the-loop: the dispatch PENDed on an approval. Park the task
+    # `blocked` on it and STOP; resume_approved re-queues it once granted.
+    if result.status is InvokeStatus.PENDING:
+        block(conn, task.id, approval_id=result.approval_id, reason="awaiting 🔴 approval")
+        return RunResult(
+            task_id=str(task.id), task_type=task.type, kind="code",
+            outcome="blocked", detail=f"blocked on approval {result.approval_id}",
+        )
+
+    if result.status is InvokeStatus.DENIED:
+        complete(
+            conn, task.id,
+            result={"denied": True, "reason": result.decision.reason},
+            status=TaskStatus.ABANDONED,
+        )
+        return RunResult(
+            task_id=str(task.id), task_type=task.type, kind="code",
+            outcome="failed", detail=f"coding dispatch denied: {result.decision.reason}",
+        )
+
+    # EXECUTED (a human grant authorized it): the coding worker ran in the sandbox.
+    tool_result = result.result
+    worker_ok = bool(tool_result and tool_result.ok)
+    output = tool_result.output if tool_result else None
+    complete(
+        conn, task.id,
+        result={
+            "worker_ok": worker_ok,
+            "worker_cmd": (tool_result.metadata.get("worker_cmd") if tool_result else None),
+            "produced_files": (output or {}).get("produced_files") if isinstance(output, dict) else None,
+            "exit_code": (output or {}).get("exit_code") if isinstance(output, dict) else None,
+        },
+        status=TaskStatus.MERGED if worker_ok else TaskStatus.ABANDONED,
+    )
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="code",
+        outcome="done" if worker_ok else "failed",
+        detail=("coding worker succeeded" if worker_ok else "coding worker failed"),
+    )
+
+
 def run_once(
     conn: Any,
     worker_id: str,
@@ -612,6 +711,17 @@ def run_once(
             registry=registry, config=config, model_registry=model_registry,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
             run_review=run_review, skills=skills,
+        )
+
+    if task.type in CODE_TASK_TYPES:
+        # "Need Prototype" → the coding worker (opencode) dispatch, run inside the
+        # sandbox via the policy-gated `coding` tool. Checked BEFORE the generic
+        # `work.*` branch so `work.code` takes the loop-free coding path (§14).
+        return _handle_code(
+            conn, task, sink,
+            registry=registry, config=config,
+            heartbeat=heartbeat, complete=complete, block=block,
+            worker_id=worker_id,
         )
 
     if task.type.startswith("work."):

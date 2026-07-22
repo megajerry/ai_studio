@@ -2,6 +2,23 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
+## Latest (branch `runtime/coding-worker` — complete, awaiting review/merge)
+
+**Coding-worker dispatch (architecture §14).** A "Need Prototype" coding task
+(`work.code` / `prototype`) now routes through a new policy-gated `coding` tool
+(`runtime/tools/coding.py`, capability `code.run` 🔴) that runs **opencode inside
+the Docker sandbox** (never the host) via the existing `SandboxRunner` seam —
+`invoke(role="builder", tool_name="coding", …)` → 🔴 NEEDS_APPROVAL → parked
+`blocked` → resumed by the existing approval flow → runs once on a grant. opencode
+is swappable via `CODING_WORKER_CMD` (default `opencode`); the tool reads no
+secrets (env-allowlist passthrough only). The worker's coding path is loop-free
+(worker exit status = pass/fail: merge on success, abandon on failure/deny). Two
+guards (like `ShellTool`): 🔴 tier gate + refuse-without-sandbox. Disjoint file
+set: `runtime/tools/coding.py`, `runtime/capabilities.py` (`code.run`→🔴),
+`runtime/worker.py` (dispatch), `runtime/policy.example.yaml` (builder grant),
+tests, `runtime/coding-worker.md`. Docker/opencode NOT available here → structural
++ mocked; real container run is **host-deferred** (see `runtime/coding-worker.md`).
+
 ## Recently merged (verified on the live DB)
 
 Task-lifecycle state machine + dependency DAG + telemetry (ADR-0015), real
