@@ -33,7 +33,10 @@ Any actor that intends to change this repo follows this loop:
    back to `main`**, not by in-branch commits. Open a PR, then **spawn a dedicated
    review agent**. The reviewer and the owning agent iterate until the reviewer
    **approves**. The reviewer is a separate actor from the author — never
-   self-approve.
+   self-approve. The review must be **evidence-based** ([ADR-0014](docs/decisions/0014-validation-rigor.md)):
+   the reviewer runs the tests/code, reads the actual code path, and greps for
+   itself — an unverified claim (the PR description, a comment, "tests pass") is
+   treated as unproven, never as fact.
 
 4. **Merge & clean up.** Once approved, merge into `main`, **push `main`**
    (push after review/QA — don't wait to be asked), then **archive/delete the

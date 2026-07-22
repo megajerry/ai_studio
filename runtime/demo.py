@@ -142,9 +142,10 @@ def main() -> int:
                       skills=skills, workstream=workstream)
         print(f"  worker#1: {r1.kind} {r1.outcome} — {r1.detail}" if r1 else "  worker#1: nothing claimed")
 
-        # 3. Worker pass — Executor does the work, Verifier checks, commit.
+        # 3. Worker pass — Executor does the work, Verifier checks (with the
+        #    `rigorous-review` doctrine injected), commit on evidence.
         r2 = run_once(conn, worker_id, sink, registry=registry, config=config,
-                      workstream=workstream)
+                      skills=skills, workstream=workstream)
         print(f"  worker#2: {r2.kind} {r2.outcome} — {r2.detail}" if r2 else "  worker#2: nothing claimed")
 
         _print_event_trail(conn, workstream)

@@ -19,7 +19,9 @@ from runtime.models import Task, TaskStatus
 from runtime.policy import Effect, load_policy
 from runtime.roles.executor import ExecutorResult, run_executor
 from runtime.roles.pm import WORK_TASK_TYPE, run_pm_tick
+from runtime.roles import verifier as verifier_mod
 from runtime.roles.verifier import verify
+from runtime.skills import SkillRegistry, default_root
 from runtime.tools import FilesystemTool, ShellTool, ToolRegistry
 
 
@@ -163,6 +165,88 @@ def test_verify_fails_when_no_artifact(tmp_path):
                             invoke_status="denied")
     verdict = verify(None, task, result, sink, registry=reg, config=load_policy())
     assert not verdict.passed and "no artifact" in verdict.reason
+
+
+# --- Evidence over claims (ADR-0014) ----------------------------------------
+
+
+def test_verify_evidence_beats_false_done_claim(tmp_path, monkeypatch):
+    """The Executor CLAIMS success (ok=True) and the (dry-run) model 'says done',
+    but the real artifact does NOT satisfy the criterion (no marker). The Verifier
+    trusts the observed artifact, not the claim → FAIL. Evidence beats the claim."""
+    sink = MemoryEventSink()
+    reg = _fs_registry(tmp_path)
+    marker = "studio-ok:xyz"
+    # The artifact exists but does NOT contain the required marker (criterion unmet).
+    (tmp_path / "art.txt").write_text("all good, trust me — done!\n")
+
+    # Force the model judgement to loudly claim success, proving the verdict does
+    # not depend on the model's/executor's word.
+    class _SaysDone:
+        text = "PASS — the work is done and verified by the author."
+
+    monkeypatch.setattr(verifier_mod, "call_model", lambda **kw: _SaysDone())
+
+    task = _task(WORK_TASK_TYPE,
+                 {"criterion": f"artifact contains {marker!r}", "marker": marker})
+    # ok=True is the Executor's (false) claim of success.
+    result = ExecutorResult(ok=True, artifact_path="art.txt", marker=marker,
+                            invoke_status="executed")
+
+    verdict = verify(None, task, result, sink, registry=reg, config=load_policy())
+
+    assert not verdict.passed  # evidence (artifact) overrides the "done" claim
+    assert marker in verdict.reason and "not found" in verdict.reason
+    assert "verify.failed" in sink.types()
+
+
+def test_verify_prompt_includes_injected_doctrine(tmp_path, monkeypatch):
+    """With a skill registry provided, the Verifier's model prompt carries the
+    injected `rigorous-review` evidence-over-claims doctrine (ADR-0008/0014)."""
+    sink = MemoryEventSink()
+    reg = _fs_registry(tmp_path)
+    marker = "studio-ok:abc"
+    (tmp_path / "art.txt").write_text(f"{marker}\n")
+
+    captured: dict = {}
+
+    def fake_call_model(*, messages, **kw):
+        captured["prompt"] = messages[0]["content"]
+        return type("C", (), {"text": "ok"})()
+
+    monkeypatch.setattr(verifier_mod, "call_model", fake_call_model)
+
+    skills = SkillRegistry.discover(default_root())
+    task = _task(WORK_TASK_TYPE, {"criterion": "c", "marker": marker})
+    result = ExecutorResult(ok=True, artifact_path="art.txt", marker=marker,
+                            invoke_status="executed")
+
+    verdict = verify(None, task, result, sink, registry=reg, config=load_policy(),
+                     skills=skills)
+
+    assert verdict.passed  # marker present → real evidence confirms
+    prompt = captured["prompt"]
+    assert "You are the studio Verifier" in prompt          # base persona preserved
+    assert "rigorous-review" in prompt                       # skill injected
+    assert "evidence" in prompt.lower() and "UNVERIFIED" in prompt
+
+
+def test_verify_prompt_unchanged_without_skills(tmp_path, monkeypatch):
+    """No registry → the inline base prompt only (behavior-preserving)."""
+    sink = MemoryEventSink()
+    reg = _fs_registry(tmp_path)
+    (tmp_path / "art.txt").write_text("studio-ok:z\n")
+    captured: dict = {}
+    monkeypatch.setattr(
+        verifier_mod, "call_model",
+        lambda *, messages, **kw: captured.setdefault("p", messages[0]["content"])
+        or type("C", (), {"text": "ok"})(),
+    )
+    task = _task(WORK_TASK_TYPE, {"criterion": "c", "marker": "studio-ok:z"})
+    result = ExecutorResult(ok=True, artifact_path="art.txt", marker="studio-ok:z",
+                            invoke_status="executed")
+    verify(None, task, result, sink, registry=reg, config=load_policy())
+    assert "### Skills" not in captured["p"]
 
 
 # --- Policy gate: 🔴 tools never execute for a role that lacks the capability --

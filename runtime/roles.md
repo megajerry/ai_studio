@@ -58,6 +58,30 @@ scheduler.tick_once ──enqueue──> pm.tick
 Verifier returns `passed`. The Verifier is a *separate* role, granted only
 `fs.read`, so it can inspect but never "fix" the work it judges (independence).
 
+## Validator doctrine — evidence over claims (ADR-0014)
+
+Every **validator** in the studio — the Verifier today, the future
+**Reviewer / Whistle-blower** ([ADR-0003](../docs/decisions/0003-workstream-operating-model.md)),
+and any review/audit agent — adopts one doctrine: **trust only evidence you
+observe yourself, never the author's claim.** LLMs default to accepting stated
+claims as true; for a validator that is a defect.
+
+- The doctrine is packaged as the reusable, reviewed **`rigorous-review`** skill
+  (`skills/rigorous-review/SKILL.md`), injected on demand into a validator's
+  prompt via the registry (`skills.inject.compose_prompt`), exactly as the PM
+  injects `define-success-criteria`.
+- Evidence hierarchy: (1) run the command/test and read its real output; (2) read
+  the actual code path; (3) inspect logs/metrics/DB rows/artifacts. NOT the
+  author's summary, comments, commit message, or an unrun "the test asserts X".
+- Per claim: cite the specific evidence and a verdict CONFIRMED / UNVERIFIED /
+  REFUTED; unobtainable evidence ⇒ UNVERIFIED — **never approve on trust.**
+- The **Verifier** already lives this: its verdict is the deterministic re-read of
+  the ACTUAL artifact against the success criterion (`_check`), NOT the Executor's
+  `result.ok`. A false "done" claim over an artifact that fails the criterion
+  still FAILS (`runtime/tests/test_roles.py::test_verify_evidence_beats_false_done_claim`).
+- The future Reviewer/Whistle-blower role (not built here) is expected to select
+  the same skill and follow the same per-claim protocol before approving a change.
+
 ## The learning loop (ADR-0003)
 
 The studio *learns from mistakes over time* structurally, not by hoping the model

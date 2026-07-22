@@ -199,6 +199,22 @@ def test_example_skills_all_load_and_are_reviewed():
         assert skill.triggers  # discoverable
 
 
+def test_rigorous_review_skill_loads_and_is_reviewed():
+    """The evidence-over-claims doctrine (ADR-0014) ships as a reviewed skill that
+    a validator selects on its validation triggers."""
+    reg = SkillRegistry.discover(default_root())
+    skill = reg.get("rigorous-review")
+    assert skill is not None, "rigorous-review skill must be discoverable"
+    assert skill.reviewed is True and skill.source == "in-repo"
+    # Selectable by every validation trigger the doctrine claims.
+    for query in ("verify", "review", "validate", "audit", "check"):
+        assert skill in reg.select(query), f"not selected for {query!r}"
+    # The body encodes the doctrine, not just a title.
+    body = skill.instructions.lower()
+    assert "evidence" in body and "unverified" in body
+    assert "commit message" in body  # explicitly names what is NOT evidence
+
+
 # --- role prompt composition (PM) -------------------------------------------
 
 
