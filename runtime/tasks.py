@@ -18,7 +18,8 @@ from .models import Assignee, EventType, Task, TaskStatus, make_event
 
 _TASK_COLUMNS = (
     "id, workstream, type, status, priority, assignee, payload, result, "
-    "heartbeat_at, claimed_by, budget_tokens, spent_tokens, created_at, updated_at"
+    "heartbeat_at, claimed_by, budget_tokens, spent_tokens, retries, "
+    "created_at, updated_at"
 )
 
 
@@ -236,3 +237,37 @@ def find_stale_tasks(
     if not conn.autocommit:
         conn.commit()
     return [Task.model_validate(r) for r in rows]
+
+
+def rekick_task(conn: psycopg.Connection, task_id: UUID) -> Optional[Task]:
+    """Re-queue a stale in-progress task for a fresh worker; emit ``task.rekicked``.
+
+    This is the non-agent supervisor's core action (ADR-0004): a task whose
+    worker went silent is reset to ``queued`` with its claim and heartbeat
+    cleared and ``retries`` incremented, so the runtime can materialize a fresh
+    worker to service it. Guarded to ``in_progress`` (like :func:`heartbeat`)
+    so a task that changed state between the supervisor's scan and this write is
+    left untouched (returns ``None``, no event). Runs in one transaction so the
+    state change and its event commit atomically.
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE tasks
+                SET status = 'queued',
+                    claimed_by = NULL,
+                    heartbeat_at = NULL,
+                    retries = retries + 1,
+                    updated_at = now()
+                WHERE id = %s AND status = 'in_progress'
+                RETURNING {_TASK_COLUMNS}
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            task = Task.model_validate(row)
+        _emit(conn, task, EventType.TASK_REKICKED, retries=task.retries)
+    return task

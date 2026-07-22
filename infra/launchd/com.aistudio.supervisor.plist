@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd TEMPLATE for the non-agent supervisor (ADR-0004) — the irreducible
+  liveness guarantee. KeepAlive=true means the OS restarts it whenever it exits
+  or crashes: the supervisor is the one thing that must never silently die.
+
+  Setup (see runtime/supervisor.md):
+    1. Replace __REPO_DIR__ with the absolute path to this repo checkout and
+       __PYTHON__ with the interpreter (e.g. the venv's bin/python).
+    2. cp this file to ~/Library/LaunchAgents/com.aistudio.supervisor.plist
+    3. launchctl load  ~/Library/LaunchAgents/com.aistudio.supervisor.plist
+       launchctl unload ~/Library/LaunchAgents/com.aistudio.supervisor.plist  # to stop
+  DATABASE_URL (or POSTGRES_*) must be resolvable; here we source it from .env.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aistudio.supervisor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>-m</string>
+        <string>runtime.supervisor</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>SUPERVISOR_INTERVAL_S</key>
+        <string>30</string>
+        <key>SUPERVISOR_STALE_S</key>
+        <string>120</string>
+        <key>SUPERVISOR_MAX_RETRIES</key>
+        <string>5</string>
+    </dict>
+
+    <!-- Always-on: run at load and restart whenever it exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Back off if it crash-loops so a broken build doesn't spin the CPU. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/state/logs/supervisor.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/state/logs/supervisor.err.log</string>
+</dict>
+</plist>

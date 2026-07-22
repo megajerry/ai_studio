@@ -19,12 +19,15 @@ from runtime import db
 from runtime.events import append_event, read_events
 from runtime.migrate import migrate
 from runtime.models import Assignee, TaskStatus, make_event
+from runtime.scheduler import PM_TICK_TYPE, tick_once
+from runtime.supervisor import sweep
 from runtime.tasks import (
     claim_task,
     complete_task,
     enqueue_task,
     find_stale_tasks,
     heartbeat,
+    rekick_task,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -183,3 +186,78 @@ def test_find_stale_tasks(conn, ws):
     assert t.id in stale_ids
     # Not stale under a large threshold.
     assert t.id not in {s.id for s in find_stale_tasks(conn, threshold_seconds=10_000)}
+
+
+# --- supervisor: re-kick + exhausted-fail (M3a) -----------------------------
+
+
+def _backdate_heartbeat(conn, task_id, seconds=300):
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET heartbeat_at = now() - make_interval(secs => %s) WHERE id = %s",
+                (seconds, task_id),
+            )
+
+
+def test_rekick_resets_task_and_emits_event(conn, ws):
+    t = enqueue_task(conn, workstream=ws, type="t")
+    claim_task(conn, worker_id="w1", workstream=ws)
+    kicked = rekick_task(conn, t.id)
+    assert kicked is not None
+    assert kicked.status is TaskStatus.QUEUED
+    assert kicked.claimed_by is None
+    assert kicked.heartbeat_at is None
+    assert kicked.retries == 1
+    assert [e.type for e in read_events(conn, task_id=t.id)][-1] == "task.rekicked"
+
+
+def test_rekick_guarded_to_in_progress(conn, ws):
+    # A queued (unclaimed) task is not re-kicked; no event, no counter bump.
+    t = enqueue_task(conn, workstream=ws, type="t")
+    assert rekick_task(conn, t.id) is None
+    assert [e.type for e in read_events(conn, task_id=t.id)] == ["task.created"]
+
+
+def test_sweep_rekicks_then_force_fails_at_max(conn, ws):
+    t = enqueue_task(conn, workstream=ws, type="t")
+    claim_task(conn, worker_id="w1", workstream=ws)
+
+    # First stale sweep re-kicks (retries 0 -> 1).
+    _backdate_heartbeat(conn, t.id)
+    res1 = sweep(conn, threshold_s=60, max_retries=1)
+    assert t.id in res1.rekicked
+
+    # Re-claim, go stale again; now retries (1) >= max (1) → force-failed.
+    claim_task(conn, worker_id="w2", workstream=ws)
+    _backdate_heartbeat(conn, t.id)
+    res2 = sweep(conn, threshold_s=60, max_retries=1)
+    assert t.id in res2.failed
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, retries FROM tasks WHERE id = %s", (t.id,))
+        row = cur.fetchone()
+    conn.commit()
+    assert row["status"] == "failed"
+    types = [e.type for e in read_events(conn, task_id=t.id)]
+    # Both the re-kick and the exhausted-fail are traceable in the log; the fail
+    # also emits task.finished (via complete_task). (task.finished and
+    # task.failed_exhausted share one transaction timestamp, so their relative
+    # order is not asserted.)
+    assert "task.rekicked" in types
+    assert "task.failed_exhausted" in types
+    assert "task.finished" in types
+
+
+# --- scheduler: PM pulse enqueue-vs-skip (M3a) ------------------------------
+
+
+def test_tick_once_enqueues_then_skips(conn, ws):
+    first = tick_once(conn, workstream=ws)
+    assert first is not None and first.type == PM_TICK_TYPE
+    # A pm.tick is now queued → second tick is skipped (no pileup).
+    assert tick_once(conn, workstream=ws) is None
+    # Finalize it; then a fresh tick is allowed again.
+    claim_task(conn, worker_id="pm", workstream=ws)
+    complete_task(conn, first.id, status=TaskStatus.DONE)
+    assert tick_once(conn, workstream=ws) is not None

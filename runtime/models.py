@@ -46,6 +46,10 @@ class EventType(str, Enum):
     TASK_CLAIMED = "task.claimed"
     TASK_HEARTBEAT = "task.heartbeat"
     TASK_FINISHED = "task.finished"
+    # Emitted by the non-agent supervisor (ADR-0004) when it re-kicks a task
+    # whose worker went stale, or force-fails one that exhausted its retries.
+    TASK_REKICKED = "task.rekicked"
+    TASK_FAILED_EXHAUSTED = "task.failed_exhausted"
 
 
 # --- Row models -------------------------------------------------------------
@@ -90,6 +94,9 @@ class Task(BaseModel):
     claimed_by: Optional[str] = None
     budget_tokens: Optional[int] = None
     spent_tokens: int = 0
+    # Times the supervisor has re-kicked this task after a stale heartbeat
+    # (ADR-0004). Force-failed once it reaches the configured max.
+    retries: int = 0
     created_at: datetime
     updated_at: datetime
 
