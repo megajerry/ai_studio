@@ -29,6 +29,7 @@ from ..model.registry import Registry
 from ..models import Task, make_event
 from ..skills import SkillRegistry, compose_prompt
 from ..tasks import enqueue_task
+from .lessons import inject_lessons
 
 #: Role event: the PM committed to a goal + success criterion and enqueued work.
 EVENT_PM_PLANNED = "pm.planned"
@@ -104,8 +105,13 @@ def run_pm_tick(
     goal = _resolve_goal(task)
 
     # 1. Confidence gate — restate the goal + define a criterion via a model call.
-    #    The prompt is the PM persona + any relevant, reviewed skills (ADR-0008).
+    #    The prompt is the PM persona + any relevant, reviewed skills (ADR-0008),
+    #    then any durable lessons prior retros distilled for this workstream
+    #    (ADR-0003) — auto-injected so applying a lesson is deterministic.
     prompt = _compose_plan_prompt(goal, skills)
+    prompt = inject_lessons(
+        prompt, conn, task.workstream, f"{goal} success criterion verification"
+    )
     call_model(
         role="pm",
         task_type="plan",

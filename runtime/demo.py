@@ -23,10 +23,14 @@ from uuid import uuid4
 from . import db
 from .enforce import DbEventSink
 from .events import read_events
+from .memory import recall_lessons
 from .migrate import migrate
 from .policy import load_policy
+from .roles.lessons import inject_lessons
+from .roles.verifier import VerifyResult
 from .scheduler import tick_once
 from .skills import SkillRegistry
+from .tasks import enqueue_task
 from .worker import build_registry, run_once
 
 
@@ -40,6 +44,66 @@ def _print_event_trail(conn, workstream: str) -> None:
                 "status", "passed", "reason", "work_task_id", "outcome")
         bits = " ".join(f"{k}={payload[k]}" for k in keys if k in payload)
         print(f"  {ev.ts:%H:%M:%S} {ev.type:<20} {bits}")
+
+
+#: A representative PM base prompt (mirrors runtime.roles.pm) for showing injection.
+_PM_BASE_PROMPT = (
+    "You are the studio PM. Restate the goal in one sentence and define ONE "
+    "concrete, independently checkable success criterion for it. Goal: {goal}"
+)
+
+
+def _demonstrate_learning(conn, registry, config, worker_id: str) -> bool:
+    """Show the learning loop end-to-end: a work task fails → Retro distills a
+    lesson into Knowledge memory → the NEXT PM prompt for that workstream is shown
+    to INCLUDE the recalled lesson (deterministic apply-the-lesson step)."""
+    ws = f"learn-{uuid4().hex[:8]}"
+    sink = DbEventSink(conn)
+    query = "work.demo verification success criterion marker"
+    base = _PM_BASE_PROMPT.format(goal="prove the studio learns")
+    print(f"\n=== learning loop demo (workstream={ws}) ===")
+
+    # 0. Baseline — this workstream has none of its OWN lessons yet (the shared
+    #    global corpus may contribute some by design; we track the delta below).
+    own_before = recall_lessons(conn, ws, query, k=10, include_global=False)
+    print(f"  before retro: this workstream has {len(own_before)} lesson(s) of its own")
+
+    # 1. A work task that FAILS verification (forced) → terminal 'failed' with
+    #    max_attempts=1 → the worker triggers a Retro (WORKER_RETRO=on_fail default).
+    def always_fail(conn_, task, result, s, **kw):
+        return VerifyResult(passed=False, reason="marker check failed (injected for demo)")
+
+    enqueue_task(
+        conn, workstream=ws, type="work.demo",
+        payload={"goal": "prove the studio learns",
+                 "criterion": "artifact contains the marker",
+                 "marker": f"studio-ok:{uuid4().hex[:6]}", "attempt": 1},
+    )
+    r_fail = run_once(conn, worker_id, sink, registry=registry, config=config,
+                      workstream=ws, run_verify=always_fail, max_attempts=1)
+    print(f"  work#1: {r_fail.kind} {r_fail.outcome} — {r_fail.detail}")
+
+    # 2. Next worker pass claims the enqueued retro → distills + stores lesson(s).
+    r_retro = run_once(conn, worker_id, sink, registry=registry, config=config,
+                       workstream=ws)
+    print(f"  retro:  {r_retro.kind} {r_retro.outcome} — {r_retro.detail}")
+
+    # 3. The lesson is now in this workstream's Knowledge corpus.
+    own_after = recall_lessons(conn, ws, query, k=10, include_global=False)
+    print(f"  lesson learned: {len(own_after)}")
+
+    # 4. The SUBSEQUENT PM prompt for this workstream now INCLUDES the lesson —
+    #    auto-injected at prompt assembly (deterministic, not model memory).
+    after = inject_lessons(base, conn, ws, query)
+    has_section = "### Lessons" in after
+    learned_present = bool(own_after) and own_after[0].text in after
+    print(f"  next PM prompt contains '### Lessons' section: {has_section}")
+    print(f"  next PM prompt includes the newly-learned lesson: {learned_present}")
+    if own_after:
+        print(f"    learned lesson> {own_after[0].text[:120]}")
+
+    retro_ok = bool(r_retro and r_retro.kind == "retro" and r_retro.outcome == "done")
+    return retro_ok and len(own_after) > len(own_before) and has_section and learned_present
 
 
 def main() -> int:
@@ -87,7 +151,12 @@ def main() -> int:
 
         ok = bool(r2 and r2.kind == "work" and r2.outcome == "done")
         print(f"\nruntime.demo: {'OK — studio operated end-to-end' if ok else 'INCOMPLETE'}")
-        return 0 if ok else 1
+
+        # Second act: demonstrate the learning loop (retro → lesson → injection).
+        learned = _demonstrate_learning(conn, registry, config, worker_id)
+        print(f"runtime.demo: {'OK — studio learned (lesson distilled + injected)' if learned else 'LEARNING INCOMPLETE'}")
+
+        return 0 if (ok and learned) else 1
     finally:
         conn.close()
 
