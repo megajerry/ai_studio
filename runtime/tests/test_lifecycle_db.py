@@ -195,17 +195,24 @@ def test_grab_filter_supports_in_list(conn, ws):
 
 
 def test_grab_sort_multi_column_and_tuple_forms(conn, ws):
-    a = enqueue_task(conn, workstream=ws, type="work.a", priority=5)
-    b = enqueue_task(conn, workstream=ws, type="work.b", priority=5)  # same priority
-    # Valid multi-column sort (string form): priority DESC, created_at DESC → newest
-    # of the top-priority tier first (b before a).
+    older = enqueue_task(conn, workstream=ws, type="work.older", priority=5)
+    newer = enqueue_task(conn, workstream=ws, type="work.newer", priority=5)  # same priority
+    # Pin created_at deterministically so the secondary sort key is unambiguous
+    # (now() ties within a tick otherwise).
+    with conn.cursor() as cur:
+        cur.execute("UPDATE tasks SET created_at = now() - interval '10 min' WHERE id = %s",
+                    (older.id,))
+        cur.execute("UPDATE tasks SET created_at = now() WHERE id = %s", (newer.id,))
+    conn.commit()
+    # Multi-column sort (string form): priority DESC, created_at DESC → newest of the
+    # top-priority tier first.
     g = grab_task(conn, worker_id="w1", workstream=ws,
                   sort="priority DESC, created_at DESC")
-    assert g.id == b.id
-    # Tuple form with NULLS ordering is also accepted.
+    assert g.id == newer.id
+    # Tuple form with an explicit NULLS ordering is also accepted.
     g2 = grab_task(conn, worker_id="w2", workstream=ws,
                    sort=[("priority", "DESC"), ("created_at", "ASC", "NULLS LAST")])
-    assert g2.id == a.id
+    assert g2.id == older.id
 
 
 def test_grab_rejects_bad_sort(conn, ws):
