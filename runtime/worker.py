@@ -42,8 +42,13 @@ from uuid import uuid4
 import psycopg
 from pydantic import BaseModel
 
+from .approvals import (
+    STATUS_APPROVED,
+    STATUS_DENIED,
+    get_approval,
+)
 from .db import connect
-from .enforce import DbEventSink, EventSink, NullEventSink
+from .enforce import DbEventSink, EventSink, InvokeStatus, NullEventSink
 from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
 from .roles.executor import run_executor
@@ -52,7 +57,15 @@ from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
 from .roles.verifier import verify as run_verify_default
 from .scheduler import PM_TICK_TYPE
 from .skills import SkillRegistry
-from .tasks import claim_task, complete_task, enqueue_task, heartbeat
+from .tasks import (
+    block_task,
+    claim_task,
+    complete_task,
+    enqueue_task,
+    find_blocked_tasks,
+    heartbeat,
+    requeue_blocked_task,
+)
 from .tools import FilesystemTool, ShellTool, ToolRegistry
 
 log = logging.getLogger("runtime.worker")
@@ -62,6 +75,9 @@ EVENT_WORK_RETRY = "work.retry"
 
 #: Event emitted when the worker enqueues a retro after a terminal work task.
 EVENT_RETRO_TRIGGERED = "retro.triggered"
+
+#: Event emitted when a task blocked on a 🔴 approval is re-queued after a grant.
+EVENT_APPROVAL_RESUMED = "approval.resumed"
 
 DEFAULT_IDLE_SLEEP_S = 5.0
 DEFAULT_MAX_WORK_ATTEMPTS = 2
@@ -81,6 +97,7 @@ Claimer = Callable[..., Optional[Task]]
 Heartbeater = Callable[..., Optional[Task]]
 Completer = Callable[..., Optional[Task]]
 Enqueuer = Callable[..., Task]
+Blocker = Callable[..., Optional[Task]]
 
 
 class RunResult(BaseModel):
@@ -88,9 +105,9 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "work" | "unknown"
+    #: "pm" | "work" | "retro" | "unknown"
     kind: str
-    #: "done" | "retry" | "failed"
+    #: "done" | "retry" | "failed" | "blocked"
     outcome: str
     detail: str = ""
 
@@ -194,6 +211,7 @@ def _handle_work(
     heartbeat: Heartbeater,
     complete: Completer,
     enqueue: Enqueuer,
+    block: Blocker,
     worker_id: str,
     max_attempts: int,
     run_exec: Callable[..., Any],
@@ -205,6 +223,19 @@ def _handle_work(
     exec_result = run_exec(
         conn, task, sink, registry=registry, config=config, model_registry=model_registry
     )
+
+    # 🔴 human-in-the-loop: the Executor's tool call PENDed on an approval. Park the
+    # task `blocked` on that approval and STOP — do NOT verify or complete. invoke
+    # already emitted approval.requested; resume_approved re-queues it once granted.
+    if exec_result.invoke_status == InvokeStatus.PENDING.value:
+        block(conn, task.id, approval_id=exec_result.approval_id,
+              reason="awaiting 🔴 approval")
+        return RunResult(
+            task_id=str(task.id), task_type=task.type, kind="work",
+            outcome="blocked",
+            detail=f"blocked on approval {exec_result.approval_id}",
+        )
+
     heartbeat(conn, task.id, worker_id)
     verdict = run_verify(
         conn, task, exec_result, sink,
@@ -314,6 +345,7 @@ def run_once(
     heartbeat: Heartbeater = heartbeat,
     complete: Completer = complete_task,
     enqueue: Enqueuer = enqueue_task,
+    block: Blocker = block_task,
     run_pm: Callable[..., Any] = run_pm_tick,
     run_exec: Callable[..., Any] = run_executor,
     run_verify: Callable[..., Any] = run_verify_default,
@@ -355,7 +387,7 @@ def run_once(
         return _handle_work(
             conn, task, sink,
             registry=registry, config=config, model_registry=model_registry,
-            heartbeat=heartbeat, complete=complete, enqueue=enqueue,
+            heartbeat=heartbeat, complete=complete, enqueue=enqueue, block=block,
             worker_id=worker_id, max_attempts=max_attempts,
             run_exec=run_exec, run_verify=run_verify,
             retro_mode=resolved_retro_mode,
@@ -371,6 +403,70 @@ def run_once(
         task_id=str(task.id), task_type=task.type, kind="unknown",
         outcome="failed", detail="no handler for task type",
     )
+
+
+class ResumeResult(BaseModel):
+    """What one :func:`resume_approved` pass did — task ids advanced, for logging."""
+
+    #: Tasks re-queued because their approval was granted (will retry + execute).
+    resumed: list[str] = []
+    #: Tasks failed because their approval was denied (the 🔴 action was refused).
+    failed: list[str] = []
+
+
+def resume_approved(
+    conn: Any,
+    sink: Optional[EventSink] = None,
+    *,
+    complete: Completer = complete_task,
+    requeue: Blocker = requeue_blocked_task,
+) -> ResumeResult:
+    """Advance tasks parked ``blocked`` on an approval a human has now resolved.
+
+    One bounded pass over the currently-blocked tasks (no loops):
+
+    - **approved** (a live grant) → re-queue the task so a worker retries; on that
+      retry :func:`runtime.enforce.invoke` finds the grant and executes (then
+      consumes it). Emits ``approval.resumed``.
+    - **denied** → fail the task (``complete_task`` ``failed``, force): the 🔴
+      action was refused, so the work cannot proceed.
+    - **still pending / missing** → left untouched for a later pass.
+
+    Call it from the worker/supervisor loop (like the stale-task sweep). It never
+    executes a tool itself — it only moves task state; the actual 🔴 execution
+    happens on the worker's normal retry through the enforced ``invoke`` path.
+    """
+    sink = sink or NullEventSink()
+    result = ResumeResult()
+    for task in find_blocked_tasks(conn):
+        approval_id = (task.result or {}).get("blocked_on_approval")
+        if not approval_id:
+            continue
+        approval = get_approval(conn, approval_id)
+        if approval is None:
+            continue
+
+        if approval.status == STATUS_APPROVED:
+            if requeue(conn, task.id) is not None:
+                sink.emit(
+                    make_event(
+                        workstream=task.workstream,
+                        type=EVENT_APPROVAL_RESUMED,
+                        task_id=task.id,
+                        payload={"approval_id": approval_id, "status": "queued"},
+                    )
+                )
+                result.resumed.append(str(task.id))
+        elif approval.status == STATUS_DENIED:
+            failed = complete(
+                conn, task.id,
+                result={"approved": False, "reason": approval.reason,
+                        "blocked_on_approval": approval_id},
+                status=TaskStatus.FAILED, force=True,
+            )
+            if failed is not None:
+                result.failed.append(str(task.id))
+    return result
 
 
 # --- Config + loop ----------------------------------------------------------
@@ -435,6 +531,9 @@ def run(
         try:
             if conn is None or conn.closed:
                 conn = connect()
+            # Advance any task whose 🔴 approval a human has resolved since last pass
+            # (grant → re-queue for retry+execute; deny → fail). Bounded, one pass.
+            resume_approved(conn, DbEventSink(conn))
             result = run_once(
                 conn, worker_id, DbEventSink(conn),
                 registry=registry, config=config, skills=skills,
