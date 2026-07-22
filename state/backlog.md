@@ -15,23 +15,23 @@ Learning loop (Retro → lessons → injected) · deterministic event replay (bu
 · concurrency/hardening · human-in-loop approvals · review-rigor doctrine
 (ADR-0014) · **real PM** (understand → confidence gate → decompose) · Reviewer /
 Whistle-blower role · **Researcher role** · WhatsApp Spokesman + **Spokesman↔runtime
-wiring** · **Docker sandbox runner** · **Task-lifecycle state machine + dependency
-DAG + lifecycle telemetry** (ADR-0015: canonical 9-state machine + guarded
-`transition`, grab-by-sort, Verifier-as-Reviewer, prereq DAG, task_transitions +
-rollups; migration 0008) · **Real per-workstream budget enforcement** (budget.py +
-migration 0010: real accrued spend caps → over-cap = `budget.exceeded` + 🛑 +
-`OverBudget`, no silent overspend) · **DB-outage resilience + remote host-restricted
-access** (ADR-0017: `connect_with_retry`/`DBUnavailable` degraded mode; supervisor
-reconnect grace window anti thundering-herd; Postgres loopback-default bind +
-env-driven `pg_hba` scram allowlist, never trust / never `0.0.0.0/0`) ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0017.
+wiring** · **Docker sandbox runner** (network-off/non-root/read-only/cap-drop/
+resource+timeout/scoped-mount/no-secret-env) · **Task-lifecycle state machine +
+dependency DAG + telemetry** (ADR-0015: 9-state guarded machine, grab-by-sort,
+Verifier-as-Reviewer, prereq DAG, task_transitions + rollups; migration 0008) ·
+**Real per-workstream budget enforcement** (migration 0010: real accrued-spend
+caps → over-cap = `budget.exceeded` + 🛑 + `OverBudget`, no silent overspend) ·
+**DB-outage resilience + remote host-restricted access** (ADR-0017:
+`connect_with_retry`/`DBUnavailable` degraded mode; supervisor reconnect grace
+window; loopback-default bind + env `pg_hba` scram allowlist, never trust/`0.0.0.0/0`)
+· **Experiment primitive** (ADR-0016: `runtime/experiment/`; hypothesis + metric +
+budget + guarded `proposed→running→evaluated→kept|scaled|killed`; evidence-based
+kill/scale — over-budget/missed→killed, met→kept, strongly-met→scaled + 🛑;
+migration 0009) · onboarding/secrets · model shortlist + cost model · ADRs 0001–0017.
 
 ## 🔄 In progress
 
-- **Experiment primitive** (branch `runtime/experiment`, ADR-0016 — built +
-  verified 427/0-skip; awaiting review/merge): `experiment` (hypothesis, metric,
-  budget, kill/scale) + evidence-based `evaluate_experiment` (budget hard-gate →
-  metric; strong-beat → `scaled` + 🛑 for more budget).
+- _(nothing in flight)_
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
