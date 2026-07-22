@@ -4,6 +4,8 @@
 # psycopg 3 (sync) with the binary build so no local libpq is required.
 psycopg[binary]>=3.2,<4.0
 pydantic>=2.7,<3.0
+# M2 policy engine reads its rules-as-data config from YAML.
+PyYAML>=6.0,<7.0
 
 # Dev/test:
 #   pip install pytest
