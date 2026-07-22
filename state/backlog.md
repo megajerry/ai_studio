@@ -45,6 +45,15 @@ migration 0009) · onboarding/secrets · model shortlist + cost model · ADRs 00
    check, e.g. `video_audit`) + the **cross-workstream request contract** (typed
    `feature_request` + receiving-PM intake/triage/prioritize/approve/decompose +
    symmetric escalation). Captured by the vertical-isolation ADR.
+   - ✅ **Prompt-assembly layer + verify-checker registry built** (branch
+     `runtime/role-seams`): `runtime/roles/prompt.py` `compose_role_prompt`
+     (base→charter→overlay→skills→lessons→task, behavior-preserving default) +
+     `runtime/roles/checkers.py` (`Checker`/`CheckerRegistry`/`ArtifactRef`,
+     default `marker` checker, structured criterion + marker back-compat, verdict
+     on facts). PM/Executor/Verifier refactored onto the assembler; verify
+     dispatches to the registry. Docs: [`runtime/roles-customization.md`](../runtime/roles-customization.md).
+     **Remaining:** the config/registration record that supplies charter/overlay/
+     checker-set + the cross-workstream request contract.
 3. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
    product→own repo, definition→platform (this repo).
 4. **Model sourcing agent** — researches models (LMArena/pricing) and proposes

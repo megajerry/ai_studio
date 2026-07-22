@@ -36,7 +36,6 @@ from runtime.roles.checkers import (
     CheckResult,
     UnknownChecker,
     default_registry,
-    marker_check,
     resolve_criterion,
 )
 from runtime.roles.executor import ExecutorResult, run_executor
