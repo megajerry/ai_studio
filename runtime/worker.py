@@ -48,6 +48,7 @@ from .roles.executor import run_executor
 from .roles.pm import run_pm_tick
 from .roles.verifier import verify as run_verify_default
 from .scheduler import PM_TICK_TYPE
+from .skills import SkillRegistry
 from .tasks import claim_task, complete_task, enqueue_task, heartbeat
 from .tools import FilesystemTool, ShellTool, ToolRegistry
 
@@ -100,8 +101,9 @@ def _handle_pm_tick(
     complete: Completer,
     worker_id: str,
     run_pm: Callable[..., Any],
+    skills: Optional[SkillRegistry] = None,
 ) -> RunResult:
-    plan = run_pm(conn, task, sink, registry=model_registry, enqueue=enqueue)
+    plan = run_pm(conn, task, sink, registry=model_registry, skills=skills, enqueue=enqueue)
     heartbeat(conn, task.id, worker_id)
     complete(conn, task.id, result=plan.model_dump(), status=TaskStatus.DONE)
     return RunResult(
@@ -196,6 +198,7 @@ def run_once(
     registry: ToolRegistry,
     config: Optional[PolicyConfig] = None,
     model_registry=None,
+    skills: Optional[SkillRegistry] = None,
     assignee: Optional[Assignee] = None,
     workstream: Optional[str] = None,
     max_attempts: int = DEFAULT_MAX_WORK_ATTEMPTS,
@@ -225,6 +228,7 @@ def run_once(
             conn, task, sink,
             model_registry=model_registry, enqueue=enqueue,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id, run_pm=run_pm,
+            skills=skills,
         )
 
     if task.type.startswith("work."):
@@ -299,6 +303,10 @@ def run(
     max_attempts = _env_int("WORKER_MAX_WORK_ATTEMPTS", DEFAULT_MAX_WORK_ATTEMPTS)
     registry = build_registry(default_scratch_dir())
     config = load_policy()
+    # Discover skills once at startup; the PM composes relevant, reviewed ones
+    # into its plan prompt on demand (ADR-0008). Empty registry if none exist.
+    skills = SkillRegistry.discover()
+    log.info("worker %s: %d skill(s) available", worker_id, len(skills))
 
     log.info("worker %s starting (scratch=%s)", worker_id, default_scratch_dir())
     conn: Optional[psycopg.Connection] = None
@@ -308,7 +316,7 @@ def run(
                 conn = connect()
             result = run_once(
                 conn, worker_id, DbEventSink(conn),
-                registry=registry, config=config,
+                registry=registry, config=config, skills=skills,
                 assignee=assignee, workstream=workstream, max_attempts=max_attempts,
             )
             if result is None:

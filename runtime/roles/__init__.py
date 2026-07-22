@@ -17,8 +17,11 @@ The three roles form the agent-driven loop (architecture §4, ADR-0004):
         --> Executor (do the work via a tool + a model)
         --> Verifier (independent verify→commit gate)
 
-A real "skills" layer (Agent Skills standard, ADR-0008) is a later milestone; for
-now the prompt is an inline string template on each role.
+The **skills** layer (Agent Skills standard, ADR-0008) now exists in
+:mod:`runtime.skills`: a role can pull relevant, reviewed skills from a
+``SkillRegistry`` and compose them into its base prompt on demand (the PM's
+``run_pm_tick`` takes an optional ``skills=`` registry). The base persona is
+still an inline string template; skills are injected on top of it.
 """
 
 from __future__ import annotations
