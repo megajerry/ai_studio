@@ -27,7 +27,9 @@ still an inline string template; skills are injected on top of it.
 from __future__ import annotations
 
 from .executor import ExecutorResult, run_executor
+from .lessons import compose_lessons, inject_lessons
 from .pm import PlanResult, run_pm_tick
+from .retro import RetroResult, distill_lessons, run_retro
 from .verifier import VerifyResult, verify
 
 __all__ = [
@@ -37,4 +39,9 @@ __all__ = [
     "run_executor",
     "VerifyResult",
     "verify",
+    "RetroResult",
+    "run_retro",
+    "distill_lessons",
+    "compose_lessons",
+    "inject_lessons",
 ]

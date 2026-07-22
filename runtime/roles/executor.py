@@ -28,6 +28,7 @@ from ..model.registry import Registry
 from ..models import Task, make_event
 from ..policy import PolicyConfig
 from ..tools import ToolRegistry
+from .lessons import inject_lessons
 
 #: Role event: the Executor finished producing a result for a work task.
 EVENT_EXECUTOR_ACTED = "executor.acted"
@@ -73,13 +74,19 @@ def run_executor(
     criterion = payload.get("criterion", "")
     marker = payload.get("marker") or f"studio-ok:{task.id}"
 
-    # 1. Model call (dry-run, keyless) — the "execution" reasoning step.
+    # 1. Model call (dry-run, keyless) — the "execution" reasoning step. The prompt
+    #    is the Executor persona plus any durable lessons prior retros distilled for
+    #    this workstream (ADR-0003), auto-injected before the role acts.
+    prompt = inject_lessons(
+        _EXEC_PROMPT.format(goal=goal, criterion=criterion),
+        conn,
+        task.workstream,
+        f"{goal} {criterion}",
+    )
     completion = call_model(
         role="executor",
         task_type="execute",
-        messages=[
-            {"role": "user", "content": _EXEC_PROMPT.format(goal=goal, criterion=criterion)}
-        ],
+        messages=[{"role": "user", "content": prompt}],
         registry=model_registry,
         conn=conn,
         task_id=task.id,

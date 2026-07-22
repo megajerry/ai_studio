@@ -25,7 +25,9 @@ Run it as an on-demand driver::
 
 Config (env): ``WORKER_ID``, ``WORKER_SCRATCH_DIR`` (tool root),
 ``WORKER_IDLE_SLEEP_S`` (poll gap when the queue is empty),
-``WORKER_MAX_WORK_ATTEMPTS`` (verify-fail re-enqueues before failing).
+``WORKER_MAX_WORK_ATTEMPTS`` (verify-fail re-enqueues before failing),
+``WORKER_RETRO`` (``on_fail`` (default) | ``always`` | ``off`` — when a terminal
+work task triggers a learning Retro).
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
 from .roles.executor import run_executor
 from .roles.pm import run_pm_tick
+from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
 from .roles.verifier import verify as run_verify_default
 from .scheduler import PM_TICK_TYPE
 from .skills import SkillRegistry
@@ -57,8 +60,20 @@ log = logging.getLogger("runtime.worker")
 #: Event emitted when the worker re-enqueues a work task after a verify fail.
 EVENT_WORK_RETRY = "work.retry"
 
+#: Event emitted when the worker enqueues a retro after a terminal work task.
+EVENT_RETRO_TRIGGERED = "retro.triggered"
+
 DEFAULT_IDLE_SLEEP_S = 5.0
 DEFAULT_MAX_WORK_ATTEMPTS = 2
+
+#: When the worker fires a Retro after a work task reaches a terminal state.
+#: ``on_fail`` (default) keeps cost down + matches ADR-0003 "more retro when errors";
+#: ``always`` retros every episode; ``off`` disables the learning loop's trigger.
+RETRO_ON_FAIL = "on_fail"
+RETRO_ALWAYS = "always"
+RETRO_OFF = "off"
+DEFAULT_RETRO_MODE = RETRO_ON_FAIL
+_RETRO_MODES = {RETRO_ON_FAIL, RETRO_ALWAYS, RETRO_OFF}
 
 # Injectable seams — defaults are the real M1/M3b/role functions; tests pass fakes
 # so `run_once` drives the full loop with no database (same idiom as supervisor).
@@ -115,6 +130,59 @@ def _handle_pm_tick(
     )
 
 
+def _resolve_retro_mode(retro_mode: Optional[str]) -> str:
+    """Resolve the retro trigger policy (arg > ``WORKER_RETRO`` env > default)."""
+    mode = (retro_mode if retro_mode is not None else os.environ.get("WORKER_RETRO", "")).strip().lower()
+    if mode in _RETRO_MODES:
+        return mode
+    if mode:
+        log.warning("invalid WORKER_RETRO=%r; using default %s", mode, DEFAULT_RETRO_MODE)
+    return DEFAULT_RETRO_MODE
+
+
+def _maybe_enqueue_retro(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    enqueue: Enqueuer,
+    outcome: str,
+    detail: str,
+    retro_mode: str,
+) -> None:
+    """Enqueue ONE retro task for a terminal work task, per the retro policy.
+
+    Bounded by construction: only ``work.*`` terminal states reach here, the retro
+    task is a distinct type (never ``work.*``/``pm.tick``), and a retro NEVER
+    enqueues another task — so there is no retro-of-a-retro loop. ``on_fail`` fires
+    only on a failed episode; ``always`` on every terminal episode; ``off`` never.
+    """
+    if retro_mode == RETRO_OFF:
+        return
+    if retro_mode == RETRO_ON_FAIL and outcome != "failed":
+        return
+    retro = enqueue(
+        conn,
+        workstream=task.workstream,
+        type=RETRO_TASK_TYPE,
+        payload={
+            "target_task_id": str(task.id),
+            "target_task_type": task.type,
+            "outcome": outcome,
+            "reason": detail,
+        },
+        priority=task.priority,
+    )
+    sink.emit(
+        make_event(
+            workstream=task.workstream,
+            type=EVENT_RETRO_TRIGGERED,
+            task_id=task.id,
+            payload={"retro_task_id": str(retro.id), "outcome": outcome, "mode": retro_mode},
+        )
+    )
+
+
 def _handle_work(
     conn: Any,
     task: Task,
@@ -130,6 +198,7 @@ def _handle_work(
     max_attempts: int,
     run_exec: Callable[..., Any],
     run_verify: Callable[..., Any],
+    retro_mode: str = DEFAULT_RETRO_MODE,
 ) -> RunResult:
     # Heartbeat around each phase — liveness while the role does the work.
     heartbeat(conn, task.id, worker_id)
@@ -150,6 +219,11 @@ def _handle_work(
             result={"verified": True, "reason": verdict.reason,
                     "artifact_path": exec_result.artifact_path},
             status=TaskStatus.DONE,
+        )
+        # Terminal (done): fire a retro per policy (default on_fail → skip on done).
+        _maybe_enqueue_retro(
+            conn, task, sink, enqueue=enqueue,
+            outcome="done", detail=verdict.reason, retro_mode=retro_mode,
         )
         return RunResult(
             task_id=str(task.id), task_type=task.type, kind="work",
@@ -184,9 +258,42 @@ def _handle_work(
             task_id=str(task.id), task_type=task.type, kind="work",
             outcome="retry", detail=f"re-enqueued as {retry.id} (attempt {attempt + 1})",
         )
+    # Terminal (failed after exhausting retries): fire a retro per policy so the
+    # studio learns from the failure (on_fail + always both trigger here).
+    detail = f"verify failed after {attempt} attempt(s): {verdict.reason}"
+    _maybe_enqueue_retro(
+        conn, task, sink, enqueue=enqueue,
+        outcome="failed", detail=detail, retro_mode=retro_mode,
+    )
     return RunResult(
         task_id=str(task.id), task_type=task.type, kind="work",
-        outcome="failed", detail=f"verify failed after {attempt} attempt(s): {verdict.reason}",
+        outcome="failed", detail=detail,
+    )
+
+
+def _handle_retro(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    model_registry,
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_retro: Callable[..., Any],
+) -> RunResult:
+    """Dispatch a ``retro`` task: distill + store lessons, then commit.
+
+    A retro NEVER enqueues another task (no ``enqueue`` seam is threaded here), so
+    the learning loop cannot recurse into a retro-of-a-retro.
+    """
+    heartbeat(conn, task.id, worker_id)
+    result = run_retro(conn, task, sink, model_registry=model_registry)
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.DONE)
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="retro",
+        outcome="done", detail=f"distilled {result.lessons_count} lesson(s)",
     )
 
 
@@ -202,6 +309,7 @@ def run_once(
     assignee: Optional[Assignee] = None,
     workstream: Optional[str] = None,
     max_attempts: int = DEFAULT_MAX_WORK_ATTEMPTS,
+    retro_mode: Optional[str] = None,
     claim: Claimer = claim_task,
     heartbeat: Heartbeater = heartbeat,
     complete: Completer = complete_task,
@@ -209,6 +317,7 @@ def run_once(
     run_pm: Callable[..., Any] = run_pm_tick,
     run_exec: Callable[..., Any] = run_executor,
     run_verify: Callable[..., Any] = run_verify_default,
+    run_retro: Callable[..., Any] = run_retro_default,
 ) -> Optional[RunResult]:
     """Claim one task and drive it to a terminal state (the single testable unit).
 
@@ -219,6 +328,7 @@ def run_once(
     injectable so the whole loop runs with no database in tests.
     """
     sink = sink or NullEventSink()
+    resolved_retro_mode = _resolve_retro_mode(retro_mode)
     task = claim(conn, worker_id=worker_id, assignee=assignee, workstream=workstream)
     if task is None:
         return None
@@ -231,6 +341,16 @@ def run_once(
             skills=skills,
         )
 
+    if task.type == RETRO_TASK_TYPE:
+        # A retro distills lessons from a finished episode. It never enqueues
+        # another task, so pm.tick / retro never trigger a retro (no loop).
+        return _handle_retro(
+            conn, task, sink,
+            model_registry=model_registry,
+            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            run_retro=run_retro,
+        )
+
     if task.type.startswith("work."):
         return _handle_work(
             conn, task, sink,
@@ -238,6 +358,7 @@ def run_once(
             heartbeat=heartbeat, complete=complete, enqueue=enqueue,
             worker_id=worker_id, max_attempts=max_attempts,
             run_exec=run_exec, run_verify=run_verify,
+            retro_mode=resolved_retro_mode,
         )
 
     # Unknown task type — fail it explicitly rather than silently dropping it.
