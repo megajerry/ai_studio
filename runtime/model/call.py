@@ -6,12 +6,16 @@ from an LLM goes through it; **agents never call a provider adapter directly**
 ad-hoc call ADR-0012 forbids). One call does, in order:
 
     1. route  — pick a model from the registry policy (emits ``model.routed``).
-    2. select — pick the provider adapter, or dry-run if forced / key absent.
-    3. complete — run the provider (dry-run needs no network/key).
-    4. cost   — compute cost = tokens × registry price (:func:`registry.cost_usd`).
-    5. emit   — a ``model.call`` event: model, provider, role, task_id, in/out/
+    2. budget — with a ``conn``, gate the call against the workstream's caps
+                (:func:`runtime.budget.enforce`): if a real (or dry-run) call would
+                exceed a cap it emits ``budget.exceeded``, raises a 🛑 approval, and
+                raises :class:`~runtime.budget.OverBudget` — the call does NOT run.
+    3. select — pick the provider adapter, or dry-run if forced / key absent.
+    4. complete — run the provider (dry-run needs no network/key).
+    5. cost   — compute cost = tokens × registry price (:func:`registry.cost_usd`).
+    6. emit   — a ``model.call`` event: model, provider, role, task_id, in/out/
                 cached tokens, cost_usd, latency_ms.
-    6. account — if a ``conn`` + ``task_id`` are given, add the call's tokens to
+    7. account — if a ``conn`` + ``task_id`` are given, add the call's tokens to
                 that task's ``spent_tokens`` (budget telemetry).
 
 Dry-run is the default whenever ``MODELS_DRY_RUN=1`` or the selected model's
@@ -30,7 +34,7 @@ from ..enforce import EventSink, NullEventSink
 from ..models import make_event
 from ..policy import BudgetContext
 from .providers import Completion, DryRunProvider, Message, Provider, get_adapter
-from .registry import ModelSpec, Registry, cost_usd, load_registry
+from .registry import ModelSpec, Registry, Usage, cost_usd, load_registry
 from .router import route
 
 #: Canonical event type for one instrumented model call (ADR-0012).
@@ -104,10 +108,29 @@ def call_model(
         span_id=span_id,
     )
 
-    # 2. select provider (dry-run if forced / no adapter / no key).
+    # 2. budget — gate against the workstream's real accrued spend BEFORE spending.
+    #    No-op without a conn or when the workstream has no cap set; over cap it
+    #    raises budget.OverBudget + a 🛑 approval (ADR-0006) — the call never runs.
+    if conn is not None:
+        from ..budget import enforce as _enforce_budget
+        from ..budget import estimate_call_tokens
+
+        est_tokens = estimate_call_tokens(messages)
+        est_usd = cost_usd(spec, Usage(input_tokens=est_tokens))
+        _enforce_budget(
+            conn,
+            workstream,
+            est_usd=est_usd,
+            est_tokens=est_tokens,
+            role=role,
+            task_id=task_id,
+            sink=sink,
+        )
+
+    # 3. select provider (dry-run if forced / no adapter / no key).
     provider = select_provider(spec, force_dry_run=force_dry_run)
 
-    # 3. complete, timing the call for latency telemetry.
+    # 4. complete, timing the call for latency telemetry.
     start = time.monotonic()
     completion = provider.complete(spec.id, messages, **opts)
     latency_ms = int((time.monotonic() - start) * 1000)
