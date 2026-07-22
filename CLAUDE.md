@@ -100,3 +100,8 @@ milestones (supervisor, scheduler, runtime, Spokesman) add their own commands.
 - Prefer assembling mature open-source components over writing our own.
 - Match the style and idioms of surrounding code.
 - Record any architecture-affecting decision as an ADR in `docs/decisions/`.
+- **Context discipline (ADR-0013).** Context size dominates cost and grows every
+  step. Scope context to the task, compact/summarize as it grows, and prefer a
+  fresh small-context subagent over one growing thread. Be **concise in reasoning
+  but never omit verifiable data or critical details** (IDs, exact values, paths,
+  decisions, acceptance criteria, errors). Concision is about prose, not facts.
