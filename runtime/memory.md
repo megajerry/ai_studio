@@ -95,8 +95,12 @@ lessons = recall_lessons(conn, "some-workstream", "migrations", k=5)  # incl. gl
 - `remember(conn, scope, layer, text, metadata=None)` — embed → insert; emit
   `memory.remembered` with **layer/scope/id/dims only — never the text or the
   embedding**.
-- `recall(conn, scope, layer, query, k=5)` — embed query → scope+layer vector
-  search → items; emit `memory.recalled` with the **count only**.
+- `recall(conn, scope, layer, query, k=5, *, min_score=None)` — embed query →
+  scope+layer vector search → items; emit `memory.recalled` with the **count
+  only**. `min_score` is an optional cosine floor (default `None` = no floor,
+  behavior-preserving) that drops weakly-matching items; a caller injecting
+  recalled context into a prompt should set a modest floor (recommended ~0.2 for
+  the dry-run embedder — see `roles.lessons.RECOMMENDED_MIN_SCORE`).
 - `add_lesson` / `recall_lessons` — thin Knowledge-layer helpers for the Retro
   loop that grows the lessons corpus and injects it into future work. Lessons are
   workstream-scoped by default; `global_lesson=True` stores under the global

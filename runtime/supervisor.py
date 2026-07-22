@@ -68,10 +68,18 @@ def _default_fail_exhausted(
 ) -> Optional[Task]:
     """Force-fail a task that has exhausted its re-kicks; emit the audit event.
 
-    ``complete_task(force=True)`` finalizes the row and emits ``task.finished``;
-    we additionally emit ``task.failed_exhausted`` so the reason is traceable in
-    the event log. Both run in one transaction (each nests as a savepoint) so
-    the fail and its audit event commit atomically.
+    Guarded to ``in_progress``: the automatic exhausted-fail must NOT clobber a
+    task that self-completed (reached ``done``/``failed``) in the scan→write
+    window (``find_stale_tasks`` → here). Like :func:`runtime.tasks.rekick_task`,
+    we finalize only a task still ``in_progress``; if it already reached a
+    terminal state ``complete_task`` (unforced) leaves it untouched and returns
+    ``None``, and this returns ``None`` (the sweep logs a skip). ``force`` on
+    :func:`complete_task` stays available for genuine manual use.
+
+    On a real fail, ``complete_task`` finalizes the row and emits
+    ``task.finished``; we additionally emit ``task.failed_exhausted`` so the
+    reason is traceable in the event log. Both run in one transaction (each
+    nests as a savepoint) so the fail and its audit event commit atomically.
     """
     with conn.transaction():
         failed = complete_task(
@@ -83,7 +91,6 @@ def _default_fail_exhausted(
                 "retries": task.retries,
                 "max_retries": max_retries,
             },
-            force=True,
         )
         if failed is not None:
             append_event(
@@ -144,6 +151,14 @@ def sweep(
                         task.id,
                         task.retries,
                         max_retries,
+                    )
+                else:
+                    # Guarded no-op: the task self-completed in the scan→write
+                    # window, so we must not clobber its terminal state.
+                    log.info(
+                        "skipped exhausted-fail of task %s: no longer in_progress "
+                        "(self-completed before sweep)",
+                        task.id,
                     )
             else:
                 if rekick(conn, task) is not None:

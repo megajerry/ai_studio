@@ -33,6 +33,13 @@ logger = logging.getLogger("runtime.roles.lessons")
 #: Default cap on how many lessons are injected into one prompt (ADR-0013 bound).
 DEFAULT_LIMIT = 3
 
+#: Recommended production cosine floor for lesson recall. A modest floor keeps
+#: only genuinely relevant lessons out of a prompt (a weak, off-topic match is
+#: worse than no lesson). ~0.2 suits the dry-run embedder; tune per real
+#: embedding model. Left as guidance — the default below is ``None`` (no floor,
+#: behavior-preserving); a caller opts in by passing ``min_score``.
+RECOMMENDED_MIN_SCORE = 0.2
+
 _SECTION_HEADER = "### Lessons (durable know-how from prior retros — apply these)"
 _SECTION_NOTE = (
     "Retros distilled these lessons for this workstream. Apply them proactively "
@@ -70,6 +77,7 @@ def inject_lessons(
     *,
     k: int = DEFAULT_LIMIT,
     limit: int = DEFAULT_LIMIT,
+    min_score: Optional[float] = None,
     recall: Callable[..., list] = _recall_lessons,
 ) -> str:
     """Recall the lessons most relevant to ``query`` and inject them into the prompt.
@@ -78,11 +86,18 @@ def inject_lessons(
     workstream-scoped (plus the shared global corpus). Returns ``base_prompt``
     unchanged when there is no ``conn``/``workstream``, when nothing is recalled,
     or when recall fails — so a role is never blocked by the learning layer.
+
+    ``min_score`` is an optional cosine floor threaded into recall to drop weakly
+    relevant lessons; ``None`` (default) applies no floor (behavior-preserving).
+    See :data:`RECOMMENDED_MIN_SCORE` for the suggested production value.
     """
     if conn is None or not workstream:
         return base_prompt
+    # Only thread min_score when set, so a custom `recall` seam whose signature
+    # predates the floor keeps working (behavior-preserving when min_score=None).
+    extra = {} if min_score is None else {"min_score": min_score}
     try:
-        items = recall(conn, workstream, query, k=k)
+        items = recall(conn, workstream, query, k=k, **extra)
     except Exception:  # pragma: no cover - defensive: never let recall break a role
         logger.exception("lesson recall failed; proceeding with base prompt")
         return base_prompt

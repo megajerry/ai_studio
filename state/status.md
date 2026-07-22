@@ -183,32 +183,38 @@ _Last updated: 2026-07-22 (remote session)_
 
 ## Known follow-ups (deferred nits from prior milestones)
 
-Small, non-blocking cleanups noted while building later milestones. None affects
-correctness today; batch them into a housekeeping pass.
+Small, non-blocking cleanups noted while building later milestones. The
+`chore/hardening` pass resolved (b)(c)(d) plus the new relevance-floor item (e);
+(a) remains deferred (discoverability-only, touches many files).
 
-- **(a) M2 — event-type constant consolidation.** M2's `runtime/enforce.py`
-  defines its event types as module constants (`EVENT_POLICY_DECISION`,
-  `EVENT_TOOL_INVOKED`, `EVENT_APPROVAL_REQUESTED`) while M1 uses an `EventType`
-  enum (`runtime/models.py`); M3b likewise adds `EVENT_MODEL_ROUTED` /
-  `EVENT_MODEL_CALL` constants. The `events.type` column is deliberately
-  free-form text so both styles coexist, but the two conventions should be
-  consolidated (one enum, or one constants module) so producers/consumers have a
-  single catalog of wire strings.
-- **(b) M3a supervisor force-fail race.** The supervisor's force-fail path could
-  guard on `in_progress` to avoid clobbering a task that self-completes in the
-  scan→write window (`find_stale_tasks` → `complete_task(..., force=True)`).
-  `rekick_task` already guards to `in_progress`; the force-fail branch uses
-  `force=True` and so could overwrite a task that finished between the scan and
-  the write. Low probability (needs the stale-threshold window), but a guarded
-  variant (or a re-check) would close it.
-- **(c) launchd plists missing the DOCTYPE line.** The templates in
-  `infra/launchd/` omit the `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` line. Cosmetic —
-  `launchd`/`plutil` accept the files without it — but adding it matches the
-  canonical plist format.
-- **(d) memory pure-logic embedding tests should force dry-run** so they never hit
-  the network if an embedding key is set during pytest. The M4 pure-logic tests in
-  `runtime/tests/test_memory.py` call `embed()` directly; with a real embedding key
-  present in the environment they could route to a live adapter. They should set
-  `MODELS_DRY_RUN=1` (or otherwise force the dry-run embedder) so the "pure-logic,
-  no network" tests stay offline and deterministic regardless of ambient keys.
+- **(a) M2 — event-type constant consolidation.** *(Deferred — still open.)* M2's
+  `runtime/enforce.py` defines its event types as module constants
+  (`EVENT_POLICY_DECISION`, `EVENT_TOOL_INVOKED`, `EVENT_APPROVAL_REQUESTED`)
+  while M1 uses an `EventType` enum (`runtime/models.py`); M3b likewise adds
+  `EVENT_MODEL_ROUTED` / `EVENT_MODEL_CALL` constants. The `events.type` column is
+  deliberately free-form text so both styles coexist, but the two conventions
+  should be consolidated (one enum, or one constants module) so
+  producers/consumers have a single catalog of wire strings. Left deferred: it is
+  discoverability-only (no correctness impact) and touches many files.
+- **(b) M3a supervisor force-fail race.** ✅ *Done (`chore/hardening`).* The
+  supervisor's automatic exhausted-fail (`_default_fail_exhausted`) is now guarded
+  to `in_progress` (it calls `complete_task` WITHOUT `force`), so a task that
+  self-completes in the scan→write window is no longer clobbered to `failed`; the
+  sweep logs a skip instead. `complete_task(force=True)` stays available for
+  genuine manual use. Covered by `test_sweep_does_not_clobber_self_completed_task`
+  (integration) and `test_supervisor_does_not_clobber_task_completed_before_sweep`
+  (concurrency), plus the concurrency re-kick→force-fail escalation test.
+- **(c) launchd plists missing the DOCTYPE line.** ✅ *Done (`chore/hardening`).*
+  Both `infra/launchd/*.plist` now carry the
+  `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` line; `plutil -lint` passes.
+- **(d) memory pure-logic embedding tests force dry-run.** ✅ *Done
+  (`chore/hardening`).* The determinism/similarity tests in
+  `runtime/tests/test_memory.py` now pass `embed(..., force_dry_run=True)` so they
+  never touch the network even if an embedding key is present during pytest.
+- **(e) lesson-recall relevance floor.** ✅ *Done (`chore/hardening`).*
+  `memory.recall` / `recall_lessons` and `roles.lessons.inject_lessons` accept an
+  optional `min_score` cosine floor (default `None` = no floor, behavior-preserving)
+  that drops weakly-matching items. Recommended production value ~0.2 for the
+  dry-run embedder (`roles.lessons.RECOMMENDED_MIN_SCORE`); tune per real embedding
+  model. Covered by `test_recall_min_score_excludes_below_floor`.
