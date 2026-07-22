@@ -37,7 +37,12 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS depends_on uuid[] NOT NULL DEFAULT '{
 -- (all prereqs merged) is a NOT EXISTS over unnest(depends_on).
 CREATE INDEX IF NOT EXISTS tasks_status_priority_idx
     ON tasks (status, priority DESC, created_at);
--- Supervisor path: actively-held tasks (claimed/in_progress) with a stale heartbeat.
+-- Supervisor path: actively-held tasks (claimed/in_progress) with a stale
+-- heartbeat. 0002 created this index with WHERE status='in_progress', so a plain
+-- CREATE INDEX IF NOT EXISTS would be silently skipped (leaving stale `claimed`
+-- rows unindexed). Drop the old partial index first so the predicate converges to
+-- the canonical (claimed, in_progress) set. Forward-only + idempotent.
+DROP INDEX IF EXISTS tasks_heartbeat_idx;
 CREATE INDEX IF NOT EXISTS tasks_heartbeat_idx
     ON tasks (heartbeat_at)
     WHERE status IN ('claimed', 'in_progress');

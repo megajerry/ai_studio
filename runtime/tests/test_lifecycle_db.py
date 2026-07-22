@@ -194,10 +194,52 @@ def test_grab_filter_supports_in_list(conn, ws):
     assert grabbed == {a.id, b.id}  # work.c excluded by the IN-list filter
 
 
+def test_grab_sort_multi_column_and_tuple_forms(conn, ws):
+    a = enqueue_task(conn, workstream=ws, type="work.a", priority=5)
+    b = enqueue_task(conn, workstream=ws, type="work.b", priority=5)  # same priority
+    # Valid multi-column sort (string form): priority DESC, created_at DESC → newest
+    # of the top-priority tier first (b before a).
+    g = grab_task(conn, worker_id="w1", workstream=ws,
+                  sort="priority DESC, created_at DESC")
+    assert g.id == b.id
+    # Tuple form with NULLS ordering is also accepted.
+    g2 = grab_task(conn, worker_id="w2", workstream=ws,
+                   sort=[("priority", "DESC"), ("created_at", "ASC", "NULLS LAST")])
+    assert g2.id == a.id
+
+
 def test_grab_rejects_bad_sort(conn, ws):
     enqueue_task(conn, workstream=ws, type="work.x")
+    # Unknown column / trailing statement → rejected (not silently permitted).
     with pytest.raises(ValueError):
         grab_task(conn, worker_id="w1", workstream=ws, sort="priority; DROP TABLE tasks")
+    # A non-allowlisted column is refused.
+    with pytest.raises(ValueError):
+        grab_task(conn, worker_id="w1", workstream=ws, sort="secret_column ASC")
+    # A bad direction is refused.
+    with pytest.raises(ValueError):
+        grab_task(conn, worker_id="w1", workstream=ws, sort="priority SIDEWAYS")
+
+
+def test_grab_sort_cannot_inject_sql(conn, ws):
+    """The exploit from review: a subquery/function-call sort must be REJECTED
+    (ValueError) — not executed. Belt-and-suspenders: no multi-second pg_sleep
+    delay and the tasks table is still intact afterwards."""
+    real = enqueue_task(conn, workstream=ws, type="work.real")
+    conn.commit()
+    exploit = "(SELECT 1 FROM (SELECT pg_sleep(3)) s)"
+    start = time.monotonic()
+    with pytest.raises(ValueError):
+        grab_task(conn, worker_id="w1", workstream=ws, sort=exploit)
+    elapsed = time.monotonic() - start
+    conn.rollback()  # clear the aborted-tx state from the expected error
+    assert elapsed < 1.0, f"pg_sleep appears to have executed ({elapsed:.1f}s)"
+    # The table is intact and the real row is untouched + still grabbable.
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM tasks WHERE id = %s", (real.id,))
+        assert cur.fetchone()["n"] == 1
+    conn.commit()
+    assert grab_task(conn, worker_id="w1", workstream=ws).id == real.id
 
 
 def test_grab_filter_rejects_unknown_column(conn, ws):

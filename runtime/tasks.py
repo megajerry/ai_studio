@@ -16,7 +16,6 @@ runtime loop uses. Tasks with unmet prerequisites are never grabbed — see
 
 from __future__ import annotations
 
-import re
 from typing import Any, Optional
 from uuid import UUID
 
@@ -38,13 +37,18 @@ _TASK_COLUMNS = (
     "budget_tokens, spent_tokens, retries, created_at, updated_at"
 )
 
-#: Default grab ordering: highest priority first, then oldest (FIFO within tier).
-DEFAULT_SORT = "priority DESC, created_at ASC"
+#: Columns a ``grab_task`` ``sort`` may order by. The ORDER BY is assembled ONLY
+#: from these validated tokens (+ direction/nulls below) — caller input is NEVER
+#: interpolated raw — so a value like ``(SELECT pg_sleep(3))`` can't become SQL.
+_SORTABLE_COLUMNS = frozenset({
+    "priority", "created_at", "updated_at", "claimed_at", "id",
+    "workstream", "type", "agent_type",
+})
+_SORT_DIRECTIONS = frozenset({"ASC", "DESC"})
+_SORT_NULLS = frozenset({"NULLS FIRST", "NULLS LAST"})
 
-#: A caller-supplied ``sort`` must match this (column names + ASC/DESC/commas).
-#: ``sort`` is an ORDER-BY shape constrained by this regex so a typo can't become
-#: arbitrary SQL; ``filter`` is a *structured* mapping (never raw SQL) — see below.
-_SORT_RE = re.compile(r"^[\w\s,.()]+(?:\s+(?:asc|desc|nulls\s+(?:first|last)))?[\w\s,.()]*$", re.I)
+#: Default grab ordering: highest priority first, then oldest (FIFO within tier).
+DEFAULT_SORT_TERMS: tuple[tuple[str, str], ...] = (("priority", "DESC"), ("created_at", "ASC"))
 
 #: Columns a ``grab_task`` filter may constrain. Values are ALWAYS bound as ``%s``
 #: parameters (or ``= ANY(%s)`` for a list) — never interpolated — so a hostile
@@ -57,12 +61,61 @@ _FILTERABLE_COLUMNS = frozenset({
 _UNSET = object()
 
 
-def _validate_sort(sort: Optional[str]) -> str:
+def _parse_sort_term(term, alias: str) -> str:
+    """Validate one sort term (str ``"col [ASC|DESC] [NULLS FIRST|LAST]"`` or a
+    ``(col, direction[, nulls])`` tuple) into a safe ``alias.col DIR [NULLS …]``
+    fragment built ONLY from allowlisted tokens. Raises ``ValueError`` otherwise."""
+    if isinstance(term, (list, tuple)):
+        parts = list(term)
+        if not parts:
+            raise ValueError("empty sort term")
+        col = str(parts[0]).strip()
+        direction = str(parts[1]).strip().upper() if len(parts) > 1 and parts[1] else "ASC"
+        nulls = str(parts[2]).strip().upper() if len(parts) > 2 and parts[2] else None
+    else:
+        tokens = str(term).split()
+        if not tokens:
+            raise ValueError("empty sort term")
+        col = tokens[0]
+        direction, nulls, rest = "ASC", None, tokens[1:]
+        if rest and rest[0].upper() in _SORT_DIRECTIONS:
+            direction = rest.pop(0).upper()
+        if rest:
+            nulls = " ".join(rest).upper()  # must be exactly "NULLS FIRST"/"LAST"
+
+    if col not in _SORTABLE_COLUMNS:
+        raise ValueError(f"unsortable column {col!r} (allowed: {sorted(_SORTABLE_COLUMNS)})")
+    if direction not in _SORT_DIRECTIONS:
+        raise ValueError(f"invalid sort direction {direction!r} (ASC/DESC only)")
+    frag = f"{alias}.{col} {direction}"
+    if nulls is not None:
+        if nulls not in _SORT_NULLS:
+            raise ValueError(f"invalid nulls ordering {nulls!r} (NULLS FIRST/LAST only)")
+        frag += f" {nulls}"
+    return frag
+
+
+def _build_sort(sort, alias: str = "t") -> str:
+    """Build a safe ORDER-BY clause from a structured ``sort`` (allowlist only).
+
+    ``sort`` may be ``None`` (→ the default priority DESC, created_at ASC), a
+    comma-separated string (each term parsed + validated), or a list of terms
+    (strings or ``(col, direction[, nulls])`` tuples). The result is composed
+    entirely of allowlisted column/direction/nulls tokens — caller input is never
+    interpolated — so it cannot carry a subquery/function call/second statement.
+    """
     if not sort:
-        return DEFAULT_SORT
-    if not _SORT_RE.match(sort.strip()):
-        raise ValueError(f"invalid sort expression: {sort!r}")
-    return sort.strip()
+        terms: list = list(DEFAULT_SORT_TERMS)
+    elif isinstance(sort, str):
+        terms = [t for t in sort.split(",") if t.strip()]
+    elif isinstance(sort, (list, tuple)):
+        terms = list(sort)
+    else:
+        raise TypeError("sort must be None, a str, or a list of terms")
+    frags = [_parse_sort_term(t, alias) for t in terms]
+    if not frags:
+        raise ValueError("empty sort expression")
+    return ", ".join(frags)
 
 
 def _build_filter(filter: Optional[dict], alias: str = "t") -> tuple[list[str], list[object]]:
@@ -286,7 +339,7 @@ def grab_task(
     worker_id: str,
     agent_type: Optional[str] = None,
     assignee: Optional[Assignee] = None,
-    sort: Optional[str] = None,
+    sort: "str | list | None" = None,
     filter: Optional[dict] = None,
     workstream: Optional[str] = None,
 ) -> Optional[Task]:
@@ -303,7 +356,7 @@ def grab_task(
     grab it records ``claimed_by``/``agent_type``/``claimed_at`` + an initial
     heartbeat. Returns the claimed task, or ``None`` if nothing is grabbable.
     """
-    order_by = _validate_sort(sort)
+    order_by = _build_sort(sort)  # allowlist-parsed; never raw SQL
     filter_clauses, filter_params = _build_filter(filter)  # validates + parameterizes
     clauses = ["t.status = 'up_for_grabs'"]
     params: list[object] = []
@@ -366,7 +419,7 @@ def claim_task(
     assignee: Optional[Assignee] = None,
     workstream: Optional[str] = None,
     agent_type: Optional[str] = None,
-    sort: Optional[str] = None,
+    sort: "str | list | None" = None,
     filter: Optional[dict] = None,
 ) -> Optional[Task]:
     """Grab the next grabbable task and start it — the runtime loop's convenience.
