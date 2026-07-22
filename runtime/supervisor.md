@@ -19,7 +19,7 @@ whose `heartbeat_at` is older than the threshold, **null heartbeats count as
 stale**, oldest-first. For each stale task:
 
 - **retries < max_retries → re-kick.** `rekick_task` (in `runtime/tasks.py`)
-  resets the row to `queued`, clears `claimed_by` and `heartbeat_at`, increments
+  resets the row to `up_for_grabs`, clears `claimed_by` and `heartbeat_at`, increments
   `retries`, and emits **`task.rekicked`** — all in one transaction. The runtime
   can then materialize a fresh worker to claim it (ADR-0009). The re-kick is
   guarded to `in_progress`, so a task that changed state between the scan and the
@@ -51,7 +51,7 @@ a live-but-busy worker is never re-kicked out from under itself.
 ## Scheduler — the PM pulse
 
 `tick_once(conn, workstream="productivity")` enqueues a `pm.tick` task **only if**
-no `pm.tick` for that workstream is already `queued` or `in_progress` (avoids
+no `pm.tick` for that workstream is already active (not merged/abandoned) (avoids
 pileup when the PM is slow/wedged — a stuck tick is the supervisor's problem, not
 the scheduler's). It returns the new `Task`, or `None` when it skipped. The
 enqueue emits `task.created`, so the pulse is traceable. `run(interval_s)` loops

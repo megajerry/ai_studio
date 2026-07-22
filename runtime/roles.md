@@ -264,7 +264,7 @@ Both are asserted in the tests.
 `run_once(conn, worker_id, sink, *, registry, config, …)` is the single testable
 unit:
 
-1. `claim_task` (M1) — highest-priority queued task, or `None` (caller idles).
+1. `claim_task` (M1) — grab+start the highest-priority grabbable `up_for_grabs` task (deps met), or `None` (caller idles).
 2. dispatch by `task.type`: `pm.tick` → PM; `work.*` → Executor then Verifier;
    `retro` → Retro; `review` → Reviewer; `research` → Researcher. The `retro` /
    `review` / `research` handlers get NO `enqueue` seam, so none can spawn another

@@ -42,7 +42,7 @@ invoke(🔴, conn)  ──find_grant hit──▶  execute tool  ──▶  cons
 4. **resume.** `resume_approved(conn, sink)` (hooked into the worker loop) scans
    `blocked` tasks:
    - approval **approved** → `requeue_blocked_task` sets the task back to
-     `queued` (emits `approval.resumed`); a worker re-claims it.
+     `up_for_grabs` (emits `approval.resumed`); a worker re-grabs it.
    - approval **denied** → `complete_task(failed)` — the 🔴 action was refused,
      the task fails, the tool never runs.
 5. **execute + consume.** On the retry, the executor calls `invoke` again for the

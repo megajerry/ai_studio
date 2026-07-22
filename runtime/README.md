@@ -93,18 +93,19 @@ t = enqueue_task(conn, workstream="productivity", type="build",
                  budget_tokens=100_000)                     # emits task.created
 
 claimed = claim_task(conn, worker_id="host-1", assignee=Assignee.HOST)
-#   highest-priority queued task via SELECT ... FOR UPDATE SKIP LOCKED;
-#   sets in_progress + claimed_by + heartbeat_at; emits task.claimed.
-#   A worker gets tasks targeted at its assignee OR unassigned (null).
-#   Returns None if nothing is claimable.
+#   grab the highest-priority grabbable up_for_grabs task via SELECT ...
+#   FOR UPDATE SKIP LOCKED (dependency-gated) + start it: up_for_grabs → claimed
+#   → in_progress, sets claimed_by/agent_type/heartbeat_at; each hop emits a
+#   task.transition. A worker gets tasks for its assignee OR unassigned (null).
+#   Returns None if nothing is grabbable.
 
 heartbeat(conn, t.id, "host-1")   # updates heartbeat_at only; emits NO event
 complete_task(conn, t.id, result={"ok": True},
-              status=TaskStatus.DONE, spent_tokens=1234)     # emits task.finished
+              status=TaskStatus.MERGED, spent_tokens=1234)   # → merged; task.finished
 #   Only finalizes an in_progress task by default (a worker can't finalize a task
 #   it no longer owns / an already-terminal one) → returns None + no event on
-#   conflict. force=True bypasses the guard (supervisor force-failing a re-kicked
-#   task).
+#   conflict. force=True bypasses the guard (supervisor force-abandoning a
+#   re-kicked task). Every state change goes through tasks.transition (ADR-0015).
 
 read_events(conn, task_id=t.id)                              # replay a task
 read_events(conn, workstream="productivity", since=some_ts) # scan a workstream
@@ -137,14 +138,14 @@ task is silently dropped." Its loop polls
 
 ```python
 for task in find_stale_tasks(conn, threshold_seconds=SUPERVISOR_THRESHOLD):
-    # heartbeat older than the threshold (or missing) while in_progress
-    # → re-kick: reset to queued / spawn a fresh worker, or force-finalize a
-    #   dead task with complete_task(..., force=True).
+    # heartbeat older than the threshold (or missing) while claimed/in_progress
+    # → re-kick: reset to up_for_grabs / spawn a fresh worker, or force-finalize a
+    #   dead task with complete_task(..., status=ABANDONED, force=True).
     ...
 ```
 
-`find_stale_tasks` returns `in_progress` tasks whose `heartbeat_at` is older than
-the threshold (nulls treated as stale), oldest-first. The equivalent pure
+`find_stale_tasks` returns `claimed`/`in_progress` tasks whose `heartbeat_at` is
+older than the threshold (nulls treated as stale), oldest-first. The equivalent pure
 predicate `is_stale(task, threshold_seconds, now=...)` is exported for the
 supervisor's own logic and is unit-tested without a DB.
 
