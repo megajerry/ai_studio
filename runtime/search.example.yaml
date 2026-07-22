@@ -1,0 +1,32 @@
+# AI Studio — search gateway config (EXAMPLE / documented default).
+#
+# Config is DATA, not code (ADR-0005, like the model registry). The Search
+# gateway (runtime/search/gateway.py) reads this to decide WHICH provider serves
+# searches and HOW LONG results are cached — swapping Tavily → Exa → Brave (or
+# tuning the TTL) is a config edit, never a code change.
+#
+# Resolution order (runtime.search.config.resolve_search_path):
+#   1. $AI_STUDIO_SEARCH_FILE   (explicit path)
+#   2. runtime/search.yaml       (real, git-ignored local config)
+#   3. runtime/search.example.yaml  (this file — committed fallback)
+#
+# Copy this to runtime/search.yaml and edit for a real deployment. This file
+# contains NO secrets: provider names only. API keys are .env entries read
+# INSIDE the provider adapters (ADR-0011); config never holds a key.
+
+# Which provider the gateway uses when the caller does not name one.
+#   dryrun  — keyless, deterministic synthetic results (the default; no network)
+#   tavily  — needs TAVILY_API_KEY
+#   exa     — needs EXA_API_KEY
+#   brave   — needs BRAVE_API_KEY
+# A named real provider with no key present is served in dry-run automatically.
+default_provider: dryrun
+
+# Cache TTL in seconds. A cache hit within this window returns stored results
+# and makes NO provider call. Set to null to never expire.
+ttl_s: 3600
+
+# When true, the gateway also remembers a compact result summary into the
+# Knowledge memory layer for reuse (architecture §9 "→ Memory"). Off by default:
+# opt-in so search never writes to memory unless explicitly enabled.
+remember_results: false
