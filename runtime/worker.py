@@ -216,6 +216,7 @@ def _handle_work(
     max_attempts: int,
     run_exec: Callable[..., Any],
     run_verify: Callable[..., Any],
+    skills: Optional[SkillRegistry] = None,
     retro_mode: str = DEFAULT_RETRO_MODE,
 ) -> RunResult:
     # Heartbeat around each phase — liveness while the role does the work.
@@ -237,9 +238,12 @@ def _handle_work(
         )
 
     heartbeat(conn, task.id, worker_id)
+    # The Verifier gets the skill registry too, so its prompt carries the
+    # `rigorous-review` (evidence-over-claims) doctrine (ADR-0014).
     verdict = run_verify(
         conn, task, exec_result, sink,
         registry=registry, config=config, model_registry=model_registry,
+        skills=skills,
     )
     heartbeat(conn, task.id, worker_id)
 
@@ -389,7 +393,7 @@ def run_once(
             registry=registry, config=config, model_registry=model_registry,
             heartbeat=heartbeat, complete=complete, enqueue=enqueue, block=block,
             worker_id=worker_id, max_attempts=max_attempts,
-            run_exec=run_exec, run_verify=run_verify,
+            run_exec=run_exec, run_verify=run_verify, skills=skills,
             retro_mode=resolved_retro_mode,
         )
 

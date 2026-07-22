@@ -196,6 +196,33 @@ _Last updated: 2026-07-22 (remote session)_
   both "OK — studio operated end-to-end" AND "OK — studio learned" —** a forced
   work failure → Retro distills a lesson → `lesson learned: 1` → the next PM prompt
   for that workstream includes the recalled `### Lessons` section.
+- **Validation rigor — evidence over claims: implemented + VERIFIED on a live
+  Postgres** on `chore/review-rigor` (see
+  [`docs/decisions/0014-validation-rigor.md`](../docs/decisions/0014-validation-rigor.md)
+  + [`runtime/roles.md`](../runtime/roles.md) "Validator doctrine"). Encodes an
+  evidence-over-claims doctrine into the platform's validator agents: LLMs default
+  to accepting stated claims as true, which for a validator (the Verifier today,
+  the future Reviewer/Whistle-blower) is a defect. New reviewed in-repo skill
+  `skills/rigorous-review/SKILL.md` (`reviewed: true`, triggers
+  review/verify/validate/audit/check) captures the doctrine: treat every claim as
+  UNVERIFIED until you observe evidence yourself; evidence hierarchy (run+read
+  output > read the code path > inspect logs/metrics/DB rows/artifacts, NEVER the
+  author's summary/comments/commit message); per-claim verdict
+  CONFIRMED/UNVERIFIED/REFUTED (unobtainable ⇒ UNVERIFIED, never approve on trust);
+  concrete rules ("tests pass"⇒run+count, "no secrets"⇒grep, "bug fixed"⇒repro no
+  longer fails); default to skepticism. The **Verifier** (`runtime/roles/verifier.py`)
+  now judges on EVIDENCE — its verdict is the deterministic re-read of the ACTUAL
+  artifact against the success criterion, never the Executor's `result.ok` claim —
+  and injects `rigorous-review` into its prompt when a skill registry is supplied
+  (behavior-preserving with none, mirroring how the PM injects its skill; threaded
+  through `worker._handle_work`/`run_once` + `runtime.demo`). ADR-0014 added;
+  CONTRIBUTING.md Review step now requires an evidence-based review. **Verified
+  live (after rebasing onto main's approvals mechanism): `pytest runtime/tests/`
+  = 251 passed, 0 skips with DATABASE_URL set** (4
+  new tests: evidence beats a false "done" claim, the doctrine skill loads +
+  reviewed + selectable, the Verifier prompt carries the injected doctrine with a
+  registry / base-only without one); **`python -m runtime.demo` still prints both
+  "OK — studio operated end-to-end" AND "OK — studio learned" (skills=4).**
 - Next: the Docker **sandbox** (`SandboxRunner`) so 🔴 `shell` can actually run,
   per-task on-demand worker spawning wired to the scheduler/supervisor, and
   curating external skills (PM/review libraries) through the review gate.
