@@ -273,6 +273,40 @@ def test_sweep_rekicks_then_force_fails_at_max(conn, ws):
     assert "task.finished" in types
 
 
+def test_sweep_does_not_clobber_self_completed_task(conn, ws):
+    # Fix (b): a task at max retries that self-completes in the scan->write window
+    # must NOT be force-failed over its terminal state. The supervisor's scan sees
+    # it in_progress (snapshot), but the worker finishes it before the sweep writes;
+    # the guarded exhausted-fail must then skip it, leaving `done` intact.
+    t = enqueue_task(conn, workstream=ws, type="t")
+    claimed = claim_task(conn, worker_id="w1", workstream=ws)
+    assert claimed is not None and claimed.id == t.id
+
+    # The scan snapshot: in_progress, retries already at max (would force-fail).
+    stale_snapshot = claimed.model_copy(update={"retries": 5})
+
+    # The worker self-completes just before the sweep acts on the snapshot.
+    done = complete_task(conn, t.id, status=TaskStatus.DONE, result={"ok": True})
+    assert done is not None and done.status is TaskStatus.DONE
+
+    # Feed the pre-completion snapshot to the sweep (models the race precisely).
+    res = sweep(conn, threshold_s=60, max_retries=5, find_stale=lambda c, s: [stale_snapshot])
+    assert stale_snapshot.id not in res.failed  # skipped, not clobbered
+
+    # The row is still `done` with its result untouched.
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, result FROM tasks WHERE id = %s", (t.id,))
+        row = cur.fetchone()
+    conn.commit()
+    assert row["status"] == "done"
+    assert row["result"] == {"ok": True}
+
+    # No spurious exhausted-fail event; the finish stays the last state change.
+    types = [e.type for e in read_events(conn, task_id=t.id)]
+    assert "task.failed_exhausted" not in types
+    assert types[-1] == "task.finished"
+
+
 # --- scheduler: PM pulse enqueue-vs-skip (M3a) ------------------------------
 
 

@@ -40,8 +40,10 @@ from runtime.migrate import migrate
 
 
 def test_dryrun_embedding_is_deterministic():
-    a = embed("the quick brown fox")
-    b = embed("the quick brown fox")
+    # force_dry_run pins the offline embedder so this pure-logic test never hits
+    # the network even if a real embedding key is present in the environment.
+    a = embed("the quick brown fox", force_dry_run=True)
+    b = embed("the quick brown fox", force_dry_run=True)
     assert a == b
     assert len(a) == EMBED_DIM
 
@@ -53,9 +55,9 @@ def test_dryrun_embedding_is_l2_normalized():
 
 
 def test_dryrun_embedding_similar_text_is_closer():
-    base = embed("the cat sat on the mat")
-    similar = embed("the cat sat on a mat")
-    different = embed("quantum chromodynamics field equations")
+    base = embed("the cat sat on the mat", force_dry_run=True)
+    similar = embed("the cat sat on a mat", force_dry_run=True)
+    different = embed("quantum chromodynamics field equations", force_dry_run=True)
     assert cosine(base, similar) > cosine(base, different)
 
 
@@ -117,6 +119,33 @@ def test_scope_where_pins_layer_and_columns():
     assert params == ["episode", "A", "p", "e"]
     where_lt, params_lt = scope_where(MemoryLayer.LONGTERM, Scope(workstream="A"))
     assert params_lt == ["longterm"]  # global: only the layer is pinned
+
+
+def test_recall_min_score_excludes_below_floor(monkeypatch):
+    # Pure filter test: a fake store returns known scores; a below-floor item is
+    # dropped. No DB — the event append is stubbed and embed is forced offline.
+    from runtime.memory import api as memory_api
+
+    monkeypatch.setenv("MODELS_DRY_RUN", "1")
+    monkeypatch.setattr(memory_api, "append_event", lambda *a, **k: None)
+
+    high = MemoryItem(layer=MemoryLayer.KNOWLEDGE, workstream="A", text="relevant")
+    low = MemoryItem(layer=MemoryLayer.KNOWLEDGE, workstream="A", text="irrelevant")
+
+    class FakeStore:
+        def upsert(self, item):  # pragma: no cover - unused here
+            return item
+
+        def search(self, **kwargs):
+            return [(high, 0.9), (low, 0.05)]
+
+    scope = Scope(workstream="A")
+    # No floor (default) → both returned: behavior-preserving.
+    both = recall(None, scope, MemoryLayer.KNOWLEDGE, "q", store=FakeStore())
+    assert {i.text for i in both} == {"relevant", "irrelevant"}
+    # Floor between the two scores → the below-floor item is excluded.
+    filtered = recall(None, scope, MemoryLayer.KNOWLEDGE, "q", min_score=0.2, store=FakeStore())
+    assert [i.text for i in filtered] == ["relevant"]
 
 
 # ===========================================================================

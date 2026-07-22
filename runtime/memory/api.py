@@ -133,12 +133,20 @@ def recall(
     k: int = 5,
     *,
     include_global_knowledge: bool = False,
+    min_score: Optional[float] = None,
     store: Optional[VectorStore] = None,
 ) -> list[MemoryItem]:
     """Return the top-``k`` items nearest to ``query`` WITHIN ``scope`` + ``layer``.
 
     Enforces the visibility rule (never crosses workstream/project/episode or
     layer). Emits ``memory.recalled`` with the count only.
+
+    ``min_score`` (optional) is a cosine-similarity floor in ``[-1, 1]``: items
+    scoring strictly below it are dropped, so a weak/irrelevant match is never
+    returned. ``None`` (the default) applies no floor — behavior-preserving.
+    A production caller injecting recalled context into a prompt should set a
+    modest floor (recommended ~0.2 for the dry-run embedder) to keep only
+    genuinely relevant items.
     """
     _validate_for_read(layer, scope)
     query_vec = embed(query)
@@ -150,6 +158,8 @@ def recall(
         k=k,
         include_global_knowledge=include_global_knowledge,
     )
+    if min_score is not None:
+        scored = [(item, score) for item, score in scored if score >= min_score]
     items = [item for item, _score in scored]
 
     append_event(
@@ -202,12 +212,18 @@ def recall_lessons(
     k: int = 5,
     *,
     include_global: bool = True,
+    min_score: Optional[float] = None,
     store: Optional[VectorStore] = None,
 ) -> list[MemoryItem]:
     """Recall the lessons most relevant to ``query`` for injection into new work.
 
     Defaults to including the global lessons corpus (``'*'``) alongside the
     workstream's own — the corpus Retro grows and future work draws on.
+
+    ``min_score`` (optional cosine floor) drops weakly-matching lessons; ``None``
+    (default) is behavior-preserving. Injecting lessons into a live prompt should
+    pass a modest floor (recommended ~0.2 for the dry-run embedder) so an
+    irrelevant lesson is never applied.
     """
     return recall(
         conn,
@@ -216,5 +232,6 @@ def recall_lessons(
         query,
         k,
         include_global_knowledge=include_global,
+        min_score=min_score,
         store=store,
     )
