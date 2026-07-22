@@ -8,6 +8,9 @@ FastAPI service that
   (signature-verified),
 - pushes 🚨 **alarms** immediately and batches 🛑 **approve** / 📣 **inform**
   items into a periodic **digest**,
+- is **wired to the runtime event log / task queue / approvals** (§9) via
+  `spokesman/runtime_bridge.py`, so those 🛑/📣/🚨 reflect **real studio state**
+  and inbound `approve`/`deny` resolve **real** approvals,
 - routes inbound messages into the git `state/` tree and answers `status`
   (ADR-0007).
 
@@ -127,22 +130,76 @@ first; outbound messages are logged rather than sent.
   `curl -XPOST localhost:8080/notify -H "X-Spokesman-Token: $SPOKESMAN_API_TOKEN" -d '{"kind":"inform","text":"fyi"}' -H 'content-type: application/json'`
   then `curl -XPOST localhost:8080/digest/flush -H "X-Spokesman-Token: $SPOKESMAN_API_TOKEN"` → one batched message arrives.
 
+## Runtime bridge (`spokesman/runtime_bridge.py`)
+
+The Spokesman aggregates **all-workstream** state from the runtime Postgres
+(architecture §9). It reuses the runtime's own data-access layer — **no schema
+change** — and runs **keyless** (dry-run send; the DB is the live runtime one):
+
+- **`poll_notifications(conn, since_cursor)`** reads new events past a monotonic
+  `seq` **cursor** and classifies each into an ADR-0006 tier:
+  - `approval.requested` → 🛑 **approve** (batched into the digest),
+  - `review.alarm` → 🚨 **alarm** (sent immediately),
+  - `task.failed_exhausted` / `review.flagged` (non-HIGH) → 📣 **inform** (feed).
+
+  A HIGH `review.flagged` is dropped because that episode already emits a
+  `review.alarm` + an `approval.requested` (no duplicate 📣). Every other event
+  (`policy.decision` / `tool.invoked` / `model.call` / `task.claimed` / …) is
+  intentionally **not** surfaced. The returned **cursor** is the max `seq`
+  scanned — persisted to a git-ignored file (`state/spokesman/notify-cursor.txt`)
+  so a restart never re-notifies an event.
+- **`studio_status(conn)`** → live counts (open / blocked tasks, pending
+  approvals, recent failures, done) + total spend (tokens), for the `status`
+  reply.
+- **`resolve(conn, approval_id, decision, resolver)`** → wraps
+  `runtime.approvals.resolve_approval` (approve/deny, guarded to `pending`) and
+  emits `approval.resolved`; the worker's `resume_approved` then re-queues
+  (approved) or fails (denied) the blocked task — the Spokesman does not touch the
+  worker.
+
+**Notifications carry no secrets or argument values.** The runtime already emits
+leak-free payloads (ids / role / tool / tier / reason / fact-based signal reasons
++ counts, never arg values — CLAUDE.md invariant 5); the bridge composes text
+from *only* those fields and caps free-form reasons.
+
+### Inbound commands (over the signed webhook)
+
+The HMAC-verified inbound message is parsed for a command:
+
+| Message | Effect |
+| --- | --- |
+| `status` | reply with the live `studio_status` summary (falls back to `state/status.md` if the DB is unreachable) |
+| `approve <approval-id>` | resolve that approval → `approved`; the blocked 🔴 action can now run once |
+| `deny <approval-id>` | resolve that approval → `denied`; the blocked task is failed |
+
+The `<approval-id>` is the UUID shown in the 🛑 digest line. A recognized command
+always gets a confirmation reply; an unknown / already-resolved id is reported
+back, not silently dropped.
+
+### Driving the notifier
+
+`POST /poll` (control-plane, token-gated) runs one bridge pass: read new events →
+send 🚨 alarms immediately + batch 🛑/📣 → advance + persist the cursor. Drive it
+on an interval (cron / the scheduler) alongside a periodic `POST /digest/flush`.
+
 ## API surface
 
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | GET | `/health` | public | liveness + dry-run + pending digest count |
 | GET | `/webhook` | public | Meta verification handshake |
-| POST | `/webhook` | HMAC signature | inbound messages (HMAC-SHA256 verified) |
+| POST | `/webhook` | HMAC signature | inbound messages: `status` / `approve <id>` / `deny <id>` (HMAC-SHA256 verified) |
 | POST | `/notify` | `X-Spokesman-Token` | `{"kind":"approve\|inform\|alarm","text":"…"}` → classify + route |
 | POST | `/digest/flush` | `X-Spokesman-Token` | send the pending approve/inform digest |
+| POST | `/poll` | `X-Spokesman-Token` | one runtime-bridge pass (event log → sends), cursor advanced |
 
-`/notify` and `/digest/flush` are the **control plane** and require the
+`/notify`, `/digest/flush` and `/poll` are the **control plane** and require the
 `X-Spokesman-Token` header (matched against `SPOKESMAN_API_TOKEN`). They **fail
-closed**: if `SPOKESMAN_API_TOKEN` is unset, both return `401`.
+closed**: if `SPOKESMAN_API_TOKEN` is unset, all return `401`.
 
-`/digest/flush` is intended to be driven by the scheduler (e.g. daily) once the
-supervisor/scheduler milestone lands; until then call it manually or by cron.
+`/digest/flush` and `/poll` are intended to be driven by the scheduler (e.g.
+`/poll` frequently, `/digest/flush` daily); until then call them manually or by
+cron.
 
 ## Security notes
 

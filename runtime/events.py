@@ -52,6 +52,7 @@ def read_events(
     task_id: Optional[UUID] = None,
     workstream: Optional[str] = None,
     since: Optional[datetime] = None,
+    since_seq: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> list[Event]:
     """Read events in true append order, optionally filtered.
@@ -60,7 +61,9 @@ def read_events(
     ``ts`` defaults to the transaction start time, so events appended within one
     transaction share a timestamp and cannot be ordered by it. Filters compose
     (AND). ``since`` is exclusive on ``ts`` (a time-window filter); ``seq`` still
-    dictates order.
+    dictates order. ``since_seq`` is exclusive on ``seq`` — the monotonic cursor a
+    consumer (e.g. the Spokesman notifier) persists to read only *new* events and
+    never re-process one it already saw.
     """
     clauses: list[str] = []
     params: list[object] = []
@@ -73,6 +76,9 @@ def read_events(
     if since is not None:
         clauses.append("ts > %s")
         params.append(since)
+    if since_seq is not None:
+        clauses.append("seq > %s")
+        params.append(since_seq)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     limit_sql = ""
