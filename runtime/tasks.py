@@ -42,9 +42,17 @@ _TASK_COLUMNS = (
 DEFAULT_SORT = "priority DESC, created_at ASC"
 
 #: A caller-supplied ``sort`` must match this (column names + ASC/DESC/commas).
-#: The sort/filter are supplied by the in-process spawning agent (trusted), but we
-#: still constrain ``sort`` to an ORDER-BY shape so a typo can't become arbitrary SQL.
+#: ``sort`` is an ORDER-BY shape constrained by this regex so a typo can't become
+#: arbitrary SQL; ``filter`` is a *structured* mapping (never raw SQL) — see below.
 _SORT_RE = re.compile(r"^[\w\s,.()]+(?:\s+(?:asc|desc|nulls\s+(?:first|last)))?[\w\s,.()]*$", re.I)
+
+#: Columns a ``grab_task`` filter may constrain. Values are ALWAYS bound as ``%s``
+#: parameters (or ``= ANY(%s)`` for a list) — never interpolated — so a hostile
+#: filter value is treated as data, never executed. Adding a column here is the
+#: only way to widen the surface; anything else raises ``ValueError``.
+_FILTERABLE_COLUMNS = frozenset({
+    "type", "workstream", "assignee", "priority", "agent_type", "claimed_by",
+})
 
 _UNSET = object()
 
@@ -55,6 +63,34 @@ def _validate_sort(sort: Optional[str]) -> str:
     if not _SORT_RE.match(sort.strip()):
         raise ValueError(f"invalid sort expression: {sort!r}")
     return sort.strip()
+
+
+def _build_filter(filter: Optional[dict], alias: str = "t") -> tuple[list[str], list[object]]:
+    """Turn a structured ``{column: value}`` filter into parameterized SQL.
+
+    Each column must be in :data:`_FILTERABLE_COLUMNS` (else ``ValueError``); each
+    value is BOUND as a ``%s`` parameter (a list/tuple/set becomes ``= ANY(%s)``),
+    so a value like ``"x'; DROP TABLE tasks;--"`` is compared as a literal string
+    and can never inject SQL. Returns ``(clauses, params)`` to AND into the query.
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if not filter:
+        return clauses, params
+    if not isinstance(filter, dict):
+        raise TypeError("grab_task filter must be a mapping of column -> value")
+    for col, val in filter.items():
+        if col not in _FILTERABLE_COLUMNS:
+            raise ValueError(
+                f"unfilterable column {col!r} (allowed: {sorted(_FILTERABLE_COLUMNS)})"
+            )
+        if isinstance(val, (list, tuple, set)):
+            clauses.append(f"{alias}.{col} = ANY(%s)")
+            params.append(list(val))
+        else:
+            clauses.append(f"{alias}.{col} = %s")
+            params.append(val)
+    return clauses, params
 
 
 def _emit(conn: psycopg.Connection, task: Task, event_type: EventType, **payload) -> None:
@@ -251,7 +287,7 @@ def grab_task(
     agent_type: Optional[str] = None,
     assignee: Optional[Assignee] = None,
     sort: Optional[str] = None,
-    filter: Optional[str] = None,
+    filter: Optional[dict] = None,
     workstream: Optional[str] = None,
 ) -> Optional[Task]:
     """Grab one grabbable ``up_for_grabs`` task and move it to ``claimed``.
@@ -261,11 +297,14 @@ def grab_task(
     Picks by the caller-supplied ``sort`` (default priority DESC, created_at ASC)
     with ``FOR UPDATE SKIP LOCKED`` so concurrent grabbers never take the same
     task. ``assignee`` targets host/offhost (or unassigned); ``filter`` is an
-    optional extra SQL predicate supplied by the in-process spawning agent. On the
+    optional **structured** ``{column: value}`` mapping (equality, ANDed; a list
+    value becomes ``IN``) over an allowlist of columns — values are bound as
+    parameters, never interpolated, so it is injection-safe (NOT raw SQL). On the
     grab it records ``claimed_by``/``agent_type``/``claimed_at`` + an initial
     heartbeat. Returns the claimed task, or ``None`` if nothing is grabbable.
     """
     order_by = _validate_sort(sort)
+    filter_clauses, filter_params = _build_filter(filter)  # validates + parameterizes
     clauses = ["t.status = 'up_for_grabs'"]
     params: list[object] = []
     if assignee is not None:
@@ -274,8 +313,8 @@ def grab_task(
     if workstream is not None:
         clauses.append("t.workstream = %s")
         params.append(workstream)
-    if filter:
-        clauses.append(f"({filter})")
+    clauses.extend(filter_clauses)
+    params.extend(filter_params)
     # Dependency gate: reject if ANY prerequisite is not yet merged (unmet or
     # abandoned) — such a task is not grabbable (see waiting_tasks()).
     clauses.append(
@@ -328,7 +367,7 @@ def claim_task(
     workstream: Optional[str] = None,
     agent_type: Optional[str] = None,
     sort: Optional[str] = None,
-    filter: Optional[str] = None,
+    filter: Optional[dict] = None,
 ) -> Optional[Task]:
     """Grab the next grabbable task and start it — the runtime loop's convenience.
 

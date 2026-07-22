@@ -175,14 +175,55 @@ def test_grab_by_sort_picks_the_right_task(conn, ws):
 def test_grab_filter_narrows_selection(conn, ws):
     a = enqueue_task(conn, workstream=ws, type="work.keep")
     enqueue_task(conn, workstream=ws, type="work.skip")
-    g = grab_task(conn, worker_id="w1", workstream=ws, filter="t.type = 'work.keep'")
+    # Structured, parameterized filter (equality on an allowlisted column).
+    g = grab_task(conn, worker_id="w1", workstream=ws, filter={"type": "work.keep"})
     assert g is not None and g.id == a.id
+
+
+def test_grab_filter_supports_in_list(conn, ws):
+    a = enqueue_task(conn, workstream=ws, type="work.a")
+    b = enqueue_task(conn, workstream=ws, type="work.b")
+    enqueue_task(conn, workstream=ws, type="work.c")
+    grabbed = set()
+    while True:
+        g = grab_task(conn, worker_id="w1", workstream=ws,
+                      filter={"type": ["work.a", "work.b"]})
+        if g is None:
+            break
+        grabbed.add(g.id)
+    assert grabbed == {a.id, b.id}  # work.c excluded by the IN-list filter
 
 
 def test_grab_rejects_bad_sort(conn, ws):
     enqueue_task(conn, workstream=ws, type="work.x")
     with pytest.raises(ValueError):
         grab_task(conn, worker_id="w1", workstream=ws, sort="priority; DROP TABLE tasks")
+
+
+def test_grab_filter_rejects_unknown_column(conn, ws):
+    enqueue_task(conn, workstream=ws, type="work.x")
+    # A column outside the allowlist (e.g. a raw-SQL smuggling attempt) is refused.
+    with pytest.raises(ValueError):
+        grab_task(conn, worker_id="w1", workstream=ws,
+                  filter={"1=1; DROP TABLE tasks;--": "x"})
+
+
+def test_grab_filter_value_cannot_inject_sql(conn, ws):
+    """A hostile filter VALUE is bound as a parameter, never executed: the query
+    runs safely, matches nothing, and the tasks table still exists afterwards."""
+    real = enqueue_task(conn, workstream=ws, type="work.real")
+    conn.commit()
+    hostile = "work.real'; DROP TABLE tasks; --"
+    # No exception, no DROP — the value is compared as a literal string (no match).
+    g = grab_task(conn, worker_id="w1", workstream=ws, filter={"type": hostile})
+    assert g is None
+    # The table is intact and the legitimate row is untouched + still grabbable.
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM tasks WHERE id = %s", (real.id,))
+        assert cur.fetchone()["n"] == 1
+    conn.commit()
+    g2 = grab_task(conn, worker_id="w1", workstream=ws, filter={"type": "work.real"})
+    assert g2 is not None and g2.id == real.id
 
 
 def test_skip_locked_no_double_grab(conn, ws):
