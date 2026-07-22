@@ -4,7 +4,16 @@ _Last updated: 2026-07-22 (remote session)_
 
 ## Phase
 
-**Design / bootstrap.** Architecture-of-record established; no runtime code yet.
+**Runtime operating end-to-end (keyless), against a live Postgres.** The merged
+substrate runs as one loop — event log + task queue (M1), policy-gated tools (M2),
+supervisor/scheduler (M3a), the single instrumented model call + router/providers
+(M3b), the PM → Executor → Verifier → Retro roles + worker (M3c/M7), four-layer
+memory (M4), search gateway (M5), and the skills layer. The **PM now genuinely
+decomposes** a goal into N work items behind a real confidence gate (execute /
+clarify / push-back), not a single hard-coded task. Evidence:
+`DATABASE_URL=… pytest runtime/tests/` = **257 passed, 0 skips**; `python -m
+runtime.demo` exits 0 (PM decomposes into >1 work items, all verified done, then
+the learning loop distills + injects a lesson).
 
 ## Workstreams
 
@@ -223,6 +232,32 @@ _Last updated: 2026-07-22 (remote session)_
   reviewed + selectable, the Verifier prompt carries the injected doctrine with a
   registry / base-only without one); **`python -m runtime.demo` still prints both
   "OK — studio operated end-to-end" AND "OK — studio learned" (skills=4).**
+- **PM decomposition + real confidence gate — implemented + VERIFIED on a live
+  Postgres** on `runtime/pm-decomposition` (see [`runtime/roles.md`](../runtime/roles.md)
+  "The PM contract"). Makes the ADR-0003 PM real (previously the thinnest stub: one
+  discarded dry-run call + a single hard-coded `work.demo`). `runtime/roles/pm.py`
+  now obtains a **structured `Plan`** (pydantic: `restated_goal`, `success_criteria`,
+  self-scored `confidence` ∈ [0,1], `feasible` + `reason`, `work_items[]` where each
+  `WorkItem` = title/type/instructions/`success_criterion`/marker) by PARSING the
+  `call_model(role=pm, task_type=plan)` output — defensively (unparseable → safe
+  low-confidence fallback, never a crash). The **confidence gate** then branches:
+  `not feasible` → `pm.pushback` + a real 🛑 `approvals.request_approval` (no work);
+  `confidence < PM_CONFIDENCE_THRESHOLD` (env, default 0.6) → `pm.needs_clarification`
+  (no work); else **decompose** → enqueue ONE `work.*` task per item (each with its
+  own concrete, marker-based criterion in payload so the Verifier still checks a real
+  artifact) + emit `pm.planned` with the item COUNT + task ids (no secret text). The
+  keyless dry-run provider gained `build_dry_run_plan` (`runtime/model/providers/dryrun.py`):
+  a planning call (`plan_goal` opt) returns a deterministic, parseable 2–3-item plan
+  derived from the goal; a real model returns the same schema — no PM code change.
+  `call_model`/`enqueue`/`request_approval` are injectable seams so every gate branch
+  is unit-tested. **Verified live: `DATABASE_URL=… pytest runtime/tests/` = 257 passed,
+  0 skips** (new PM tests: multi-item decomposition with per-item criteria + unique
+  markers, injected-plan decomposition, low-confidence→clarify/no-work, infeasible→
+  pushback+approval/no-work, unparseable→safe-low-confidence, `pm.planned` carries
+  counts/ids not secret text; live-DB `test_pm_pushback_creates_approval_*` +
+  `test_worker_full_loop_pm_to_done` now asserting N>1 work items drained to done);
+  **`python -m runtime.demo` prints "PM decomposed into 2 work items"** and stays
+  green (operate + learn).
 - Next: the Docker **sandbox** (`SandboxRunner`) so 🔴 `shell` can actually run,
   per-task on-demand worker spawning wired to the scheduler/supervisor, and
   curating external skills (PM/review libraries) through the review gate.

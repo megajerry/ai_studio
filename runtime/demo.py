@@ -34,6 +34,19 @@ from .tasks import enqueue_task
 from .worker import build_registry, run_once
 
 
+def _count_work_tasks(conn, workstream: str) -> int:
+    """How many ``work.*`` tasks the PM enqueued for this workstream (decomposition)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM tasks WHERE workstream = %s AND type LIKE 'work.%%'",
+            (workstream,),
+        )
+        n = cur.fetchone()["n"]
+    if not conn.autocommit:
+        conn.commit()
+    return int(n)
+
+
 def _print_event_trail(conn, workstream: str) -> None:
     events = read_events(conn, workstream=workstream)
     print(f"\n=== event trail ({len(events)} events, workstream={workstream}) ===")
@@ -41,7 +54,8 @@ def _print_event_trail(conn, workstream: str) -> None:
         payload = ev.payload or {}
         # A compact, PII-free summary of each event's salient fields.
         keys = ("effect", "tier", "tool", "role", "model", "provider",
-                "status", "passed", "reason", "work_task_id", "outcome")
+                "status", "passed", "reason", "work_item_count", "confidence",
+                "work_task_id", "outcome")
         bits = " ".join(f"{k}={payload[k]}" for k in keys if k in payload)
         print(f"  {ev.ts:%H:%M:%S} {ev.type:<20} {bits}")
 
@@ -137,21 +151,31 @@ def main() -> int:
         tick = tick_once(conn, workstream)
         print(f"  scheduler: enqueued {tick.type} {tick.id}" if tick else "  scheduler: (skipped)")
 
-        # 2. Worker pass — PM plans + enqueues the work task (skills injected).
+        # 2. Worker pass — PM understands the goal, self-scores confidence, and
+        #    DECOMPOSES it into N work items (skills injected).
         r1 = run_once(conn, worker_id, sink, registry=registry, config=config,
                       skills=skills, workstream=workstream)
-        print(f"  worker#1: {r1.kind} {r1.outcome} — {r1.detail}" if r1 else "  worker#1: nothing claimed")
+        print(f"  worker#1 (PM): {r1.kind} {r1.outcome} — {r1.detail}" if r1 else "  worker#1: nothing claimed")
+        n_work = _count_work_tasks(conn, workstream)
+        print(f"  PM decomposed into {n_work} work item(s)")
 
-        # 3. Worker pass — Executor does the work, Verifier checks (with the
-        #    `rigorous-review` doctrine injected), commit on evidence.
-        r2 = run_once(conn, worker_id, sink, registry=registry, config=config,
-                      skills=skills, workstream=workstream)
-        print(f"  worker#2: {r2.kind} {r2.outcome} — {r2.detail}" if r2 else "  worker#2: nothing claimed")
+        # 3. Worker passes — Executor does each work item, Verifier checks it (with
+        #    the `rigorous-review` doctrine injected), commit on evidence. Drain ALL
+        #    decomposed work items so the whole plan completes.
+        done = 0
+        while True:
+            r = run_once(conn, worker_id, sink, registry=registry, config=config,
+                         skills=skills, workstream=workstream)
+            if r is None:
+                break
+            print(f"  worker (work): {r.kind} {r.outcome} — {r.detail}")
+            if r.kind == "work" and r.outcome == "done":
+                done += 1
 
         _print_event_trail(conn, workstream)
 
-        ok = bool(r2 and r2.kind == "work" and r2.outcome == "done")
-        print(f"\nruntime.demo: {'OK — studio operated end-to-end' if ok else 'INCOMPLETE'}")
+        ok = bool(n_work > 1 and done == n_work)
+        print(f"\nruntime.demo: {'OK — studio operated end-to-end (PM decomposed into %d work items)' % n_work if ok else 'INCOMPLETE'}")
 
         # Second act: demonstrate the learning loop (retro → lesson → injection).
         learned = _demonstrate_learning(conn, registry, config, worker_id)

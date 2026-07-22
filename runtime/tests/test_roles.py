@@ -8,6 +8,7 @@ refuses 🔴 tool calls (delete / shell) so a role can never escalate privilege.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -18,7 +19,7 @@ from runtime.enforce import InvokeStatus, MemoryEventSink, invoke
 from runtime.models import Task, TaskStatus
 from runtime.policy import Effect, load_policy
 from runtime.roles.executor import ExecutorResult, run_executor
-from runtime.roles.pm import WORK_TASK_TYPE, run_pm_tick
+from runtime.roles.pm import DEFAULT_WORK_TASK_TYPE, WORK_TASK_TYPE, run_pm_tick
 from runtime.roles import verifier as verifier_mod
 from runtime.roles.verifier import verify
 from runtime.skills import SkillRegistry, default_root
@@ -58,47 +59,165 @@ def _fs_registry(root) -> ToolRegistry:
     return reg
 
 
-# --- PM ---------------------------------------------------------------------
+# --- PM: understand → confidence-gate → decompose (ADR-0003) ----------------
 
 
-def test_pm_plans_and_enqueues_exactly_one_work_task():
-    sink = MemoryEventSink()
-    enqueued = []
+def _collecting_enqueue(bucket: list) -> "callable":
+    """A fake enqueue that records each enqueued task (as a QUEUED Task)."""
 
     def fake_enqueue(conn, *, workstream, type, payload=None, priority=0, **kw) -> Task:
-        t = _task(type, payload, workstream)
-        t = t.model_copy(update={"status": TaskStatus.QUEUED})
-        enqueued.append(t)
+        t = _task(type, payload, workstream).model_copy(update={"status": TaskStatus.QUEUED})
+        bucket.append(t)
         return t
 
-    task = _task("pm.tick", {"goal": "Ship the thing"})
-    plan = run_pm_tick(None, task, sink, enqueue=fake_enqueue)
+    return fake_enqueue
 
-    assert plan.goal == "Ship the thing"
-    assert plan.marker and plan.criterion
-    # Exactly ONE work task enqueued, carrying the goal + criterion + marker.
-    assert len(enqueued) == 1
-    work = enqueued[0]
-    assert work.type == WORK_TASK_TYPE
-    assert work.payload["marker"] == plan.marker
-    assert work.payload["criterion"] == plan.criterion
-    # The confidence-gate model call and the plan event were both emitted.
+
+def _plan_completion(plan: dict):
+    """A stand-in Completion whose `.text` is the JSON plan (parsed by the PM)."""
+    return type("C", (), {"text": json.dumps(plan)})()
+
+
+def test_pm_decomposes_goal_into_multiple_work_items():
+    """The keyless dry-run planner splits the goal into N>1 work items; the PM
+    enqueues one work task per item, each with its OWN concrete criterion + marker."""
+    sink = MemoryEventSink()
+    enqueued: list = []
+    task = _task("pm.tick", {"goal": "Ship the thing"})
+
+    plan = run_pm_tick(None, task, sink, enqueue=_collecting_enqueue(enqueued))
+
+    assert plan.decision == "planned"
+    assert plan.work_item_count > 1  # genuine decomposition, not a single hard-coded task
+    assert len(enqueued) == plan.work_item_count
+    # Each work item carries its own criterion + a UNIQUE marker; type is work.*
+    markers = [t.payload["marker"] for t in enqueued]
+    assert len(set(markers)) == len(markers)
+    for t in enqueued:
+        assert t.type.startswith("work.")
+        assert t.payload["criterion"] and t.payload["marker"]
+        assert t.payload["marker"] in t.payload["criterion"]  # criterion is marker-based
+    # The confidence-gate model call and the plan event were emitted.
     types = sink.types()
     assert "model.routed" in types and "model.call" in types
     assert "pm.planned" in types
 
 
+def test_pm_planned_event_carries_counts_and_ids_not_secret_text():
+    sink = MemoryEventSink()
+    enqueued: list = []
+    run_pm_tick(None, _task("pm.tick", {"goal": "Ship the thing"}), sink,
+                enqueue=_collecting_enqueue(enqueued))
+    ev = [e for e in sink.events if e.type == "pm.planned"][0]
+    assert ev.payload["work_item_count"] == len(enqueued)
+    assert set(ev.payload["work_task_ids"]) == {str(t.id) for t in enqueued}
+    # No per-item instruction/criterion/prompt text leaks onto the event log.
+    assert "instructions" not in ev.payload and "criterion" not in ev.payload
+
+
 def test_pm_uses_default_objective_when_no_goal():
     sink = MemoryEventSink()
-    enqueued = []
-    plan = run_pm_tick(
-        None,
-        _task("pm.tick", {"kind": "pulse"}),
-        sink,
-        enqueue=lambda conn, **kw: enqueued.append(kw) or _task(kw["type"], kw.get("payload")),
-    )
+    enqueued: list = []
+    plan = run_pm_tick(None, _task("pm.tick", {"kind": "pulse"}), sink,
+                       enqueue=_collecting_enqueue(enqueued))
     assert plan.goal  # a non-empty default objective
-    assert len(enqueued) == 1
+    assert plan.decision == "planned" and len(enqueued) >= 1
+
+
+def test_pm_decomposes_injected_multiitem_plan_with_per_item_criteria():
+    """Independent of the dry-run wording: an injected high-confidence plan of 3
+    items → 3 work tasks whose payload criteria + markers match the plan exactly."""
+    sink = MemoryEventSink()
+    enqueued: list = []
+    plan_dict = {
+        "restated_goal": "Build X",
+        "success_criteria": ["all parts done"],
+        "confidence": 0.85,
+        "feasible": True,
+        "work_items": [
+            {"title": "P1", "type": "work.task", "instructions": "do p1",
+             "success_criterion": "artifact 1 contains marker A", "marker": "A"},
+            {"title": "P2", "type": "work.build", "instructions": "do p2",
+             "success_criterion": "artifact 2 contains marker B", "marker": "B"},
+            {"title": "P3", "instructions": "do p3",
+             "success_criterion": "artifact 3 contains marker C", "marker": "C"},
+        ],
+    }
+
+    plan = run_pm_tick(
+        None, _task("pm.tick", {"goal": "Build X"}), sink,
+        enqueue=_collecting_enqueue(enqueued),
+        call_model=lambda **kw: _plan_completion(plan_dict),
+    )
+
+    assert plan.decision == "planned" and plan.work_item_count == 3 and len(enqueued) == 3
+    assert [t.payload["criterion"] for t in enqueued] == [
+        "artifact 1 contains marker A", "artifact 2 contains marker B",
+        "artifact 3 contains marker C",
+    ]
+    assert [t.payload["marker"] for t in enqueued] == ["A", "B", "C"]
+    # A named work.* type is honored; a missing type defaults to work.task.
+    assert [t.type for t in enqueued] == ["work.task", "work.build", DEFAULT_WORK_TASK_TYPE]
+
+
+def test_pm_low_confidence_needs_clarification_and_enqueues_no_work():
+    sink = MemoryEventSink()
+    enqueued: list = []
+    plan_dict = {
+        "restated_goal": "g", "confidence": 0.2, "feasible": True,
+        "work_items": [{"title": "a", "instructions": "i",
+                        "success_criterion": "c", "marker": "m1"}],
+    }
+    plan = run_pm_tick(
+        None, _task("pm.tick", {"goal": "g"}), sink,
+        enqueue=_collecting_enqueue(enqueued),
+        call_model=lambda **kw: _plan_completion(plan_dict),
+    )
+    assert plan.decision == "needs_clarification"
+    assert enqueued == []  # gate closed → no work executed
+    assert "pm.needs_clarification" in sink.types()
+    assert "pm.planned" not in sink.types()
+
+
+def test_pm_infeasible_pushes_back_creates_approval_and_enqueues_no_work():
+    sink = MemoryEventSink()
+    enqueued: list = []
+    approvals: list = []
+
+    def fake_request_approval(conn, *, task_id, role, tool, capabilities, tier,
+                              reason, sink, workstream, **kw):
+        approvals.append({"tier": tier, "reason": reason, "role": role, "tool": tool})
+        return type("A", (), {"id": uuid4()})()
+
+    plan_dict = {
+        "restated_goal": "g", "confidence": 0.9, "feasible": False,
+        "reason": "requirement is out of scope", "work_items": [],
+    }
+    plan = run_pm_tick(
+        None, _task("pm.tick", {"goal": "g"}), sink,
+        enqueue=_collecting_enqueue(enqueued),
+        call_model=lambda **kw: _plan_completion(plan_dict),
+        request_approval=fake_request_approval,
+    )
+    assert plan.decision == "pushback" and plan.approval_id
+    assert enqueued == []  # never executes on an infeasible requirement
+    assert approvals and approvals[0]["tier"] == "🛑" and approvals[0]["role"] == "pm"
+    assert "pm.pushback" in sink.types()
+    assert "pm.planned" not in sink.types()
+
+
+def test_pm_unparseable_output_takes_safe_low_confidence_path_no_crash():
+    sink = MemoryEventSink()
+    enqueued: list = []
+    plan = run_pm_tick(
+        None, _task("pm.tick", {"goal": "g"}), sink,
+        enqueue=_collecting_enqueue(enqueued),
+        call_model=lambda **kw: type("C", (), {"text": "sorry — no JSON here at all"})(),
+    )
+    assert plan.decision == "needs_clarification"
+    assert plan.confidence == 0.0
+    assert enqueued == []
+    assert "pm.needs_clarification" in sink.types()
 
 
 # --- Executor ---------------------------------------------------------------

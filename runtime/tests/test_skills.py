@@ -227,19 +227,23 @@ def _pm_task(goal: str) -> Task:
 def test_pm_composes_prompt_with_selected_reviewed_skill(monkeypatch):
     """The PM's confidence-gate prompt includes the selected reviewed skill and
     excludes irrelevant/unreviewed ones — proving the role uses the skills layer."""
+    import json as _json
+
     from runtime.roles import pm as pm_mod
 
     captured: dict = {}
 
     def fake_call_model(*, messages, **kw):
         captured["prompt"] = messages[0]["content"]
+        # A valid single-item plan so decomposition proceeds (behavior preserved).
+        plan = {"restated_goal": "Ship the release", "confidence": 0.9, "feasible": True,
+                "work_items": [{"title": "t", "instructions": "i",
+                                "success_criterion": "c", "marker": "m1"}]}
 
         class _C:
-            text = "ok"
+            text = _json.dumps(plan)
 
         return _C()
-
-    monkeypatch.setattr(pm_mod, "call_model", fake_call_model)
 
     reg = SkillRegistry(
         [
@@ -263,6 +267,7 @@ def test_pm_composes_prompt_with_selected_reviewed_skill(monkeypatch):
         skills=reg,
         enqueue=lambda conn, **kw: enqueued.append(kw)
         or _pm_task(kw.get("payload", {}).get("goal", "")),
+        call_model=fake_call_model,
     )
 
     prompt = captured["prompt"]
@@ -279,10 +284,10 @@ def test_pm_prompt_unchanged_without_skills(monkeypatch):
     from runtime.roles import pm as pm_mod
 
     captured: dict = {}
-    monkeypatch.setattr(
-        pm_mod, "call_model",
-        lambda *, messages, **kw: captured.setdefault("p", messages[0]["content"])
+    pm_mod.run_pm_tick(
+        None, _pm_task("g"),
+        enqueue=lambda conn, **kw: _pm_task("g"),
+        call_model=lambda *, messages, **kw: captured.setdefault("p", messages[0]["content"])
         or type("C", (), {"text": "ok"})(),
     )
-    pm_mod.run_pm_tick(None, _pm_task("g"), enqueue=lambda conn, **kw: _pm_task("g"))
     assert "### Skills" not in captured["p"]

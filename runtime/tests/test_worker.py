@@ -124,21 +124,26 @@ def test_full_loop_reaches_done_and_emits_canonical_sequence(tmp_path):
 
     q.enqueue(None, workstream="test", type=PM_TICK_TYPE, payload={"goal": "Operate the studio"})
 
-    # Pass 1: claims pm.tick → PM plans + enqueues the work task, then commits.
+    # Pass 1: claims pm.tick → PM decomposes + enqueues N>1 work tasks, then commits.
     r1 = run_once(None, "w1", sink, registry=reg, config=cfg, **_seams(q))
     assert r1 is not None and r1.kind == "pm" and r1.outcome == "done"
+    work_items = [t for t in q.tasks.values() if t.type.startswith("work.")]
+    assert len(work_items) > 1  # genuine decomposition into multiple work items
 
-    # Pass 2: claims work.demo → Executor + Verifier → commit done.
-    r2 = run_once(None, "w1", sink, registry=reg, config=cfg, **_seams(q))
-    assert r2 is not None and r2.kind == "work" and r2.outcome == "done"
+    # Subsequent passes: claim each work.* task → Executor + Verifier → commit done.
+    done_count = 0
+    while True:
+        r = run_once(None, "w1", sink, registry=reg, config=cfg, **_seams(q))
+        if r is None:
+            break
+        assert r.kind == "work" and r.outcome == "done"
+        done_count += 1
+    assert done_count == len(work_items)  # every decomposed item reached done
 
-    # Pass 3: nothing left to claim.
-    assert run_once(None, "w1", sink, registry=reg, config=cfg, **_seams(q)) is None
-
-    # The work task is DONE and was verified (verify→commit).
-    work = [t for t in q.tasks.values() if t.type.startswith("work.")][0]
-    assert work.status is TaskStatus.DONE
-    assert work.result and work.result["verified"] is True
+    # Every work task is DONE and was verified (verify→commit).
+    work = [t for t in q.tasks.values() if t.type.startswith("work.")]
+    assert all(t.status is TaskStatus.DONE for t in work)
+    assert all(t.result and t.result["verified"] is True for t in work)
 
     types = sink.types()
     # (a) planning happened, (b) both model events, (c) the policy-gated tool
