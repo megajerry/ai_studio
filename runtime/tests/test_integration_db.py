@@ -309,3 +309,36 @@ def test_call_model_records_spend_and_event(conn, ws, monkeypatch):
         spent = cur.fetchone()["spent_tokens"]
     conn.commit()
     assert spent == comp.usage.total_tokens
+
+
+# --- worker: full agent-driven loop end-to-end (M3c) ------------------------
+
+
+def test_worker_full_loop_pm_to_done(conn, ws, tmp_path, monkeypatch):
+    """Against a live DB: tick → PM plans + enqueues work → Executor + Verifier →
+    committed done, with the canonical event trail landing in the M1 log."""
+    from runtime.enforce import DbEventSink
+    from runtime.policy import load_policy
+    from runtime.worker import build_registry, run_once
+
+    for env in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setenv("MODELS_DRY_RUN", "1")
+
+    registry = build_registry(str(tmp_path))
+    config = load_policy()
+    sink = DbEventSink(conn)
+
+    tick = tick_once(conn, workstream=ws)
+    assert tick is not None and tick.type == PM_TICK_TYPE
+
+    r1 = run_once(conn, "it-worker", sink, registry=registry, config=config, workstream=ws)
+    assert r1 is not None and r1.kind == "pm" and r1.outcome == "done"
+
+    r2 = run_once(conn, "it-worker", sink, registry=registry, config=config, workstream=ws)
+    assert r2 is not None and r2.kind == "work" and r2.outcome == "done"
+
+    types = [e.type for e in read_events(conn, workstream=ws)]
+    for required in ("task.created", "pm.planned", "model.routed", "model.call",
+                     "policy.decision", "tool.invoked", "task.finished"):
+        assert required in types, f"missing {required} in {types}"

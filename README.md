@@ -148,6 +148,26 @@ opt-in compose service — see the runbook
 docker compose --profile spokesman up -d spokesman   # opt-in; M0 up is unaffected
 ```
 
+### Runtime: see the studio operate end-to-end (M3c)
+
+The agent runtime now runs as one loop — PM plans, a worker materializes to do the
+work, and an independent verifier gates the commit — **fully keyless (dry-run)**:
+
+```bash
+pip install -r runtime/requirements.txt pytest
+pytest runtime/tests/          # full loop, keyless; DB tests skip without Postgres
+
+# End-to-end against a live DB (prints the event trail; skips cleanly if no DB):
+docker compose up -d postgres && python -m runtime.migrate
+python -m runtime.demo
+
+# The on-demand worker daemon (claims + services queued tasks):
+python -m runtime.worker
+```
+
+See [`runtime/roles.md`](runtime/roles.md) for the roles, the operating loop, and
+how the worker/supervisor/scheduler fit together.
+
 This repo is developed from a remote session; the target host is a separate
 machine, so `state/` (git) is the cross-machine substrate until the host is live
 (see [`state/README.md`](state/README.md)).
