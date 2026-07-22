@@ -10,7 +10,7 @@ _Last updated: 2026-07-21 (remote session)_
 
 | Workstream | Status | Notes |
 | --- | --- | --- |
-| Productivity (this repo) | 🟡 bootstrapping | Architecture + ADRs written; onboarding flow + **M0 infra spine implemented** (docker-compose + bootstrap + health check) — **pending verification on the host** (not runnable from the remote session). |
+| Productivity (this repo) | 🟡 bootstrapping | Architecture + ADRs written; onboarding flow + **M0 infra spine implemented** (docker-compose + bootstrap + health check) — **pending verification on the host** (not runnable from the remote session). **M1 event log + task queue implemented** (`runtime/`: Postgres schema + typed data-access + migrator + tests) on branch `runtime/eventlog` — **pending host verification against a live Postgres**. |
 
 ## Next up
 
@@ -21,8 +21,11 @@ _Last updated: 2026-07-21 (remote session)_
   state integration; runs in dry-run with no creds). See
   [`docs/spokesman-whatsapp.md`](../docs/spokesman-whatsapp.md). Remaining: WhatsApp
   Business provisioning (stakeholder credentials + a public tunnel) + host verify.
-- M1 — event log / task queue (Postgres schema), then M2 (policy + tools),
-  M3 (supervisor + scheduler + first on-demand role agent end-to-end).
+- **M1 — event log / task queue: implemented** on `runtime/eventlog` (see
+  [`runtime/README.md`](../runtime/README.md)). Host TODO: `make migrate` against
+  a live Postgres, then `pytest runtime/tests/` (DB tests skip off-host).
+- Next: M2 (policy + tools), M3 (supervisor + scheduler + first on-demand role
+  agent end-to-end — the supervisor consumes `runtime.find_stale_tasks`).
 
 ## Open decisions
 
