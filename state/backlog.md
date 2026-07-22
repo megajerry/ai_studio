@@ -27,8 +27,15 @@ migrated `queued→up_for_grabs`/`done→merged`/`failed→abandoned` (migration
 idempotent); grab-by-sort + `FOR UPDATE SKIP LOCKED`; Verifier-as-Reviewer unified
 dev/review loop; prerequisite DAG `depends_on` with `ready_tasks`/`waiting_tasks`;
 append-only `task_transitions` telemetry + `task_lifecycle`/`task_cost`/agent+model
-rollups; docs `docs/task-lifecycle.md`) · onboarding/secrets · model shortlist +
-cost model · ADRs 0001–0015.
+rollups; docs `docs/task-lifecycle.md`) · **Experiment primitive** (ADR-0016 —
+venture-studio brain's first object: `runtime/experiment/` package; `Experiment`
+= hypothesis + `success_metric{name,target,comparator}` + token/$ budget; guarded
+`proposed→running→evaluated→kept|scaled|killed`; evidence-based kill/scale rule
+(spend from `task_cost` + metric from telemetry; over-budget/missed→killed,
+met→kept, strongly-met→scaled w/ 🛑 budget approval); events leak no secret text;
+migration 0009 idempotent, indexed `(workstream, status)`; docs
+`runtime/experiment.md`) · onboarding/secrets · model shortlist +
+cost model · ADRs 0001–0016.
 
 ## 🔄 In progress
 
@@ -40,27 +47,24 @@ cost model · ADRs 0001–0015.
    lifecycle milestone) — degraded-mode contract, reconnect grace window (avoid
    thundering-herd re-kick), git fallback; Postgres LAN bind + `pg_hba` allowlist
    of authorized hosts (not internet).
-2. **Experiment primitive** (venture-studio brain, first object) — an `experiment`
-   (hypothesis, success metric, budget, kill/scale decision) + one evaluation step.
-   Generic machinery; the *first real* experiment needs a product decision (below).
-3. **Real budget enforcement** — per-workstream $/token caps that actually gate
+2. **Real budget enforcement** — per-workstream $/token caps that actually gate
    (today: router downshift + `OverBudget` on dry-run tokens only).
-4. **Coding-worker dispatch** — route a "Need Prototype" coding task through the
+3. **Coding-worker dispatch** — route a "Need Prototype" coding task through the
    (done) sandbox runner via `invoke` (opencode as the replaceable worker).
-5. **Workstream-bootstrap primitive** (makes starting a vertical config-not-code) —
+4. **Workstream-bootstrap primitive** (makes starting a vertical config-not-code) —
    a workstream config/registration (name/objective/budget/policy grants/tool+skill
    set/memory-seed/DB-scope/object-store bucket) + the **role prompt-assembly layer**
    (shared role base + workstream charter + per-role overlay + skills + lessons +
    task) + a **pluggable verify-checker registry** (structured criterion → domain
    check, e.g. `video_audit`) so verticals augment verification while the learning/
    retro/reviewer/telemetry all still apply. Captured by the vertical-isolation ADR.
-6. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
+5. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
    product→own repo, definition→platform (this repo).
-7. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
+6. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
-8. **Adaptive orchestration intensity** — generalize scaling of review/retro/
+7. **Adaptive orchestration intensity** — generalize scaling of review/retro/
    research by recent error rate + budget/telemetry (today: on_fail/on_risk).
-9. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+8. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
    M1's `EventType` enum).
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)

@@ -2,6 +2,21 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
+## Latest (branch `runtime/experiment`, ADR-0016 — complete, awaiting merge)
+
+**Experiment primitive — the venture-studio brain's first object.** New
+self-contained `runtime/experiment/` package: an `Experiment` (hypothesis +
+`success_metric{name,target,comparator}` + token/$ budget) with a guarded status
+machine (`proposed → running → evaluated → kept|scaled|killed`) and an
+**evidence-based kill/scale rule** — reads spend from `task_cost` + metric from
+observation/telemetry events, then over-budget/missed → `killed`, met → `kept`,
+strongly met → `scaled` (opens a 🛑 budget approval). Events leak no hypothesis /
+secret text. Migration `0009_experiments.sql` (forward-only + idempotent, indexed
+on `(workstream, status)`). Docs: [ADR-0016](decisions/0016-experiment-primitive.md)
++ [`runtime/experiment.md`](../runtime/experiment.md). Evidence:
+`DATABASE_URL=… pytest runtime/tests/ spokesman/tests/` = **427 passed, 0 skips**
+(395 → 427, +32 new); `python -m runtime.demo` exits 0.
+
 ## Latest (branch `runtime/task-lifecycle`, ADR-0015 — complete, awaiting merge)
 
 **Canonical task-lifecycle state machine.** Task state is now one canonical
