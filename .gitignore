@@ -17,6 +17,11 @@ config.local.*
 runtime/policy.yaml
 runtime/policy.local.yaml
 
+# Real model registry/routing policy lives locally; only
+# runtime/models.example.yaml is committed (rules-as-data; ADR-0005/0011).
+runtime/models.yaml
+runtime/models.local.yaml
+
 # Runtime inbound messages captured by the Spokesman may contain personal info
 # (sender numbers, message bodies) — keep them out of git (ADR-0011).
 state/inbox/whatsapp-inbound.jsonl
