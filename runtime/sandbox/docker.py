@@ -72,8 +72,11 @@ class SandboxConfigError(ValueError):
     """Raised when a sandbox is configured unsafely (e.g. mounting host root)."""
 
 
-def _abspath(path: str) -> str:
-    return os.path.abspath(os.path.expanduser(path))
+def _realpath(path: str) -> str:
+    # realpath (not abspath) resolves symlinks too, so a workdir that is a symlink
+    # pointing at '/' (or any disallowed host path) is caught by the host-root
+    # check below instead of silently mounting its target.
+    return os.path.realpath(os.path.expanduser(path))
 
 
 class DockerSandboxRunner:
@@ -140,8 +143,8 @@ class DockerSandboxRunner:
 
     @staticmethod
     def _validate_workdir(path: str) -> str:
-        """Resolve ``path`` and refuse to mount the host root."""
-        resolved = _abspath(path)
+        """Resolve ``path`` (following symlinks) and refuse to mount the host root."""
+        resolved = _realpath(path)
         if resolved == os.sep:
             raise SandboxConfigError(
                 "refusing to bind-mount the host root '/' into the sandbox"

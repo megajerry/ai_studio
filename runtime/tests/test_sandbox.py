@@ -138,6 +138,15 @@ def test_refuses_to_mount_host_root():
         DockerSandboxRunner(env={}, workdir="/")
 
 
+def test_refuses_symlink_to_host_root(tmp_path):
+    # A workdir that is a symlink pointing at '/' must be refused too — the
+    # resolution follows symlinks (realpath) before the host-root check.
+    link = tmp_path / "sneaky"
+    link.symlink_to("/")
+    with pytest.raises(SandboxConfigError):
+        DockerSandboxRunner(env={}, workdir=str(link))
+
+
 def test_workdir_is_scoped_not_host_root(tmp_path):
     # Sanity: the mounted host path is the scoped dir, never '/'.
     r = DockerSandboxRunner(env={}, workdir=str(tmp_path))
