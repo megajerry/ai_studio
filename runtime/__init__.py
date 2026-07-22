@@ -43,12 +43,17 @@ from .policy import (
     decide,
     load_policy,
 )
+# NOTE: `runtime.supervisor` / `runtime.scheduler` are deliberately NOT imported
+# here — they are always-on entrypoints (`python -m runtime.supervisor`), and
+# re-exporting them from the package triggers a double-import RuntimeWarning
+# under `-m`. Import `sweep` / `tick_once` from those submodules directly.
 from .tasks import (
     claim_task,
     complete_task,
     enqueue_task,
     find_stale_tasks,
     heartbeat,
+    rekick_task,
 )
 from .tools import (
     FilesystemTool,
@@ -78,6 +83,7 @@ __all__ = [
     "is_stale",
     "make_event",
     "read_events",
+    "rekick_task",  # M3a supervisor re-kick primitive (loop lives in runtime.supervisor)
     # M2 — capabilities & tiers
     "ActionTier",
     "Capability",

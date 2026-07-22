@@ -10,7 +10,7 @@ _Last updated: 2026-07-21 (remote session)_
 
 | Workstream | Status | Notes |
 | --- | --- | --- |
-| Productivity (this repo) | 🟡 bootstrapping | Architecture + ADRs written; onboarding flow + **M0 infra spine implemented** (docker-compose + bootstrap + health check) — **pending verification on the host** (not runnable from the remote session). **M1 event log + task queue implemented** (`runtime/`: Postgres schema + typed data-access + migrator + tests) on branch `runtime/eventlog` — **pending host verification against a live Postgres**. **M2 policy engine + tool layer implemented** (`runtime/`: capabilities/tiers, rules-as-data policy, tool registry, confined FilesystemTool, refusing ShellTool, enforced `invoke` path emitting events) on branch `runtime/policy-tools` — pure/tool/enforce tests green off-host; **pending host verification** (event emission against a live Postgres via `DbEventSink`). |
+| Productivity (this repo) | 🟡 bootstrapping | Architecture + ADRs written; onboarding flow + **M0 infra spine implemented** (docker-compose + bootstrap + health check) — **pending verification on the host** (not runnable from the remote session). **M1 event log + task queue implemented** (`runtime/`: Postgres schema + typed data-access + migrator + tests) on branch `runtime/eventlog` — **pending host verification against a live Postgres**. **M2 policy engine + tool layer implemented** (`runtime/`: capabilities/tiers, rules-as-data policy, tool registry, confined FilesystemTool, refusing ShellTool, enforced `invoke` path emitting events) on branch `runtime/policy-tools` — pure/tool/enforce tests green off-host; **pending host verification** (event emission against a live Postgres via `DbEventSink`). **M3a supervisor + scheduler implemented** (`runtime/supervisor.py` + `runtime/scheduler.py`: the non-agent liveness layer — re-kick stale tasks / force-fail on exhausted retries emitting `task.rekicked`/`task.failed_exhausted`; PM-pulse `pm.tick` enqueue-without-pileup; migration `0003_task_retries.sql`; launchd `KeepAlive` templates in `infra/launchd/`) on branch `runtime/supervisor` — unit tests green off-host (72 passed, DB tests skip cleanly); **pending host verification** (migrate + DB re-kick/fail/tick tests + launchd load). |
 
 ## Next up
 
@@ -31,8 +31,18 @@ _Last updated: 2026-07-21 (remote session)_
   `tool.invoked` / `approval.requested`; 🔴 never auto-executes. Host TODO: run
   `pytest runtime/tests/` and exercise `DbEventSink` against a live Postgres so
   the emitted events land in the M1 log.
-- Next: M3 (supervisor + scheduler + first on-demand role agent end-to-end — the
-  supervisor consumes `runtime.find_stale_tasks`).
+- **M3a — supervisor + scheduler: implemented** on `runtime/supervisor` (see
+  [`runtime/supervisor.md`](../runtime/supervisor.md)). The non-agent liveness
+  layer (ADR-0004): `sweep` re-kicks in-progress tasks with a stale heartbeat
+  (reset → `queued`, bump `retries`, emit `task.rekicked`) and force-fails ones
+  that exhaust `SUPERVISOR_MAX_RETRIES` (emit `task.failed_exhausted`);
+  `tick_once` enqueues the `pm.tick` pulse without pileup. No LLM calls. Host
+  TODO: `python -m runtime.migrate` (applies `0003_task_retries.sql`), then
+  `pytest runtime/tests/` against a live Postgres (re-kick / exhausted-fail /
+  tick DB tests), then install the launchd templates from `infra/launchd/`
+  (`KeepAlive`) so the OS keeps the supervisor alive.
+- Next: M3b (first on-demand role agent end-to-end — a worker that claims a
+  `pm.tick` / task, heartbeats, and completes, materialized per task).
 
 ## Open decisions
 

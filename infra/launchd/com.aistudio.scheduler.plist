@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd TEMPLATE for the scheduler (ADR-0009) — the Productivity PM pulse.
+  Enqueues a `pm.tick` task on a cadence; the runtime materializes a PM worker
+  per tick. KeepAlive=true so the OS restarts the pulse if it dies.
+
+  Setup (see runtime/supervisor.md):
+    1. Replace __REPO_DIR__ with the absolute path to this repo checkout and
+       __PYTHON__ with the interpreter (e.g. the venv's bin/python).
+    2. cp this file to ~/Library/LaunchAgents/com.aistudio.scheduler.plist
+    3. launchctl load  ~/Library/LaunchAgents/com.aistudio.scheduler.plist
+       launchctl unload ~/Library/LaunchAgents/com.aistudio.scheduler.plist  # to stop
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aistudio.scheduler</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>-m</string>
+        <string>runtime.scheduler</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PULSE_INTERVAL_S</key>
+        <string>300</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/state/logs/scheduler.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/state/logs/scheduler.err.log</string>
+</dict>
+</plist>
