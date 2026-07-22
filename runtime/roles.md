@@ -20,13 +20,15 @@ to the dry-run provider when no key is present.
 | `roles/verifier.py` | `verify` — INDEPENDENT verify→commit gate (read-only); returns pass/fail |
 | `roles/reviewer.py` | `run_review` — INDEPENDENT risk/disaster guard (read-only): reads a finished episode's trail + artifact, computes fact-based risk signals; emits `review.passed`/`review.flagged` (+ 🚨 `review.alarm` / 🛑 approval on HIGH) |
 | `roles/retro.py` | `run_retro` — distill 1-3 durable **lessons** from an episode's trail into Knowledge memory; emits `retro.completed` (count only) |
+| `roles/researcher.py` | `run_research` — mine **external** best-practice: `search()` via the policy-gated gateway (`net.fetch`) → `call_model(task_type=research)` dry-run → distill 1-3 **lessons** into Knowledge memory (+ optional `reviewed: false` candidate skill, off by default); emits `research.completed` (topic-hash + counts only); enqueues nothing (no loop) |
 | `roles/lessons.py` | `inject_lessons`/`compose_lessons` — auto-inject the recalled lessons into a role's prompt (`### Lessons`), the deterministic apply-the-lesson step |
 | `worker.py` | `run_once` (claim → dispatch → heartbeat → verify→commit; triggers Retro on terminal work), `run()`/`main()` |
-| `demo.py` | `python -m runtime.demo` — end-to-end proof + learning-loop proof against a live DB (skips w/o DB) |
+| `demo.py` | `python -m runtime.demo` — four acts against a live DB (skips w/o DB): end-to-end loop, learning loop, Reviewer guard, and the **Researcher** (search gateway → distilled recallable lessons) |
 | `tests/test_roles.py` | role units + policy-gate refusals (🔴 delete/shell) — keyless, no DB |
 | `tests/test_worker.py` | full loop via an in-memory fake queue; verify-fail re-enqueue |
 | `tests/test_retro.py` | lesson distillation + retro trigger policy + NO retro-loop; live-DB run_retro |
 | `tests/test_reviewer.py` | pure `assess_risks` signals + `WORKER_REVIEW` trigger policy + NO review-loop; live-DB `run_review` (evidence beats a lying model, HIGH → 🚨/🛑, events leak no secrets) |
+| `tests/test_researcher.py` | finding distillation (bounded, adaptive-lite) + research dispatch + NO research-loop; live-DB `run_research` (gateway-gated search, `net.fetch` denial, recallable lessons, events leak no bodies, drafted skill `reviewed: false` excluded by inject gate) |
 | `tests/test_lessons.py` | lesson injection: bounded/scoped, behavior-preserving with no lessons |
 
 > A role is `prompt + skills + tools` (architecture §3). Today the prompt is an
@@ -198,6 +200,50 @@ work.* finishes (done|failed)
 - **Behavior-preserving.** With no lessons (or no `conn`), `inject_lessons` returns
   the base prompt unchanged — the roles behave exactly as before.
 
+## The Researcher — learning from outside (ADR-0003)
+
+Where the Retro learns from an episode's **own** trail, the **Researcher**
+(`roles/researcher.py`) mines **external** best-practice/tools into the same
+reusable Knowledge corpus. It runs on a `research` task and acts only through the
+sanctioned seams — never agent-direct (architecture §9):
+
+```
+research task (payload.topic|question)
+        ▼  worker.run_once (claim research)   [a research task NEVER enqueues → no loop]
+   Researcher: search(conn, role="researcher", query=topic)   ── policy-gated on net.fetch,
+               cached, keyless dry-run   ──emits──> search.cache_miss/hit, search.provider_call
+                                                    (provider/count/latency + query HASH — no bodies)
+          call_model(role=researcher, task_type=research)      ── traceability only (dry-run);
+                                                    digest is titles/urls only (no fetched body)
+          distill 1-3 reusable lessons (bounded; fast-moving domain → +revisit lesson)
+          memory.add_lesson(...) → Knowledge layer   ──emits──> memory.remembered (id/dims only)
+          [optional, off by default] draft a candidate SKILL.md via the policy-gated
+                 invoke(role=researcher, tool_name="filesystem", op="write") →
+                 frontmatter `reviewed: false` + `source` provenance  ⇒ the inject gate
+                 (`filter_injectable`) NEVER auto-injects it (review-before-use, ADR-0008)
+          ──emits──> research.completed (topic-HASH + counts + skill_drafted bool — NEVER bodies)
+        │
+        ▼  the distilled lessons are recall_lessons-able and auto-injected into future work
+```
+
+**Design properties:**
+
+- **Gateway only, never agent-direct.** The Researcher cannot fetch the network
+  itself; every search is the choke-point `search()` (policy → cache → provider →
+  cache → memory). A role lacking `net.fetch` is DENIED before any provider call.
+- **Adaptive intensity (ADR-0003).** A fast-moving domain (AI/LLM/security/…)
+  earns an extra "treat this as perishable — re-research before relying on it"
+  lesson. Output is bounded (≤ `MAX_LESSONS=3`, single pass).
+- **Review-before-use.** A drafted candidate skill is always `reviewed: false`,
+  so it is excluded from prompt injection until a human reviews + flips it.
+- **No leakage / no loop.** `research.completed` carries the topic *hash* + counts
+  + ids only (never the raw topic, result bodies, or lesson text); a research task
+  enqueues nothing.
+- **Note (future PM wiring).** The PM's low-confidence branch
+  (`pm.needs_clarification`) *could* enqueue a `research` task to gather
+  best-practice before re-planning — not wired here (the PM is unchanged), noted
+  as the intended hook.
+
 ### Roles & least privilege (policy.example.yaml)
 
 | Role | Granted capabilities | Why |
@@ -207,6 +253,7 @@ work.* finishes (done|failed)
 | `verifier` | `fs.read` | read-only independent check |
 | `reviewer` | `fs.read` | read-only independent risk/disaster guard — inspects the trail + artifact but can never touch the work it judges |
 | `retro` | *(none)* | reads the event trail + calls a model; writes lessons to Knowledge memory (not a host tool). No tool capabilities needed |
+| `researcher` | `fs.read`, `net.fetch` | searches ONLY via the policy-gated gateway (`net.fetch` 🟢); distills into Knowledge lessons (not a host tool). Drafting a candidate skill needs `fs.write` (🟡) — off by default and DENIED under the least-privilege default, so a draft is an explicit, granted opt-in |
 
 A 🔴 tool from a role that lacks the capability → **DENY** (e.g. executor→delete);
 a 🔴 tool from a role that *has* it → **NEEDS_APPROVAL** (never auto-executes).
@@ -218,7 +265,10 @@ Both are asserted in the tests.
 unit:
 
 1. `claim_task` (M1) — highest-priority queued task, or `None` (caller idles).
-2. dispatch by `task.type`: `pm.tick` → PM; `work.*` → Executor then Verifier.
+2. dispatch by `task.type`: `pm.tick` → PM; `work.*` → Executor then Verifier;
+   `retro` → Retro; `review` → Reviewer; `research` → Researcher. The `retro` /
+   `review` / `research` handlers get NO `enqueue` seam, so none can spawn another
+   task (no loop).
 3. `heartbeat` around each work phase (liveness is the **worker's** job, not the
    role's — the supervisor re-kicks a task whose heartbeat goes stale, M3a).
 4. verify pass → `complete_task(done)`; fail → bounded re-enqueue (`work.retry`,

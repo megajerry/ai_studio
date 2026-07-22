@@ -30,6 +30,7 @@ from .migrate import migrate
 from .models import Task, TaskStatus, make_event
 from .policy import load_policy
 from .roles.lessons import inject_lessons
+from .roles.researcher import RESEARCH_TASK_TYPE
 from .roles.reviewer import REVIEW_TASK_TYPE, run_review
 from .roles.verifier import VerifyResult
 from .scheduler import tick_once
@@ -181,6 +182,37 @@ def _demonstrate_review(conn, registry, config, scratch: str) -> bool:
                 and flagged.approval_id)
 
 
+def _demonstrate_research(conn, registry, config, worker_id: str) -> bool:
+    """Show the Researcher end-to-end: a `research` task → the worker dispatches it
+    → search runs through the policy-gated cached gateway (net.fetch, keyless
+    dry-run) → findings are distilled into recallable Knowledge lessons. The
+    research task enqueues NOTHING (no research-loop)."""
+    ws = f"research-{uuid4().hex[:8]}"
+    sink = DbEventSink(conn)
+    print(f"\n=== researcher demo (workstream={ws}) ===")
+
+    before = len(recall_lessons(conn, ws, "best practice", k=5, include_global=False))
+    enqueue_task(conn, workstream=ws, type=RESEARCH_TASK_TYPE,
+                 payload={"topic": f"best practices for LLM agent tool use {ws}"})
+    r = run_once(conn, worker_id, sink, registry=registry, config=config, workstream=ws)
+    print(f"  worker (research): {r.kind} {r.outcome} — {r.detail}" if r else "  worker: nothing claimed")
+
+    after = recall_lessons(conn, ws, "best practices LLM agent tool use", k=5,
+                           include_global=False)
+    print(f"  lessons distilled into Knowledge memory: {len(after)} (was {before})")
+    if after:
+        print(f"    distilled lesson> {after[0].text[:110]}")
+    # No follow-on task was spawned by the research task (no loop).
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM tasks WHERE workstream = %s", (ws,))
+        n_tasks = int(cur.fetchone()["n"])
+    if not conn.autocommit:
+        conn.commit()
+    print(f"  tasks in this workstream: {n_tasks} (the research task spawned none)")
+    return bool(r and r.kind == "research" and r.outcome == "done"
+                and len(after) > before and n_tasks == 1)
+
+
 def main() -> int:
     # Keyless by construction — dry-run every model call.
     os.environ.setdefault("MODELS_DRY_RUN", "1")
@@ -246,7 +278,11 @@ def main() -> int:
         reviewed = _demonstrate_review(conn, registry, config, scratch)
         print(f"runtime.demo: {'OK — reviewer guarded (clean passed, hallucination flagged + escalated)' if reviewed else 'REVIEW INCOMPLETE'}")
 
-        return 0 if (ok and learned and reviewed) else 1
+        # Fourth act: demonstrate the Researcher (search gateway → distilled lessons).
+        researched = _demonstrate_research(conn, registry, config, worker_id)
+        print(f"runtime.demo: {'OK — researcher mined external best-practice into recallable lessons' if researched else 'RESEARCH INCOMPLETE'}")
+
+        return 0 if (ok and learned and reviewed and researched) else 1
     finally:
         conn.close()
 
