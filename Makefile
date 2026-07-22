@@ -1,7 +1,7 @@
 # AI Studio — convenience targets for the M0 infra spine.
 DC := $(shell if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi)
 
-.PHONY: help onboard up down restart ps logs health clean
+.PHONY: help onboard up down restart ps logs health clean migrate
 
 help:
 	@echo "AI Studio — targets:"
@@ -12,6 +12,7 @@ help:
 	@echo "  make ps        Show service status"
 	@echo "  make logs      Tail logs"
 	@echo "  make health    Run the health check"
+	@echo "  make migrate   Apply runtime DB migrations (event log + task queue)"
 	@echo "  make clean     Stop and REMOVE volumes (destroys local data)"
 
 onboard:
@@ -34,6 +35,9 @@ logs:
 
 health:
 	./scripts/healthcheck.sh
+
+migrate:
+	python -m runtime.migrate
 
 clean:
 	$(DC) down -v

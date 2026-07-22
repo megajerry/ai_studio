@@ -1,0 +1,10 @@
+# AI Studio runtime — event log + task queue (M1).
+# Install with: pip install -r runtime/requirements.txt
+#
+# psycopg 3 (sync) with the binary build so no local libpq is required.
+psycopg[binary]>=3.2,<4.0
+pydantic>=2.7,<3.0
+
+# Dev/test:
+#   pip install pytest
+# Integration tests skip cleanly when no DATABASE_URL is reachable.
