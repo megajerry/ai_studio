@@ -29,6 +29,12 @@ from __future__ import annotations
 from .executor import ExecutorResult, run_executor
 from .lessons import compose_lessons, inject_lessons
 from .pm import PlanResult, run_pm_tick
+from .researcher import (
+    RESEARCH_TASK_TYPE,
+    ResearchResult,
+    distill_findings,
+    run_research,
+)
 from .retro import RetroResult, distill_lessons, run_retro
 from .verifier import VerifyResult, verify
 
@@ -42,6 +48,10 @@ __all__ = [
     "RetroResult",
     "run_retro",
     "distill_lessons",
+    "ResearchResult",
+    "run_research",
+    "distill_findings",
+    "RESEARCH_TASK_TYPE",
     "compose_lessons",
     "inject_lessons",
 ]

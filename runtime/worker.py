@@ -55,6 +55,7 @@ from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
 from .roles.executor import run_executor
 from .roles.pm import run_pm_tick
+from .roles.researcher import RESEARCH_TASK_TYPE, run_research as run_research_default
 from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
 from .roles.reviewer import REVIEW_TASK_TYPE, run_review as run_review_default
 from .roles.verifier import verify as run_verify_default
@@ -121,7 +122,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "work" | "retro" | "unknown"
+    #: "pm" | "work" | "retro" | "review" | "research" | "unknown"
     kind: str
     #: "done" | "retry" | "failed" | "blocked"
     outcome: str
@@ -445,6 +446,40 @@ def _handle_retro(
     )
 
 
+def _handle_research(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    registry: ToolRegistry,
+    config: Optional[PolicyConfig],
+    model_registry,
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_research: Callable[..., Any],
+) -> RunResult:
+    """Dispatch a ``research`` task: search → distill into Knowledge lessons, commit.
+
+    The Researcher gathers via the policy-gated cached search gateway and distills
+    the findings into recallable lessons (+ an optional ``reviewed: false``
+    candidate skill, off by default). It NEVER enqueues another task (no
+    ``enqueue`` seam is threaded here), so there is no research-of-a-research loop.
+    """
+    heartbeat(conn, task.id, worker_id)
+    result = run_research(
+        conn, task, sink,
+        model_registry=model_registry, tool_registry=registry, policy=config,
+    )
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.DONE)
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="research",
+        outcome="done",
+        detail=f"gathered {result.results_count} source(s), distilled {result.lessons_count} lesson(s)",
+    )
+
+
 def _handle_review(
     conn: Any,
     task: Task,
@@ -509,6 +544,7 @@ def run_once(
     run_verify: Callable[..., Any] = run_verify_default,
     run_retro: Callable[..., Any] = run_retro_default,
     run_review: Callable[..., Any] = run_review_default,
+    run_research: Callable[..., Any] = run_research_default,
 ) -> Optional[RunResult]:
     """Claim one task and drive it to a terminal state (the single testable unit).
 
@@ -541,6 +577,17 @@ def run_once(
             model_registry=model_registry,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
             run_retro=run_retro,
+        )
+
+    if task.type == RESEARCH_TASK_TYPE:
+        # The Researcher mines external best-practice into Knowledge lessons via the
+        # policy-gated cached search gateway. It enqueues NOTHING (no enqueue seam
+        # threaded), so a research task cannot spawn another — no research-loop.
+        return _handle_research(
+            conn, task, sink,
+            registry=registry, config=config, model_registry=model_registry,
+            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            run_research=run_research,
         )
 
     if task.type == REVIEW_TASK_TYPE:
