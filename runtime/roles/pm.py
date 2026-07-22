@@ -27,6 +27,7 @@ from ..enforce import EventSink, NullEventSink
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
+from ..skills import SkillRegistry, compose_prompt
 from ..tasks import enqueue_task
 
 #: Role event: the PM committed to a goal + success criterion and enqueued work.
@@ -38,11 +39,28 @@ WORK_TASK_TYPE = "work.demo"
 #: Default objective when a pulse carries no explicit goal.
 DEFAULT_OBJECTIVE = "Prove the studio operates end-to-end in dry-run."
 
-# Inline prompt template (a real Agent Skills layer is a later milestone, ADR-0008).
+# Base persona prompt. On-demand skills (ADR-0008) are composed in on top of this
+# when a SkillRegistry is supplied — see `_compose_plan_prompt`.
 _PLAN_PROMPT = (
     "You are the studio PM. Restate the goal in one sentence and define ONE "
     "concrete, independently checkable success criterion for it. Goal: {goal}"
 )
+
+#: Selection query for the PM's planning skills (matches `define-success-criteria`).
+_PM_SKILL_QUERY = "pm plan success criteria confidence gate"
+
+
+def _compose_plan_prompt(goal: str, skills: Optional[SkillRegistry]) -> str:
+    """Base plan prompt + any relevant, REVIEWED skills (on-demand injection).
+
+    With no registry the prompt is the inline base (behavior-preserving). With
+    one, only skills relevant to PM planning are selected and only the reviewed
+    ones are injected (:func:`runtime.skills.compose_prompt`).
+    """
+    base = _PLAN_PROMPT.format(goal=goal)
+    if skills is None:
+        return base
+    return compose_prompt(base, skills.select(_PM_SKILL_QUERY))
 
 
 class PlanResult(BaseModel):
@@ -71,6 +89,7 @@ def run_pm_tick(
     sink: Optional[EventSink] = None,
     *,
     registry: Optional[Registry] = None,
+    skills: Optional[SkillRegistry] = None,
     enqueue: Callable[..., Task] = enqueue_task,
 ) -> PlanResult:
     """Service one ``pm.tick`` task: confidence-gate a goal and enqueue work.
@@ -85,10 +104,12 @@ def run_pm_tick(
     goal = _resolve_goal(task)
 
     # 1. Confidence gate — restate the goal + define a criterion via a model call.
+    #    The prompt is the PM persona + any relevant, reviewed skills (ADR-0008).
+    prompt = _compose_plan_prompt(goal, skills)
     call_model(
         role="pm",
         task_type="plan",
-        messages=[{"role": "user", "content": _PLAN_PROMPT.format(goal=goal)}],
+        messages=[{"role": "user", "content": prompt}],
         quality="high",
         registry=registry,
         conn=conn,

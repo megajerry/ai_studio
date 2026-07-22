@@ -114,10 +114,35 @@ _Last updated: 2026-07-22 (remote session)_
   migration-idempotent search DB tests all ran and passed. Host TODO: none required
   to run keyless; optionally set `TAVILY_API_KEY`/`EXA_API_KEY`/`BRAVE_API_KEY` and
   set `default_provider` to swap off dry-run.
-- Next: a real **skills** layer for roles (Agent Skills standard, ADR-0008 — today
-  each role's prompt is an inline string template), the Docker **sandbox**
-  (`SandboxRunner`) so 🔴 `shell` can actually run, and per-task on-demand worker
-  spawning wired to the scheduler/supervisor.
+- **Skills layer — implemented + VERIFIED on a live Postgres** on `runtime/skills`
+  (see [`runtime/skills.md`](../runtime/skills.md) + [`skills/README.md`](skills/README.md)).
+  The Agent Skills open standard (ADR-0008, architecture §14): a `SKILL.md` =
+  `---`-fenced YAML frontmatter (`name`/`description` required + `triggers`/
+  `when_to_use`/`reviewed`/`source`/`resources`) + a markdown instruction body.
+  `runtime/skills/`: `models.py` (`Skill`/`SkillError` + relevance `matches`),
+  `loader.py` (`parse_skill`/`load_skill` — malformed frontmatter → clear
+  path-qualified `SkillError`, never a crash), `registry.py`
+  (`SkillRegistry.discover(root)` walks `SKILL.md` under the skills root — default
+  repo `skills/`, `$AI_STUDIO_SKILLS_DIR`-overridable — skipping malformed ones;
+  `select(query, limit)` returns ONLY relevant skills, ranked + capped for context
+  discipline, ADR-0013), `inject.py` (`compose_prompt`/`compose` inject ONLY
+  relevant **reviewed** skills into a bounded `### Skills` section — unreviewed
+  ones skipped + logged, `allow_unreviewed=True` to override + warn). **Skills are
+  INSTRUCTIONS only** — loading/injecting never executes a resource/script; any
+  action still goes through the policy-gated `invoke`. Three reviewed in-repo
+  example skills ship: `define-success-criteria` (PM), `retrospective` (Retro),
+  `code-review` (Reviewer). Wired minimal + behavior-preserving: `run_pm_tick`
+  takes an optional `skills=` registry and composes its confidence-gate prompt
+  with the relevant reviewed skill; `worker.run()` + `runtime.demo` discover the
+  registry once and thread it to the PM. **Verified live: `pytest runtime/tests/`
+  = 206 passed, 0 skips with DATABASE_URL set** (21 new skills pure-logic tests:
+  parse valid, malformed→clear-error-no-crash, select only-relevant+limit,
+  inject reviewed+relevant/exclude unreviewed+irrelevant, example skills all
+  load+reviewed, PM prompt composition); **`python -m runtime.demo` still prints
+  "studio operated end-to-end"** (skills=3 discovered + injected).
+- Next: the Docker **sandbox** (`SandboxRunner`) so 🔴 `shell` can actually run,
+  per-task on-demand worker spawning wired to the scheduler/supervisor, and
+  curating external skills (PM/review libraries) through the review gate.
 
 ## Open decisions
 

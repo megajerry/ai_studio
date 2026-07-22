@@ -26,6 +26,7 @@ from .events import read_events
 from .migrate import migrate
 from .policy import load_policy
 from .scheduler import tick_once
+from .skills import SkillRegistry
 from .worker import build_registry, run_once
 
 
@@ -58,21 +59,23 @@ def main() -> int:
     scratch = tempfile.mkdtemp(prefix="ai_studio_demo_")
     registry = build_registry(scratch)
     config = load_policy()
+    skills = SkillRegistry.discover()  # on-demand skills for the PM (ADR-0008)
     worker_id = "demo-worker"
 
     conn = db.connect()
     migrate(conn)
     try:
         sink = DbEventSink(conn)
-        print(f"runtime.demo: workstream={workstream} scratch={scratch}")
+        print(f"runtime.demo: workstream={workstream} scratch={scratch} "
+              f"skills={len(skills)}")
 
         # 1. Scheduler pulse — enqueue a pm.tick (spawning the PM, ADR-0009).
         tick = tick_once(conn, workstream)
         print(f"  scheduler: enqueued {tick.type} {tick.id}" if tick else "  scheduler: (skipped)")
 
-        # 2. Worker pass — PM plans + enqueues the work task.
+        # 2. Worker pass — PM plans + enqueues the work task (skills injected).
         r1 = run_once(conn, worker_id, sink, registry=registry, config=config,
-                      workstream=workstream)
+                      skills=skills, workstream=workstream)
         print(f"  worker#1: {r1.kind} {r1.outcome} — {r1.detail}" if r1 else "  worker#1: nothing claimed")
 
         # 3. Worker pass — Executor does the work, Verifier checks, commit.
