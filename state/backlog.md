@@ -33,9 +33,12 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0014.
    Generic machinery; the *first real* experiment needs a product decision (below).
 3. **Real budget enforcement** — per-workstream $/token caps that actually gate
    (today: router downshift + `OverBudget` on dry-run tokens only).
-4. **opencode / Docker sandbox worker** — implement a `SandboxRunner` behind the
-   `ShellTool` seam and dispatch a "Need Prototype" coding task. (Docker verified
-   on host.)
+4. **opencode / Docker sandbox worker** — **sandbox RUNNER done** (`runtime/sandbox/`
+   `DockerSandboxRunner` behind the `ShellTool` seam: network-off/non-root/read-only/
+   resource+timeout/scoped-mount/no-secret-env, unit-tested with Docker mocked;
+   real container run host-verified via `infra/sandbox/Dockerfile`). **Still
+   pending:** the coding-worker **dispatch** (route a "Need Prototype" coding task
+   through it via `invoke`).
 5. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
 6. **Adaptive orchestration intensity** — generalize scaling of review/retro/

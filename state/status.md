@@ -262,9 +262,23 @@ into recallable Knowledge lessons).
   `test_worker_full_loop_pm_to_done` now asserting N>1 work items drained to done);
   **`python -m runtime.demo` prints "PM decomposed into 2 work items"** and stays
   green (operate + learn).
-- Next: the Docker **sandbox** (`SandboxRunner`) so 🔴 `shell` can actually run,
-  per-task on-demand worker spawning wired to the scheduler/supervisor, and
-  curating external skills (PM/review libraries) through the review gate.
+- **Docker sandbox RUNNER — implemented** on `runtime/sandbox` (see
+  [`runtime/sandbox.md`](../runtime/sandbox.md)). `runtime/sandbox/DockerSandboxRunner`
+  implements the `SandboxRunner` protocol behind the `ShellTool` seam: runs a
+  command in a throwaway container with `--network none`, non-root user,
+  `--read-only` rootfs, `--cap-drop ALL` + `no-new-privileges`, hard
+  memory/cpu/pids limits, a kill-on-exceed timeout (exit 124), a scoped single
+  bind mount (host root `/` refused), and **only** an explicit env allowlist
+  forwarded (no host secrets; ADR-0011). `ShellTool.with_docker_sandbox(...)` wires
+  it lazily; the 🔴 tier gate + refuse-without-sandbox guard are unchanged. Config
+  via `SANDBOX_*`. Docker imported lazily (not required at import). Unit-tested with
+  the docker CLI **mocked** (no real container in tests); real run host-verified via
+  `infra/sandbox/Dockerfile` (`docker build -t ai-studio-sandbox:latest infra/sandbox`).
+  Host TODO: build the image + smoke-test a real `docker run`. **Still pending:** the
+  coding-worker **dispatch** that routes work through this runner.
+- Next: the coding-worker dispatch wired to the sandbox runner, per-task on-demand
+  worker spawning wired to the scheduler/supervisor, and curating external skills
+  (PM/review libraries) through the review gate.
 
 ## Open decisions
 
