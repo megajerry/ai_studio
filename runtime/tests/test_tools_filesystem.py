@@ -76,6 +76,18 @@ def test_rejects_symlink_escape(tool, tmp_path):
     assert r.ok is False and "confinement" in r.error
 
 
+def test_rejects_null_byte_path(tool):
+    # An embedded null byte makes Path.resolve() raise; execute() must return a
+    # clean ok=False, not crash — and must not create/read/delete anything.
+    before = sorted(p.name for p in tool.root.iterdir())
+    r = tool.execute(op="read", path="a\x00b")
+    assert r.ok is False and "invalid path" in r.error
+    w = tool.execute(op="write", path="a\x00b", content="x")
+    assert w.ok is False and "invalid path" in w.error
+    # Nothing was written.
+    assert sorted(p.name for p in tool.root.iterdir()) == before
+
+
 def test_delete_refuses_directory(tool):
     (tool.root / "d").mkdir()
     r = tool.execute(op="delete", path="d")

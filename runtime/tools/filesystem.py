@@ -82,6 +82,10 @@ class FilesystemTool(Tool):
         except PathEscapeError as exc:
             # Confinement violation is a hard failure, not a handled result.
             return ToolResult(ok=False, error=f"path confinement: {exc}")
+        except (ValueError, OSError) as exc:
+            # An invalid path (e.g. an embedded null byte) makes resolve() raise;
+            # treat it as a rejected path and touch nothing.
+            return ToolResult(ok=False, error=f"invalid path: {exc}")
 
         if op == "read":
             if not target.is_file():
