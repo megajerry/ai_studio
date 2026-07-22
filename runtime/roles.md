@@ -18,6 +18,7 @@ to the dry-run provider when no key is present.
 | `roles/pm.py` | `run_pm_tick` — understand → confidence-gate → **decompose**: parse a structured `Plan` from `call_model(task_type=plan)`, then enqueue ONE `work.*` task **per work item** (emits `pm.planned` w/ count+ids); or push back (`pm.pushback` + 🛑 approval) / clarify (`pm.needs_clarification`) |
 | `roles/executor.py` | `run_executor` — DO the work: a policy-gated `filesystem` write + a `call_model` dry-run call |
 | `roles/verifier.py` | `verify` — INDEPENDENT verify→commit gate (read-only); returns pass/fail |
+| `roles/reviewer.py` | `run_review` — INDEPENDENT risk/disaster guard (read-only): reads a finished episode's trail + artifact, computes fact-based risk signals; emits `review.passed`/`review.flagged` (+ 🚨 `review.alarm` / 🛑 approval on HIGH) |
 | `roles/retro.py` | `run_retro` — distill 1-3 durable **lessons** from an episode's trail into Knowledge memory; emits `retro.completed` (count only) |
 | `roles/lessons.py` | `inject_lessons`/`compose_lessons` — auto-inject the recalled lessons into a role's prompt (`### Lessons`), the deterministic apply-the-lesson step |
 | `worker.py` | `run_once` (claim → dispatch → heartbeat → verify→commit; triggers Retro on terminal work), `run()`/`main()` |
@@ -25,6 +26,7 @@ to the dry-run provider when no key is present.
 | `tests/test_roles.py` | role units + policy-gate refusals (🔴 delete/shell) — keyless, no DB |
 | `tests/test_worker.py` | full loop via an in-memory fake queue; verify-fail re-enqueue |
 | `tests/test_retro.py` | lesson distillation + retro trigger policy + NO retro-loop; live-DB run_retro |
+| `tests/test_reviewer.py` | pure `assess_risks` signals + `WORKER_REVIEW` trigger policy + NO review-loop; live-DB `run_review` (evidence beats a lying model, HIGH → 🚨/🛑, events leak no secrets) |
 | `tests/test_lessons.py` | lesson injection: bounded/scoped, behavior-preserving with no lessons |
 
 > A role is `prompt + skills + tools` (architecture §3). Today the prompt is an
@@ -107,8 +109,56 @@ claims as true; for a validator that is a defect.
   the ACTUAL artifact against the success criterion (`_check`), NOT the Executor's
   `result.ok`. A false "done" claim over an artifact that fails the criterion
   still FAILS (`runtime/tests/test_roles.py::test_verify_evidence_beats_false_done_claim`).
-- The future Reviewer/Whistle-blower role (not built here) is expected to select
-  the same skill and follow the same per-claim protocol before approving a change.
+- The **Reviewer / Whistle-blower** (`roles/reviewer.py`) lives it too: every risk
+  signal is computed from FACTS it observes itself (the real trail + a re-read of
+  the actual artifact), never from a model's "looks fine". A monkeypatched lying
+  model does not change its verdict (`test_reviewer.py::test_review_evidence_beats_lying_model_flags_hallucination`).
+
+## Reviewer / Whistle-blower — the independent risk & disaster guard (ADR-0003)
+
+ADR-0003 calls for a **Reviewer / Whistle-blower**: an independent guard that
+"spot[s] anything that will lead to failure/disaster" — a *general* reviewer, run
+at **adaptive intensity** (more review when the recent error rate is high). This
+is that role, and it is deliberately **distinct from the Verifier**:
+
+| | **Verifier** (`verifier.py`) | **Reviewer / Whistle-blower** (`reviewer.py`) |
+| --- | --- | --- |
+| Question | Does the artifact meet *this task's* success criterion? | Does anything about this episode look like failure/disaster? |
+| Scope | One narrow criterion | The whole episode (trail + artifact + counters) |
+| Timing | **Gate** — its pass is what makes a work task `done` | **After-the-fact** — runs on the *finished* episode; does NOT block/gate |
+| Effect | pass → commit; fail → re-enqueue/fail | raises **signals** (`review.flagged`) + escalates (🚨/🛑); never blocks the queue |
+| Privilege | `fs.read` (read-only) | `fs.read` (read-only) |
+
+The Verifier can PASS a task the Reviewer still FLAGS — e.g. the criterion was met
+but the episode blew its token budget, was re-kicked repeatedly, or a 🔴 delete kept
+getting gated.
+
+**Risk / disaster signals** (all fact-derived by the pure `assess_risks`, so reasons
+carry counts/numbers only — never a secret, arg value, artifact body, or marker):
+
+- **hallucinated success** — the trail claims done/verified but the *real* artifact
+  does not back it (missing / unreadable / success marker absent) → HIGH. This is
+  evidence-over-claim: it only fires when the claim can be **refuted** from facts
+  (an unreadable-because-no-registry artifact stays UNVERIFIED, never a false flag).
+- **budget blowout** — `spent_tokens` over `budget_tokens` → HIGH (≥90% → MEDIUM).
+- **repeated failures / re-kicks** — `verify.failed` + `work.retry` + `task.rekicked`
+  in the trail plus `retries`; ≥4 → HIGH, ≥2 → MEDIUM.
+- **recurring policy denials** — `policy.decision` DENYs in the episode.
+- **irreversible / costly actions gated** — `approval.requested` (🔴) events.
+
+Verdict = `ReviewResult(ok | flagged, severity, reasons[])`. It emits
+`review.passed` / `review.flagged`; a **HIGH** finding escalates — emits
+`review.alarm` (🚨) and raises a 🛑 human approval via `approvals.request_approval`
+(ADR-0006). The (traceability-only) model call has the `rigorous-review` skill
+injected but does NOT decide anything.
+
+**Adaptive trigger (`WORKER_REVIEW`, adaptive-lite).** The worker enqueues a
+`review` task after a terminal `work.*` task per policy: `on_risk` (default) runs
+the guard only when the episode looks risky (failed / re-kicked / over budget) —
+"more review when the error rate is high", at minimal cost on the happy path;
+`always` reviews every episode; `off` disables it. A `review` task dispatches to
+`run_review` and **never enqueues another task**, so it can trigger neither another
+review nor a retro — there is no review-loop (nor a review↔retro loop).
 
 ## The learning loop (ADR-0003)
 
@@ -155,6 +205,7 @@ work.* finishes (done|failed)
 | `pm` | `fs.read` | plans + calls a model; never does the work |
 | `executor` | `fs.read`, `fs.write` | writes the scratch artifact (🟡). **No `fs.delete`/`shell.exec`** → those DENY |
 | `verifier` | `fs.read` | read-only independent check |
+| `reviewer` | `fs.read` | read-only independent risk/disaster guard — inspects the trail + artifact but can never touch the work it judges |
 | `retro` | *(none)* | reads the event trail + calls a model; writes lessons to Knowledge memory (not a host tool). No tool capabilities needed |
 
 A 🔴 tool from a role that lacks the capability → **DENY** (e.g. executor→delete);
@@ -215,6 +266,9 @@ verification) — it never hangs.
 - `WORKER_MAX_WORK_ATTEMPTS` — verify-fail re-enqueues before failing (default 2).
 - `WORKER_RETRO` — when a terminal work task triggers a Retro: `on_fail`
   (default) | `always` | `off` (the learning-loop trigger; adaptive-lite).
+- `WORKER_REVIEW` — when a terminal work task triggers the Reviewer/Whistle-blower:
+  `on_risk` (default) | `always` | `off` (the risk-guard trigger; adaptive-lite —
+  `on_risk` fires only on a failed / re-kicked / over-budget episode).
 - `PM_CONFIDENCE_THRESHOLD` — the PM confidence gate threshold (default `0.6`);
   a plan scoring below it yields `pm.needs_clarification` instead of executing.
 - `MODELS_DRY_RUN=1` — force keyless dry-run (the demo sets this).

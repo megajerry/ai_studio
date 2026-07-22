@@ -18,15 +18,19 @@ from __future__ import annotations
 
 import os
 import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from . import db
 from .enforce import DbEventSink
-from .events import read_events
+from .events import append_event, read_events
 from .memory import recall_lessons
 from .migrate import migrate
+from .models import Task, TaskStatus, make_event
 from .policy import load_policy
 from .roles.lessons import inject_lessons
+from .roles.reviewer import REVIEW_TASK_TYPE, run_review
 from .roles.verifier import VerifyResult
 from .scheduler import tick_once
 from .skills import SkillRegistry
@@ -120,6 +124,63 @@ def _demonstrate_learning(conn, registry, config, worker_id: str) -> bool:
     return retro_ok and len(own_after) > len(own_before) and has_section and learned_present
 
 
+def _review_task(ws: str, target_id, *, artifact_path, marker, scratch) -> Task:
+    now = datetime.now(timezone.utc)
+    return Task(
+        id=uuid4(), workstream=ws, type=REVIEW_TASK_TYPE, status=TaskStatus.IN_PROGRESS,
+        priority=0, created_at=now, updated_at=now,
+        payload={"target_task_id": str(target_id), "target_task_type": "work.demo",
+                 "outcome": "done", "artifact_path": artifact_path, "marker": marker,
+                 "spent_tokens": 0, "budget_tokens": None, "retries": 0},
+    )
+
+
+def _demonstrate_review(conn, registry, config, scratch: str) -> bool:
+    """Show the independent Reviewer/Whistle-blower guard end-to-end: it PASSES a
+    clean episode and FLAGS a hallucinated-success one (a done/verified CLAIM whose
+    real artifact lacks the marker) — escalating with 🚨 review.alarm + a 🛑 approval.
+    The verdict rests on the ACTUAL artifact evidence, never a claim (ADR-0014)."""
+    ws = f"review-{uuid4().hex[:8]}"
+    sink = DbEventSink(conn)
+    print(f"\n=== reviewer / whistle-blower demo (workstream={ws}) ===")
+
+    def _claim_trail(target_id):
+        for typ in ("executor.acted", "verify.passed", "task.finished"):
+            append_event(conn, make_event(workstream=ws, type=typ, task_id=target_id,
+                                          payload={"status": "done"}))
+
+    # 1. Clean episode — the trail claims done AND the real artifact backs it.
+    good_id = uuid4()
+    good_marker = f"studio-ok:{uuid4().hex[:6]}"
+    good_path = f"review-good-{good_id}.txt"
+    _claim_trail(good_id)
+    (Path(scratch) / good_path).write_text(f"{good_marker}\nall done\n")
+    clean = run_review(conn, _review_task(ws, good_id, artifact_path=good_path,
+                                          marker=good_marker, scratch=scratch),
+                       sink, registry=registry, config=config)
+    print(f"  clean episode:  review {'PASSED' if clean.ok else 'FLAGGED'} "
+          f"(severity={clean.severity})")
+
+    # 2. Hallucinated success — the trail CLAIMS done+verified, but the real
+    #    artifact does NOT contain the success marker. Evidence beats the claim.
+    bad_id = uuid4()
+    bad_marker = f"studio-ok:{uuid4().hex[:6]}"
+    bad_path = f"review-bad-{bad_id}.txt"
+    _claim_trail(bad_id)
+    (Path(scratch) / bad_path).write_text("looks fine, trust me — done!\n")  # no marker
+    flagged = run_review(conn, _review_task(ws, bad_id, artifact_path=bad_path,
+                                            marker=bad_marker, scratch=scratch),
+                         sink, registry=registry, config=config)
+    esc = " 🚨 alarm + 🛑 approval raised" if flagged.severity == "high" else ""
+    print(f"  hallucinated:   review {'FLAGGED' if not flagged.ok else 'PASSED'} "
+          f"(severity={flagged.severity}, {len(flagged.reasons)} signal(s)){esc}")
+    if flagged.reasons:
+        print(f"    reason> {flagged.reasons[0]}")
+
+    return bool(clean.ok and (not flagged.ok) and flagged.severity == "high"
+                and flagged.approval_id)
+
+
 def main() -> int:
     # Keyless by construction — dry-run every model call.
     os.environ.setdefault("MODELS_DRY_RUN", "1")
@@ -181,7 +242,11 @@ def main() -> int:
         learned = _demonstrate_learning(conn, registry, config, worker_id)
         print(f"runtime.demo: {'OK — studio learned (lesson distilled + injected)' if learned else 'LEARNING INCOMPLETE'}")
 
-        return 0 if (ok and learned) else 1
+        # Third act: demonstrate the independent Reviewer/Whistle-blower risk guard.
+        reviewed = _demonstrate_review(conn, registry, config, scratch)
+        print(f"runtime.demo: {'OK — reviewer guarded (clean passed, hallucination flagged + escalated)' if reviewed else 'REVIEW INCOMPLETE'}")
+
+        return 0 if (ok and learned and reviewed) else 1
     finally:
         conn.close()
 

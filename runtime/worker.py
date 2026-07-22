@@ -27,7 +27,9 @@ Config (env): ``WORKER_ID``, ``WORKER_SCRATCH_DIR`` (tool root),
 ``WORKER_IDLE_SLEEP_S`` (poll gap when the queue is empty),
 ``WORKER_MAX_WORK_ATTEMPTS`` (verify-fail re-enqueues before failing),
 ``WORKER_RETRO`` (``on_fail`` (default) | ``always`` | ``off`` — when a terminal
-work task triggers a learning Retro).
+work task triggers a learning Retro), ``WORKER_REVIEW`` (``on_risk`` (default) |
+``always`` | ``off`` — when a terminal work task triggers the independent
+Reviewer/Whistle-blower risk guard).
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ from .policy import PolicyConfig, load_policy
 from .roles.executor import run_executor
 from .roles.pm import run_pm_tick
 from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
+from .roles.reviewer import REVIEW_TASK_TYPE, run_review as run_review_default
 from .roles.verifier import verify as run_verify_default
 from .scheduler import PM_TICK_TYPE
 from .skills import SkillRegistry
@@ -76,6 +79,9 @@ EVENT_WORK_RETRY = "work.retry"
 #: Event emitted when the worker enqueues a retro after a terminal work task.
 EVENT_RETRO_TRIGGERED = "retro.triggered"
 
+#: Event emitted when the worker enqueues a review after a terminal work task.
+EVENT_REVIEW_TRIGGERED = "review.triggered"
+
 #: Event emitted when a task blocked on a 🔴 approval is re-queued after a grant.
 EVENT_APPROVAL_RESUMED = "approval.resumed"
 
@@ -90,6 +96,16 @@ RETRO_ALWAYS = "always"
 RETRO_OFF = "off"
 DEFAULT_RETRO_MODE = RETRO_ON_FAIL
 _RETRO_MODES = {RETRO_ON_FAIL, RETRO_ALWAYS, RETRO_OFF}
+
+#: When the worker fires a Reviewer/Whistle-blower after a terminal work task.
+#: ``on_risk`` (default) runs the guard adaptively — only when the episode looks
+#: risky (failed / re-kicked / over budget), matching ADR-0003 "more review when
+#: the error rate is high"; ``always`` reviews every episode; ``off`` disables it.
+REVIEW_ON_RISK = "on_risk"
+REVIEW_ALWAYS = "always"
+REVIEW_OFF = "off"
+DEFAULT_REVIEW_MODE = REVIEW_ON_RISK
+_REVIEW_MODES = {REVIEW_ON_RISK, REVIEW_ALWAYS, REVIEW_OFF}
 
 # Injectable seams — defaults are the real M1/M3b/role functions; tests pass fakes
 # so `run_once` drives the full loop with no database (same idiom as supervisor).
@@ -163,6 +179,85 @@ def _resolve_retro_mode(retro_mode: Optional[str]) -> str:
     return DEFAULT_RETRO_MODE
 
 
+def _resolve_review_mode(review_mode: Optional[str]) -> str:
+    """Resolve the review trigger policy (arg > ``WORKER_REVIEW`` env > default)."""
+    mode = (review_mode if review_mode is not None else os.environ.get("WORKER_REVIEW", "")).strip().lower()
+    if mode in _REVIEW_MODES:
+        return mode
+    if mode:
+        log.warning("invalid WORKER_REVIEW=%r; using default %s", mode, DEFAULT_REVIEW_MODE)
+    return DEFAULT_REVIEW_MODE
+
+
+def _episode_is_risky(task: Task, outcome: str) -> bool:
+    """Adaptive trigger for ``on_risk``: did the episode look risky (ADR-0003)?
+
+    Risky == the work failed, was re-kicked by the supervisor (``retries`` > 0), or
+    blew its token budget. A clean, first-try ``done`` is NOT risky, so the guard
+    stays quiet + cheap on the happy path and intensifies exactly when the error
+    rate rises.
+    """
+    if outcome == "failed":
+        return True
+    if (getattr(task, "retries", 0) or 0) > 0:
+        return True
+    budget = getattr(task, "budget_tokens", None)
+    spent = getattr(task, "spent_tokens", 0) or 0
+    if budget and spent > budget:
+        return True
+    return False
+
+
+def _maybe_enqueue_review(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    enqueue: Enqueuer,
+    outcome: str,
+    exec_result: Any,
+    review_mode: str,
+) -> None:
+    """Enqueue ONE ``review`` task for a terminal work task, per the review policy.
+
+    Bounded by construction: only ``work.*`` terminal states reach here, the review
+    task is a distinct type (never ``work.*``/``pm.tick``/``retro``), and a review
+    NEVER enqueues another task — so there is no review-of-a-review (or review↔retro)
+    loop. ``on_risk`` fires only on a risky episode; ``always`` on every terminal one;
+    ``off`` never. The review carries the target's facts (artifact path/marker +
+    spend/budget/retries) so the Reviewer can gather evidence; the trigger event
+    carries ids/outcome only (no marker/path/secret).
+    """
+    if review_mode == REVIEW_OFF:
+        return
+    if review_mode == REVIEW_ON_RISK and not _episode_is_risky(task, outcome):
+        return
+    review = enqueue(
+        conn,
+        workstream=task.workstream,
+        type=REVIEW_TASK_TYPE,
+        payload={
+            "target_task_id": str(task.id),
+            "target_task_type": task.type,
+            "outcome": outcome,
+            "artifact_path": getattr(exec_result, "artifact_path", None),
+            "marker": getattr(exec_result, "marker", None),
+            "spent_tokens": getattr(task, "spent_tokens", 0) or 0,
+            "budget_tokens": getattr(task, "budget_tokens", None),
+            "retries": getattr(task, "retries", 0) or 0,
+        },
+        priority=task.priority,
+    )
+    sink.emit(
+        make_event(
+            workstream=task.workstream,
+            type=EVENT_REVIEW_TRIGGERED,
+            task_id=task.id,
+            payload={"review_task_id": str(review.id), "outcome": outcome, "mode": review_mode},
+        )
+    )
+
+
 def _maybe_enqueue_retro(
     conn: Any,
     task: Task,
@@ -224,6 +319,7 @@ def _handle_work(
     run_verify: Callable[..., Any],
     skills: Optional[SkillRegistry] = None,
     retro_mode: str = DEFAULT_RETRO_MODE,
+    review_mode: str = DEFAULT_REVIEW_MODE,
 ) -> RunResult:
     # Heartbeat around each phase — liveness while the role does the work.
     heartbeat(conn, task.id, worker_id)
@@ -254,17 +350,24 @@ def _handle_work(
     heartbeat(conn, task.id, worker_id)
 
     if verdict.passed:
-        # verify → commit: only now is the task done.
-        complete(
+        # verify → commit: only now is the task done. Capture the finished row so
+        # the Reviewer sees fresh facts (accumulated spent_tokens / retries).
+        finished = complete(
             conn, task.id,
             result={"verified": True, "reason": verdict.reason,
                     "artifact_path": exec_result.artifact_path},
             status=TaskStatus.DONE,
-        )
-        # Terminal (done): fire a retro per policy (default on_fail → skip on done).
+        ) or task
+        # Terminal (done): fire a retro per policy (default on_fail → skip on done),
+        # then the independent Reviewer/Whistle-blower per its policy (on_risk → a
+        # clean done is skipped). Retro is enqueued first so it is claimed first.
         _maybe_enqueue_retro(
             conn, task, sink, enqueue=enqueue,
             outcome="done", detail=verdict.reason, retro_mode=retro_mode,
+        )
+        _maybe_enqueue_review(
+            conn, finished, sink, enqueue=enqueue,
+            outcome="done", exec_result=exec_result, review_mode=review_mode,
         )
         return RunResult(
             task_id=str(task.id), task_type=task.type, kind="work",
@@ -273,11 +376,11 @@ def _handle_work(
 
     # Verify failed — bounded re-enqueue (nudge) or fail.
     attempt = int((task.payload or {}).get("attempt", 1))
-    complete(
+    finished = complete(
         conn, task.id,
         result={"verified": False, "reason": verdict.reason, "attempt": attempt},
         status=TaskStatus.FAILED,
-    )
+    ) or task
     if attempt < max_attempts:
         retry = enqueue(
             conn,
@@ -305,6 +408,10 @@ def _handle_work(
     _maybe_enqueue_retro(
         conn, task, sink, enqueue=enqueue,
         outcome="failed", detail=detail, retro_mode=retro_mode,
+    )
+    _maybe_enqueue_review(
+        conn, finished, sink, enqueue=enqueue,
+        outcome="failed", exec_result=exec_result, review_mode=review_mode,
     )
     return RunResult(
         task_id=str(task.id), task_type=task.type, kind="work",
@@ -338,6 +445,46 @@ def _handle_retro(
     )
 
 
+def _handle_review(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    registry: ToolRegistry,
+    config: Optional[PolicyConfig],
+    model_registry,
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_review: Callable[..., Any],
+    skills: Optional[SkillRegistry] = None,
+) -> RunResult:
+    """Dispatch a ``review`` task: the independent Reviewer/Whistle-blower guard.
+
+    Reads the target episode's trail + artifact (evidence), assesses risk from
+    facts, emits ``review.passed`` / ``review.flagged`` (+ 🚨/🛑 on HIGH), then
+    commits the review task. A review NEVER enqueues another task (no ``enqueue``
+    seam is threaded here), so it cannot recurse into a review-of-a-review or
+    trigger a retro — there is no loop.
+    """
+    heartbeat(conn, task.id, worker_id)
+    result = run_review(
+        conn, task, sink,
+        registry=registry, config=config, model_registry=model_registry, skills=skills,
+    )
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.DONE)
+    detail = (
+        f"clean (severity=none)" if result.ok
+        else f"flagged severity={result.severity}, {len(result.reasons)} signal(s)"
+        + (" 🚨🛑 escalated" if result.severity == "high" else "")
+    )
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="review",
+        outcome="done", detail=detail,
+    )
+
+
 def run_once(
     conn: Any,
     worker_id: str,
@@ -351,6 +498,7 @@ def run_once(
     workstream: Optional[str] = None,
     max_attempts: int = DEFAULT_MAX_WORK_ATTEMPTS,
     retro_mode: Optional[str] = None,
+    review_mode: Optional[str] = None,
     claim: Claimer = claim_task,
     heartbeat: Heartbeater = heartbeat,
     complete: Completer = complete_task,
@@ -360,6 +508,7 @@ def run_once(
     run_exec: Callable[..., Any] = run_executor,
     run_verify: Callable[..., Any] = run_verify_default,
     run_retro: Callable[..., Any] = run_retro_default,
+    run_review: Callable[..., Any] = run_review_default,
 ) -> Optional[RunResult]:
     """Claim one task and drive it to a terminal state (the single testable unit).
 
@@ -371,6 +520,7 @@ def run_once(
     """
     sink = sink or NullEventSink()
     resolved_retro_mode = _resolve_retro_mode(retro_mode)
+    resolved_review_mode = _resolve_review_mode(review_mode)
     task = claim(conn, worker_id=worker_id, assignee=assignee, workstream=workstream)
     if task is None:
         return None
@@ -393,6 +543,17 @@ def run_once(
             run_retro=run_retro,
         )
 
+    if task.type == REVIEW_TASK_TYPE:
+        # The independent Reviewer/Whistle-blower guard over a finished episode. It
+        # never enqueues another task (no enqueue seam threaded), so a review can
+        # trigger neither another review nor a retro (no loop).
+        return _handle_review(
+            conn, task, sink,
+            registry=registry, config=config, model_registry=model_registry,
+            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            run_review=run_review, skills=skills,
+        )
+
     if task.type.startswith("work."):
         return _handle_work(
             conn, task, sink,
@@ -400,7 +561,7 @@ def run_once(
             heartbeat=heartbeat, complete=complete, enqueue=enqueue, block=block,
             worker_id=worker_id, max_attempts=max_attempts,
             run_exec=run_exec, run_verify=run_verify, skills=skills,
-            retro_mode=resolved_retro_mode,
+            retro_mode=resolved_retro_mode, review_mode=resolved_review_mode,
         )
 
     # Unknown task type — fail it explicitly rather than silently dropping it.
