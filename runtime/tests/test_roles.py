@@ -23,6 +23,7 @@ from runtime.roles.pm import DEFAULT_WORK_TASK_TYPE, WORK_TASK_TYPE, run_pm_tick
 from runtime.roles import verifier as verifier_mod
 from runtime.roles.verifier import verify
 from runtime.skills import SkillRegistry, default_root
+from runtime.task_state import DependencyCycle
 from runtime.tools import FilesystemTool, ShellTool, ToolRegistry
 
 
@@ -158,6 +159,67 @@ def test_pm_decomposes_injected_multiitem_plan_with_per_item_criteria():
     assert [t.payload["marker"] for t in enqueued] == ["A", "B", "C"]
     # A named work.* type is honored; a missing type defaults to work.task.
     assert [t.type for t in enqueued] == ["work.task", "work.build", DEFAULT_WORK_TASK_TYPE]
+
+
+def test_pm_sets_dependency_edges_among_work_items():
+    """The PM maps 1-based work-item ``depends_on`` indices onto the created task
+    ids and enqueues prerequisites first (topological order) — ADR-0015."""
+    sink = MemoryEventSink()
+    created: list = []  # (task, depends_on) in enqueue order
+
+    def fake_enqueue(conn, *, workstream, type, payload=None, priority=0,
+                     depends_on=None, **kw) -> Task:
+        t = _task(type, payload, workstream).model_copy(update={"status": TaskStatus.UP_FOR_GRABS})
+        created.append((t, list(depends_on or [])))
+        return t
+
+    # Diamond: item4 depends on 2 and 3, which each depend on 1.
+    plan_dict = {
+        "restated_goal": "Build X", "confidence": 0.9, "feasible": True,
+        "work_items": [
+            {"title": "root", "success_criterion": "c1", "marker": "A", "depends_on": []},
+            {"title": "left", "success_criterion": "c2", "marker": "B", "depends_on": [1]},
+            {"title": "right", "success_criterion": "c3", "marker": "C", "depends_on": [1]},
+            {"title": "join", "success_criterion": "c4", "marker": "D", "depends_on": [2, 3]},
+        ],
+    }
+    plan = run_pm_tick(
+        None, _task("pm.tick", {"goal": "Build X"}), sink,
+        enqueue=fake_enqueue, call_model=lambda **kw: _plan_completion(plan_dict),
+    )
+    assert plan.decision == "planned" and plan.work_item_count == 4
+
+    by_marker = {t.payload["marker"]: (t, deps) for t, deps in created}
+    root_id = by_marker["A"][0].id
+    left_id = by_marker["B"][0].id
+    right_id = by_marker["C"][0].id
+    # root has no prereqs; left/right depend on root; join depends on left+right.
+    assert by_marker["A"][1] == []
+    assert by_marker["B"][1] == [root_id]
+    assert by_marker["C"][1] == [root_id]
+    assert set(by_marker["D"][1]) == {left_id, right_id}
+    # Prerequisites are enqueued before their dependents (topological order).
+    order = [t.payload["marker"] for t, _ in created]
+    assert order.index("A") < order.index("B") < order.index("D")
+    assert order.index("A") < order.index("C") < order.index("D")
+
+
+def test_pm_rejects_cyclic_decomposition():
+    """A plan whose work items form a dependency cycle is rejected up front."""
+    sink = MemoryEventSink()
+    plan_dict = {
+        "restated_goal": "g", "confidence": 0.9, "feasible": True,
+        "work_items": [
+            {"title": "a", "success_criterion": "c", "marker": "A", "depends_on": [2]},
+            {"title": "b", "success_criterion": "c", "marker": "B", "depends_on": [1]},
+        ],
+    }
+    with pytest.raises(DependencyCycle):
+        run_pm_tick(
+            None, _task("pm.tick", {"goal": "g"}), sink,
+            enqueue=_collecting_enqueue([]),
+            call_model=lambda **kw: _plan_completion(plan_dict),
+        )
 
 
 def test_pm_low_confidence_needs_clarification_and_enqueues_no_work():
