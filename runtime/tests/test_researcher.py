@@ -122,14 +122,14 @@ class FakeQueue:
     def enqueue(self, conn, *, workstream, type, payload=None, priority=0,
                 assignee=None, budget_tokens=None) -> Task:
         now = datetime.now(timezone.utc)
-        t = Task(id=uuid4(), workstream=workstream, type=type, status=TaskStatus.QUEUED,
+        t = Task(id=uuid4(), workstream=workstream, type=type, status=TaskStatus.UP_FOR_GRABS,
                  priority=priority, payload=payload or {}, created_at=now, updated_at=now)
         self.tasks[t.id] = t
         self.order.append(t.id)
         return t
 
     def claim(self, conn, *, worker_id, assignee=None, workstream=None):
-        ids = [i for i in self.order if self.tasks[i].status is TaskStatus.QUEUED
+        ids = [i for i in self.order if self.tasks[i].status is TaskStatus.UP_FOR_GRABS
                and (workstream is None or self.tasks[i].workstream == workstream)]
         if not ids:
             return None
@@ -142,7 +142,7 @@ class FakeQueue:
     def heartbeat(self, conn, task_id, worker_id):
         return self.tasks.get(task_id)
 
-    def complete(self, conn, task_id, *, result=None, status=TaskStatus.DONE,
+    def complete(self, conn, task_id, *, result=None, status=TaskStatus.MERGED,
                  spent_tokens=None, force=False):
         t = self.tasks.get(task_id)
         if t is None:

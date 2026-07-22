@@ -150,7 +150,7 @@ def test_supervisor_rekicks_real_stall_then_force_fails(conn, ws):
             cur.execute("SELECT status, retries FROM tasks WHERE id = %s", (t.id,))
             row = cur.fetchone()
         _fresh(conn)
-        assert row["status"] == "queued" and row["retries"] == 1
+        assert row["status"] == "up_for_grabs" and row["retries"] == 1
 
         claimed_b = claim_task(conn_b, worker_id="B", workstream=ws)
         assert claimed_b is not None and claimed_b.id == t.id
@@ -171,7 +171,7 @@ def test_supervisor_rekicks_real_stall_then_force_fails(conn, ws):
         _fresh(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT status FROM tasks WHERE id = %s", (t.id,))
-            assert cur.fetchone()["status"] == "failed"
+            assert cur.fetchone()["status"] == "abandoned"
         _fresh(conn)
         types = [e.type for e in read_events(conn, task_id=t.id)]
         assert types.count("task.rekicked") == 2
@@ -191,7 +191,7 @@ def test_supervisor_does_not_clobber_task_completed_before_sweep(conn, ws):
     # Supervisor's scan snapshot: in_progress at max retries (would force-fail).
     snapshot = claimed.model_copy(update={"retries": 2})
     # ...but the worker finishes first.
-    assert complete_task(conn, t.id, status=TaskStatus.DONE, result={"ok": 1}) is not None
+    assert complete_task(conn, t.id, status=TaskStatus.MERGED, result={"ok": 1}) is not None
 
     res = sweep(conn, threshold_s=60, max_retries=2, find_stale=lambda c, s: [snapshot])
     assert t.id not in res.failed
@@ -201,7 +201,7 @@ def test_supervisor_does_not_clobber_task_completed_before_sweep(conn, ws):
         cur.execute("SELECT status, result FROM tasks WHERE id = %s", (t.id,))
         row = cur.fetchone()
     _fresh(conn)
-    assert row["status"] == "done" and row["result"] == {"ok": 1}
+    assert row["status"] == "merged" and row["result"] == {"ok": 1}
     assert "task.failed_exhausted" not in [e.type for e in read_events(conn, task_id=t.id)]
 
 
@@ -236,10 +236,10 @@ def test_two_workers_each_task_terminal_exactly_once(conn, ws):
                     continue
                 misses = 0
                 done = complete_task(
-                    wconn, task.id, status=TaskStatus.DONE, result={"by": worker_id}
+                    wconn, task.id, status=TaskStatus.MERGED, result={"by": worker_id}
                 )
                 # The claimer always owns the finalize (guarded to in_progress).
-                assert done is not None and done.status is TaskStatus.DONE
+                assert done is not None and done.status is TaskStatus.MERGED
                 with completed_lock:
                     completed.append(task.id)
         finally:
@@ -260,7 +260,7 @@ def test_two_workers_each_task_terminal_exactly_once(conn, ws):
         )
         statuses = [r["status"] for r in cur.fetchall()]
     _fresh(conn)
-    assert statuses == ["done"] * N
+    assert statuses == ["merged"] * N
 
     # Exactly one task.finished event per task (no double-finalize).
     for tid in enqueued:

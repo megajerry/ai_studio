@@ -47,14 +47,32 @@ from .policy import (
 # here — they are always-on entrypoints (`python -m runtime.supervisor`), and
 # re-exporting them from the package triggers a double-import RuntimeWarning
 # under `-m`. Import `sweep` / `tick_once` from those submodules directly.
+from .task_state import (
+    TRANSITIONS,
+    DependencyCycle,
+    IllegalTransition,
+    assert_transition,
+    can_transition,
+    is_terminal,
+)
 from .tasks import (
     add_spent_tokens,
+    agent_rollup,
     claim_task,
     complete_task,
     enqueue_task,
     find_stale_tasks,
+    grab_task,
     heartbeat,
+    list_for_review,
+    model_rollup,
+    ready_tasks,
     rekick_task,
+    start_task,
+    task_cost,
+    task_lifecycle,
+    transition,
+    waiting_tasks,
 )
 from .tools import (
     FilesystemTool,
@@ -73,6 +91,7 @@ __all__ = [
     "Task",
     "TaskStatus",
     "add_spent_tokens",
+    "agent_rollup",
     "append_event",
     "build_database_url",
     "can_connect",
@@ -81,11 +100,27 @@ __all__ = [
     "connect",
     "enqueue_task",
     "find_stale_tasks",
+    "grab_task",
     "heartbeat",
     "is_stale",
+    "list_for_review",
     "make_event",
+    "model_rollup",
     "read_events",
+    "ready_tasks",
     "rekick_task",  # M3a supervisor re-kick primitive (loop lives in runtime.supervisor)
+    "start_task",
+    "task_cost",
+    "task_lifecycle",
+    "transition",
+    "waiting_tasks",
+    # M3d — canonical lifecycle state machine (ADR-0015)
+    "TRANSITIONS",
+    "DependencyCycle",
+    "IllegalTransition",
+    "assert_transition",
+    "can_transition",
+    "is_terminal",
     # M2 — capabilities & tiers
     "ActionTier",
     "Capability",

@@ -48,7 +48,7 @@ def _pm_tick_pending(conn: psycopg.Connection, workstream: str) -> bool:
             SELECT 1 FROM tasks
             WHERE workstream = %s
               AND type = %s
-              AND status IN ('queued', 'in_progress')
+              AND status NOT IN ('merged', 'abandoned')
             LIMIT 1
             """,
             (workstream, PM_TICK_TYPE),

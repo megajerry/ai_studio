@@ -1,13 +1,23 @@
-"""Task-queue access (ADR-0004, ADR-0009, ADR-0010, ADR-0012).
+"""Task-queue access + the canonical lifecycle (ADR-0004/0009/0010/0012/0015).
 
 Agents coordinate ONLY through this queue + the event log — never by direct
-calls. Every state transition here appends a corresponding event in the same
-transaction, so the log is a complete, replayable record of the queue.
+calls. Every state change goes through the single guarded :func:`transition`
+(there are **no ad-hoc status UPDATEs** anywhere): it checks the move against the
+canonical state machine (:mod:`runtime.task_state`), does the UPDATE guarded on
+the current status, records a ``task_transitions`` telemetry row (with latency),
+and emits a ``task.transition`` event — all in one transaction, so the log +
+telemetry are a complete, replayable record of the queue.
+
+Work is picked up with :func:`grab_task` (grab-by-sort, ``FOR UPDATE SKIP
+LOCKED``, dependency-gated); :func:`claim_task` is the convenience grab→start the
+runtime loop uses. Tasks with unmet prerequisites are never grabbed — see
+:func:`ready_tasks` / :func:`waiting_tasks` for what is parallelizable vs blocked.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import re
+from typing import Any, Optional
 from uuid import UUID
 
 import psycopg
@@ -15,12 +25,36 @@ from psycopg.types.json import Jsonb
 
 from .events import append_event
 from .models import Assignee, EventType, Task, TaskStatus, make_event
+from .task_state import (
+    DependencyCycle,
+    assert_acyclic,
+    assert_transition,
+    is_terminal,
+)
 
 _TASK_COLUMNS = (
     "id, workstream, type, status, priority, assignee, payload, result, "
-    "heartbeat_at, claimed_by, budget_tokens, spent_tokens, retries, "
-    "created_at, updated_at"
+    "heartbeat_at, claimed_by, agent_type, claimed_at, depends_on, "
+    "budget_tokens, spent_tokens, retries, created_at, updated_at"
 )
+
+#: Default grab ordering: highest priority first, then oldest (FIFO within tier).
+DEFAULT_SORT = "priority DESC, created_at ASC"
+
+#: A caller-supplied ``sort`` must match this (column names + ASC/DESC/commas).
+#: The sort/filter are supplied by the in-process spawning agent (trusted), but we
+#: still constrain ``sort`` to an ORDER-BY shape so a typo can't become arbitrary SQL.
+_SORT_RE = re.compile(r"^[\w\s,.()]+(?:\s+(?:asc|desc|nulls\s+(?:first|last)))?[\w\s,.()]*$", re.I)
+
+_UNSET = object()
+
+
+def _validate_sort(sort: Optional[str]) -> str:
+    if not sort:
+        return DEFAULT_SORT
+    if not _SORT_RE.match(sort.strip()):
+        raise ValueError(f"invalid sort expression: {sort!r}")
+    return sort.strip()
 
 
 def _emit(conn: psycopg.Connection, task: Task, event_type: EventType, **payload) -> None:
@@ -35,6 +69,133 @@ def _emit(conn: psycopg.Connection, task: Task, event_type: EventType, **payload
     )
 
 
+# --- The single guarded transition ------------------------------------------
+
+
+def transition(
+    conn: psycopg.Connection,
+    task_id: UUID,
+    to: TaskStatus,
+    *,
+    agent_id: Optional[str] = None,
+    agent_type: Optional[str] = None,
+    expected_from: Optional[TaskStatus] = None,
+    result: Any = _UNSET,
+    spent_tokens: Optional[int] = None,
+    claimed_by: Any = _UNSET,
+    clear_claim: bool = False,
+    set_claimed_at: bool = False,
+    set_heartbeat: bool = False,
+    increment_retries: bool = False,
+    sink: Any = None,
+    force: bool = False,
+) -> Optional[Task]:
+    """Move ``task_id`` to state ``to`` — THE single guarded state change.
+
+    Legal moves are defined by :mod:`runtime.task_state`; an illegal move raises
+    :class:`~runtime.task_state.IllegalTransition` (unless ``force``). The UPDATE
+    is guarded on the current status (so a concurrent change is a no-op → returns
+    ``None``); ``expected_from`` additionally requires a specific source state.
+
+    Records a ``task_transitions`` row (with ``latency_ms`` since this task's
+    previous transition) and emits a ``task.transition`` event carrying only
+    ids/statuses/agent/latency — never secret text. The optional column setters
+    (``result``, ``spent_tokens``, ``claimed_by``/``clear_claim``,
+    ``set_claimed_at``, ``set_heartbeat``, ``increment_retries``) let one guarded
+    write also carry the bookkeeping a given transition needs.
+    """
+    to_val = to.value if isinstance(to, TaskStatus) else str(to)
+    exp_val = (
+        expected_from.value if isinstance(expected_from, TaskStatus) else expected_from
+    )
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status FROM tasks WHERE id = %s FOR UPDATE", (task_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            current = row["status"]
+            if exp_val is not None and current != exp_val:
+                return None  # guarded: not in the expected source state
+            if current == to_val:
+                return None  # idempotent no-op (already there)
+            if not force:
+                assert_transition(current, to_val)  # raises IllegalTransition
+
+            sets = ["status = %s", "updated_at = now()"]
+            params: list[object] = [to_val]
+            if result is not _UNSET:
+                sets.append("result = %s")
+                params.append(Jsonb(result) if result is not None else None)
+            if spent_tokens is not None:
+                sets.append("spent_tokens = COALESCE(%s, spent_tokens)")
+                params.append(spent_tokens)
+            if claimed_by is not _UNSET:
+                sets.append("claimed_by = %s")
+                params.append(claimed_by)
+            if agent_type is not None:
+                sets.append("agent_type = %s")
+                params.append(agent_type)
+            if set_claimed_at:
+                sets.append("claimed_at = now()")
+            if set_heartbeat:
+                sets.append("heartbeat_at = now()")
+            if clear_claim:
+                sets.append("claimed_by = NULL")
+                sets.append("heartbeat_at = NULL")
+            if increment_retries:
+                sets.append("retries = retries + 1")
+
+            params.extend([task_id, current])
+            cur.execute(
+                f"""
+                UPDATE tasks SET {', '.join(sets)}
+                WHERE id = %s AND status = %s
+                RETURNING {_TASK_COLUMNS}
+                """,
+                params,
+            )
+            updated = cur.fetchone()
+            if updated is None:
+                return None
+            task = Task.model_validate(updated)
+
+            # Append-only lifecycle telemetry: latency since the previous
+            # transition (or task creation for the first one).
+            cur.execute(
+                """
+                INSERT INTO task_transitions
+                    (task_id, from_status, to_status, agent_id, agent_type, latency_ms)
+                VALUES (%s, %s, %s, %s, %s,
+                    (EXTRACT(EPOCH FROM (now() - COALESCE(
+                        (SELECT max(at) FROM task_transitions WHERE task_id = %s),
+                        (SELECT created_at FROM tasks WHERE id = %s)
+                    ))) * 1000)::bigint)
+                RETURNING latency_ms
+                """,
+                (task_id, current, to_val, agent_id, agent_type or task.agent_type,
+                 task_id, task_id),
+            )
+            latency_ms = cur.fetchone()["latency_ms"]
+
+        _emit(
+            conn, task, EventType.TASK_TRANSITION,
+            **{"from": current, "to": to_val, "agent_id": agent_id,
+               "agent_type": agent_type or task.agent_type, "latency_ms": latency_ms},
+        )
+        # Uniform terminal marker for existing consumers/telemetry: any transition
+        # into a terminal state (merged/abandoned) also emits task.finished.
+        if is_terminal(to_val):
+            _emit(conn, task, EventType.TASK_FINISHED, spent_tokens=task.spent_tokens)
+    return task
+
+
+# --- Enqueue (with dependency edges) ----------------------------------------
+
+
 def enqueue_task(
     conn: psycopg.Connection,
     *,
@@ -44,18 +205,23 @@ def enqueue_task(
     priority: int = 0,
     assignee: Optional[Assignee] = None,
     budget_tokens: Optional[int] = None,
+    depends_on: Optional[list[UUID]] = None,
 ) -> Task:
-    """Create a queued task and emit ``task.created``.
+    """Create an ``up_for_grabs`` task and emit ``task.created`` (ADR-0009/0015).
 
-    Enqueueing is how a role/agent is "spawned" (ADR-0009): the runtime later
-    materializes a worker to claim and service it.
+    Enqueueing is how a role/agent is "spawned"; the runtime later grabs it.
+    ``depends_on`` lists prerequisite task ids — the task becomes grabbable only
+    once every prerequisite is ``merged`` (see :func:`grab_task`). Self-dependency
+    is rejected (:class:`~runtime.task_state.DependencyCycle`).
     """
+    deps = list(depends_on or [])
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                INSERT INTO tasks (workstream, type, payload, priority, assignee, budget_tokens)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO tasks
+                    (workstream, type, payload, priority, assignee, budget_tokens, depends_on)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING {_TASK_COLUMNS}
                 """,
                 (
@@ -65,11 +231,93 @@ def enqueue_task(
                     priority,
                     assignee.value if assignee else None,
                     budget_tokens,
+                    deps,
                 ),
             )
             task = Task.model_validate(cur.fetchone())
+            if task.id in task.depends_on:
+                raise DependencyCycle(f"task {task.id} depends on itself")
         _emit(conn, task, EventType.TASK_CREATED, type=task.type, priority=task.priority)
     return task
+
+
+# --- Grab / claim -----------------------------------------------------------
+
+
+def grab_task(
+    conn: psycopg.Connection,
+    *,
+    worker_id: str,
+    agent_type: Optional[str] = None,
+    assignee: Optional[Assignee] = None,
+    sort: Optional[str] = None,
+    filter: Optional[str] = None,
+    workstream: Optional[str] = None,
+) -> Optional[Task]:
+    """Grab one grabbable ``up_for_grabs`` task and move it to ``claimed``.
+
+    Grabbable = ``up_for_grabs`` AND every prerequisite is ``merged`` (so tasks
+    with no unmet deps are independent + grabbable in parallel; dependents wait).
+    Picks by the caller-supplied ``sort`` (default priority DESC, created_at ASC)
+    with ``FOR UPDATE SKIP LOCKED`` so concurrent grabbers never take the same
+    task. ``assignee`` targets host/offhost (or unassigned); ``filter`` is an
+    optional extra SQL predicate supplied by the in-process spawning agent. On the
+    grab it records ``claimed_by``/``agent_type``/``claimed_at`` + an initial
+    heartbeat. Returns the claimed task, or ``None`` if nothing is grabbable.
+    """
+    order_by = _validate_sort(sort)
+    clauses = ["t.status = 'up_for_grabs'"]
+    params: list[object] = []
+    if assignee is not None:
+        clauses.append("(t.assignee IS NULL OR t.assignee = %s)")
+        params.append(assignee.value)
+    if workstream is not None:
+        clauses.append("t.workstream = %s")
+        params.append(workstream)
+    if filter:
+        clauses.append(f"({filter})")
+    # Dependency gate: reject if ANY prerequisite is not yet merged (unmet or
+    # abandoned) — such a task is not grabbable (see waiting_tasks()).
+    clauses.append(
+        "NOT EXISTS (SELECT 1 FROM unnest(t.depends_on) AS dep(id) "
+        "JOIN tasks p ON p.id = dep.id WHERE p.status <> 'merged')"
+    )
+    where = " AND ".join(clauses)
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT t.id FROM tasks t
+                WHERE {where}
+                ORDER BY {order_by}
+                FOR UPDATE OF t SKIP LOCKED
+                LIMIT 1
+                """,
+                params,
+            )
+            picked = cur.fetchone()
+            if picked is None:
+                return None
+        task = transition(
+            conn, picked["id"], TaskStatus.CLAIMED,
+            agent_id=worker_id, agent_type=agent_type,
+            expected_from=TaskStatus.UP_FOR_GRABS,
+            claimed_by=worker_id, set_claimed_at=True, set_heartbeat=True,
+        )
+    return task
+
+
+def start_task(
+    conn: psycopg.Connection, task_id: UUID, worker_id: str,
+    *, agent_type: Optional[str] = None,
+) -> Optional[Task]:
+    """Move a ``claimed`` task to ``in_progress`` (work begins); refresh heartbeat."""
+    return transition(
+        conn, task_id, TaskStatus.IN_PROGRESS,
+        agent_id=worker_id, agent_type=agent_type,
+        expected_from=TaskStatus.CLAIMED, set_heartbeat=True,
+    )
 
 
 def claim_task(
@@ -78,56 +326,28 @@ def claim_task(
     worker_id: str,
     assignee: Optional[Assignee] = None,
     workstream: Optional[str] = None,
+    agent_type: Optional[str] = None,
+    sort: Optional[str] = None,
+    filter: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically claim the highest-priority queued task, or return None.
+    """Grab the next grabbable task and start it — the runtime loop's convenience.
 
-    Uses ``FOR UPDATE SKIP LOCKED`` so concurrent workers never claim the same
-    task and never block on each other. A worker declaring ``assignee`` picks up
-    tasks targeted at that assignee OR left unassigned (null); tasks targeted at
-    the *other* assignee are skipped (ADR-0010). Sets the row ``in_progress``
-    with an initial heartbeat and emits ``task.claimed``.
+    Equivalent to :func:`grab_task` (up_for_grabs→claimed) then :func:`start_task`
+    (claimed→in_progress), returning the ``in_progress`` task ready to work, or
+    ``None`` when nothing is grabbable. Preserves the historical ``claim_task``
+    contract so the worker loop keeps working unchanged.
     """
-    clauses = ["status = 'queued'"]
-    params: list[object] = []
-    if assignee is not None:
-        clauses.append("(assignee IS NULL OR assignee = %s)")
-        params.append(assignee.value)
-    if workstream is not None:
-        clauses.append("workstream = %s")
-        params.append(workstream)
-    where = " AND ".join(clauses)
+    grabbed = grab_task(
+        conn, worker_id=worker_id, agent_type=agent_type,
+        assignee=assignee, sort=sort, filter=filter, workstream=workstream,
+    )
+    if grabbed is None:
+        return None
+    started = start_task(conn, grabbed.id, worker_id, agent_type=agent_type)
+    return started or grabbed
 
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT id FROM tasks
-                WHERE {where}
-                ORDER BY priority DESC, created_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-                """,
-                params,
-            )
-            picked = cur.fetchone()
-            if picked is None:
-                return None
 
-            cur.execute(
-                f"""
-                UPDATE tasks
-                SET status = 'in_progress',
-                    claimed_by = %s,
-                    heartbeat_at = now(),
-                    updated_at = now()
-                WHERE id = %s
-                RETURNING {_TASK_COLUMNS}
-                """,
-                (worker_id, picked["id"]),
-            )
-            task = Task.model_validate(cur.fetchone())
-        _emit(conn, task, EventType.TASK_CLAIMED, claimed_by=worker_id)
-    return task
+# --- Heartbeat --------------------------------------------------------------
 
 
 def heartbeat(
@@ -135,11 +355,9 @@ def heartbeat(
 ) -> Optional[Task]:
     """Refresh a task's heartbeat; returns the task, or None if not held.
 
-    Only the worker holding the claim may heartbeat (guards against a stale
-    worker resurrecting a re-kicked task). Deliberately emits **no** event:
-    heartbeats are high-frequency liveness with zero replay value, and logging
-    each one would bloat the append-only log (ADR-0013). ``EventType.TASK_HEARTBEAT``
-    remains defined for occasional manual/explicit use.
+    Only the worker holding the claim may heartbeat, and only while the task is
+    actively held (``claimed`` or ``in_progress``). Emits **no** event: heartbeats
+    are high-frequency liveness with zero replay value (ADR-0013).
     """
     with conn.transaction():
         with conn.cursor() as cur:
@@ -147,7 +365,8 @@ def heartbeat(
                 f"""
                 UPDATE tasks
                 SET heartbeat_at = now(), updated_at = now()
-                WHERE id = %s AND claimed_by = %s AND status = 'in_progress'
+                WHERE id = %s AND claimed_by = %s
+                  AND status IN ('claimed', 'in_progress')
                 RETURNING {_TASK_COLUMNS}
                 """,
                 (task_id, worker_id),
@@ -158,56 +377,60 @@ def heartbeat(
     return Task.model_validate(row)
 
 
+# --- Completion (terminal finalize for non-reviewed internal tasks) ---------
+
+
 def complete_task(
     conn: psycopg.Connection,
     task_id: UUID,
     *,
     result: Optional[dict] = None,
-    status: TaskStatus = TaskStatus.DONE,
+    status: TaskStatus = TaskStatus.MERGED,
     spent_tokens: Optional[int] = None,
     force: bool = False,
 ) -> Optional[Task]:
-    """Mark a task done/failed with a result and emit ``task.finished``.
+    """Finalize an ``in_progress`` task to ``merged`` (success) or ``abandoned``.
 
-    ``status`` must be a terminal state. By default only an ``in_progress`` task
-    is finalized — a worker cannot finalize a task it no longer owns (e.g. one
-    the supervisor already re-kicked, or an already-terminal task). On such a
-    conflict (or a missing task) the row is left untouched, **no event is
-    emitted**, and ``None`` is returned.
+    Used by the non-work handlers (pm.tick / retro / research / review) and the
+    supervisor; ``work.*`` tasks reach ``merged`` through the review flow in the
+    worker. ``status`` must be a terminal state (``MERGED``/``ABANDONED``; the
+    legacy ``DONE``/``FAILED`` are not valid here). A success is driven through the
+    canonical ``in_progress → ready_for_review → approved → merged`` path (an
+    internal task is auto-approved), so its full lifecycle telemetry is recorded;
+    an abandon is ``current → abandoned``.
 
-    ``force=True`` bypasses the in-progress guard so the supervisor can
-    force-fail a stale/re-kicked task regardless of its current state.
-    ``spent_tokens`` (if given) records final cost for telemetry (ADR-0012).
+    By default only an ``in_progress`` task is finalized (a worker cannot finalize
+    a task it no longer owns); a conflict/missing task returns ``None`` with no
+    event. ``force=True`` finalizes from whatever the current (non-terminal) state
+    is (the supervisor force-abandoning a stale task); it still emits ``task.finished``.
     """
-    if status not in (TaskStatus.DONE, TaskStatus.FAILED):
-        raise ValueError("complete_task status must be 'done' or 'failed'")
+    if not is_terminal(status):
+        raise ValueError("complete_task status must be 'merged' or 'abandoned'")
 
-    guard = "" if force else "AND status = 'in_progress'"
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE tasks
-                SET status = %s,
-                    result = %s,
-                    spent_tokens = COALESCE(%s, spent_tokens),
-                    updated_at = now()
-                WHERE id = %s {guard}
-                RETURNING {_TASK_COLUMNS}
-                """,
-                (
-                    status.value,
-                    Jsonb(result) if result is not None else None,
-                    spent_tokens,
-                    task_id,
-                ),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            task = Task.model_validate(row)
-        _emit(conn, task, EventType.TASK_FINISHED, spent_tokens=task.spent_tokens)
+    if status == TaskStatus.MERGED:
+        # Auto-approve + merge an internal task through the canonical path.
+        t = transition(
+            conn, task_id, TaskStatus.READY_FOR_REVIEW,
+            expected_from=None if force else TaskStatus.IN_PROGRESS,
+            result=result, spent_tokens=spent_tokens, force=force,
+        )
+        if t is None:
+            return None
+        t = transition(conn, task_id, TaskStatus.APPROVED)
+        if t is None:
+            return None
+        task = transition(conn, task_id, TaskStatus.MERGED)
+    else:  # ABANDONED — reachable from any non-terminal state
+        task = transition(
+            conn, task_id, TaskStatus.ABANDONED,
+            expected_from=None if force else TaskStatus.IN_PROGRESS,
+            result=result, spent_tokens=spent_tokens, force=force,
+        )
+    # transition() emits task.finished on the terminal hop, so nothing to add here.
     return task
+
+
+# --- Approval block / requeue -----------------------------------------------
 
 
 def block_task(
@@ -220,71 +443,31 @@ def block_task(
     """Park an ``in_progress`` task as ``blocked`` on a pending 🔴 approval.
 
     Stores ``approval_id`` in ``result`` so :func:`runtime.worker.resume_approved`
-    can match the task to its approval once a human resolves it. Guarded to
-    ``in_progress`` (like :func:`heartbeat`) so a task that changed state is left
-    untouched (returns ``None``).
-
-    Emits **no** event by design: the ``approval.requested`` event (from
-    :func:`runtime.enforce.invoke`) already records this block with the same
-    ``task_id``, and ``blocked`` is a transient wait state — not a terminal
-    verify→commit transition — so re-logging it would only bloat the log (ADR-0013).
+    can match the task to its approval. Guarded to ``in_progress`` (returns
+    ``None`` otherwise). The ``task.transition`` event records the block.
     """
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE tasks
-                SET status = 'blocked',
-                    result = %s,
-                    updated_at = now()
-                WHERE id = %s AND status = 'in_progress'
-                RETURNING {_TASK_COLUMNS}
-                """,
-                (
-                    Jsonb({"blocked_on_approval": str(approval_id), "reason": reason}),
-                    task_id,
-                ),
-            )
-            row = cur.fetchone()
-    if row is None:
-        return None
-    return Task.model_validate(row)
+    return transition(
+        conn, task_id, TaskStatus.BLOCKED,
+        expected_from=TaskStatus.IN_PROGRESS,
+        result={"blocked_on_approval": str(approval_id), "reason": reason},
+    )
 
 
 def requeue_blocked_task(conn: psycopg.Connection, task_id: UUID) -> Optional[Task]:
-    """Re-queue a ``blocked`` task once its approval is granted; guarded to ``blocked``.
+    """Re-queue a ``blocked`` task (→ ``up_for_grabs``) once its approval is granted.
 
-    Clears the claim and heartbeat so a fresh worker re-claims it and re-runs the
-    action — on that retry :func:`runtime.enforce.invoke` finds the live grant and
-    executes. Emits no event here; the caller (:func:`runtime.worker.resume_approved`)
-    emits ``approval.resumed`` with the grant context.
+    Clears the claim so a fresh worker re-grabs and re-runs the action — on that
+    retry :func:`runtime.enforce.invoke` finds the live grant and executes. Guarded
+    to ``blocked``.
     """
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE tasks
-                SET status = 'queued',
-                    claimed_by = NULL,
-                    heartbeat_at = NULL,
-                    updated_at = now()
-                WHERE id = %s AND status = 'blocked'
-                RETURNING {_TASK_COLUMNS}
-                """,
-                (task_id,),
-            )
-            row = cur.fetchone()
-    if row is None:
-        return None
-    return Task.model_validate(row)
+    return transition(
+        conn, task_id, TaskStatus.UP_FOR_GRABS,
+        expected_from=TaskStatus.BLOCKED, clear_claim=True,
+    )
 
 
 def find_blocked_tasks(conn: psycopg.Connection) -> list[Task]:
-    """Return all tasks currently parked ``blocked`` on an approval (oldest first).
-
-    :func:`runtime.worker.resume_approved` scans these to advance any whose
-    approval a human has now resolved (grant → re-queue, deny → fail).
-    """
+    """Return all tasks currently parked ``blocked`` on an approval (oldest first)."""
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT {_TASK_COLUMNS} FROM tasks WHERE status = 'blocked' ORDER BY created_at ASC"
@@ -295,18 +478,135 @@ def find_blocked_tasks(conn: psycopg.Connection) -> list[Task]:
     return [Task.model_validate(r) for r in rows]
 
 
+# --- Reviewer helpers -------------------------------------------------------
+
+
+def list_for_review(
+    conn: psycopg.Connection, *, workstream: Optional[str] = None, limit: Optional[int] = None
+) -> list[Task]:
+    """Tasks awaiting review (``ready_for_review``), oldest first.
+
+    A human / off-host Reviewer queries this, then drives each one
+    ``ready_for_review → approved`` (then merged) or ``→ reviewer_blocked`` via
+    :func:`transition`.
+    """
+    clauses = ["status = 'ready_for_review'"]
+    params: list[object] = []
+    if workstream is not None:
+        clauses.append("workstream = %s")
+        params.append(workstream)
+    sql = (
+        f"SELECT {_TASK_COLUMNS} FROM tasks WHERE {' AND '.join(clauses)} "
+        "ORDER BY priority DESC, created_at ASC"
+    )
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+    return [Task.model_validate(r) for r in rows]
+
+
+# --- Dependency visibility (what's parallelizable vs blocked) ---------------
+
+
+def ready_tasks(
+    conn: psycopg.Connection,
+    *,
+    assignee: Optional[Assignee] = None,
+    workstream: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[Task]:
+    """``up_for_grabs`` tasks with ALL prerequisites merged — grabbable now.
+
+    These have no unmet dependency, so they are independent and can be grabbed in
+    parallel by the fleet. Ordered like the grab path (priority DESC, created_at).
+    """
+    clauses = ["t.status = 'up_for_grabs'"]
+    params: list[object] = []
+    if assignee is not None:
+        clauses.append("(t.assignee IS NULL OR t.assignee = %s)")
+        params.append(assignee.value)
+    if workstream is not None:
+        clauses.append("t.workstream = %s")
+        params.append(workstream)
+    clauses.append(
+        "NOT EXISTS (SELECT 1 FROM unnest(t.depends_on) AS dep(id) "
+        "JOIN tasks p ON p.id = dep.id WHERE p.status <> 'merged')"
+    )
+    sql = (
+        f"SELECT {_TASK_COLUMNS} FROM tasks t WHERE {' AND '.join(clauses)} "
+        "ORDER BY t.priority DESC, t.created_at ASC"
+    )
+    if limit is not None:
+        sql += " LIMIT %s"
+        params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+    return [Task.model_validate(r) for r in rows]
+
+
+def waiting_tasks(
+    conn: psycopg.Connection, *, workstream: Optional[str] = None
+) -> list[dict]:
+    """``up_for_grabs`` tasks blocked by an unmet/abandoned prerequisite.
+
+    Returns one dict per waiting task: ``task`` (the :class:`Task`),
+    ``pending_prereqs`` (prereq ids not yet merged), and ``blocked_by_abandoned``
+    (True if any prerequisite is ``abandoned`` — the dependent can then never run
+    and is surfaced here, never silently grabbed). Complements :func:`ready_tasks`.
+    """
+    clauses = ["t.status = 'up_for_grabs'", "cardinality(t.depends_on) > 0"]
+    params: list[object] = []
+    if workstream is not None:
+        clauses.append("t.workstream = %s")
+        params.append(workstream)
+    clauses.append(
+        "EXISTS (SELECT 1 FROM unnest(t.depends_on) AS dep(id) "
+        "JOIN tasks p ON p.id = dep.id WHERE p.status <> 'merged')"
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_TASK_COLUMNS} FROM tasks t WHERE {' AND '.join(clauses)} "
+            "ORDER BY t.created_at ASC",
+            params,
+        )
+        rows = cur.fetchall()
+        out: list[dict] = []
+        for r in rows:
+            task = Task.model_validate(r)
+            cur.execute(
+                "SELECT id, status FROM tasks WHERE id = ANY(%s) AND status <> 'merged'",
+                (task.depends_on,),
+            )
+            pend = cur.fetchall()
+            out.append({
+                "task": task,
+                "pending_prereqs": [p["id"] for p in pend],
+                "blocked_by_abandoned": any(p["status"] == "abandoned" for p in pend),
+            })
+    if not conn.autocommit:
+        conn.commit()
+    return out
+
+
+# --- Telemetry --------------------------------------------------------------
+
+
 def add_spent_tokens(
     conn: psycopg.Connection, task_id: UUID, tokens: int
 ) -> Optional[Task]:
     """Increment a task's ``spent_tokens`` by ``tokens`` (telemetry; ADR-0012).
 
-    Called by the instrumented model-call wrapper (:func:`runtime.model.call.call_model`)
-    after each LLM call so a task's cumulative token spend is tracked live for
-    budget enforcement. Unlike :func:`complete_task` this does **not** change
-    status and is not guarded to ``in_progress`` — spend is recorded wherever the
-    task is. Returns the updated task, or ``None`` if the task does not exist.
-    Emits no event: the ``model.call`` event (from the wrapper) already carries
-    per-call tokens + cost, so incrementing the counter here would double-log.
+    Called by the instrumented model-call wrapper after each LLM call so a task's
+    cumulative token spend is tracked live. Does not change status; emits no event
+    (the ``model.call`` event already carries per-call tokens + cost).
     """
     if tokens < 0:
         raise ValueError("tokens must be non-negative")
@@ -315,8 +615,7 @@ def add_spent_tokens(
             cur.execute(
                 f"""
                 UPDATE tasks
-                SET spent_tokens = spent_tokens + %s,
-                    updated_at = now()
+                SET spent_tokens = spent_tokens + %s, updated_at = now()
                 WHERE id = %s
                 RETURNING {_TASK_COLUMNS}
                 """,
@@ -328,21 +627,129 @@ def add_spent_tokens(
     return Task.model_validate(row)
 
 
+def task_lifecycle(conn: psycopg.Connection, task_id: UUID) -> dict:
+    """Ordered transitions + per-hop durations + total wall-clock for one task.
+
+    Returns ``{"transitions": [...], "total_ms": int|None, "current": status|None,
+    "depends_on": [...]}`` where each transition carries from/to/agent/agent_type/at
+    and its ``latency_ms`` (time spent in the *previous* state). The full canonical
+    journey of a task, straight from the append-only ``task_transitions`` table.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT from_status, to_status, agent_id, agent_type, at, latency_ms
+            FROM task_transitions WHERE task_id = %s ORDER BY at ASC, id ASC
+            """,
+            (task_id,),
+        )
+        trans = cur.fetchall()
+        cur.execute("SELECT status, depends_on FROM tasks WHERE id = %s", (task_id,))
+        row = cur.fetchone()
+    if not conn.autocommit:
+        conn.commit()
+    total = None
+    if trans:
+        total = sum(int(t["latency_ms"] or 0) for t in trans)
+    return {
+        "transitions": [dict(t) for t in trans],
+        "total_ms": total,
+        "current": row["status"] if row else None,
+        "depends_on": list(row["depends_on"]) if row else [],
+    }
+
+
+def task_cost(conn: psycopg.Connection, task_id: UUID) -> dict:
+    """Sum tokens + cost + latency from a task's ``model.call`` events (ADR-0012).
+
+    Returns ``{"calls", "input_tokens", "output_tokens", "cached_tokens",
+    "total_tokens", "cost_usd", "latency_ms", "spent_tokens"}`` — cost per task,
+    linked because every model call on a task's behalf carries its ``task_id``.
+    ``spent_tokens`` is the live counter on the task row (cross-check).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                count(*) AS calls,
+                COALESCE(sum((payload->>'input_tokens')::bigint), 0)  AS input_tokens,
+                COALESCE(sum((payload->>'output_tokens')::bigint), 0) AS output_tokens,
+                COALESCE(sum((payload->>'cached_tokens')::bigint), 0) AS cached_tokens,
+                COALESCE(sum((payload->>'cost_usd')::numeric), 0)     AS cost_usd,
+                COALESCE(sum((payload->>'latency_ms')::bigint), 0)    AS latency_ms
+            FROM events WHERE task_id = %s AND type = 'model.call'
+            """,
+            (task_id,),
+        )
+        agg = cur.fetchone()
+        cur.execute("SELECT spent_tokens FROM tasks WHERE id = %s", (task_id,))
+        row = cur.fetchone()
+    if not conn.autocommit:
+        conn.commit()
+    out = {k: (int(v) if k != "cost_usd" else float(v)) for k, v in agg.items()}
+    out["total_tokens"] = out["input_tokens"] + out["output_tokens"]
+    out["spent_tokens"] = int(row["spent_tokens"]) if row else 0
+    return out
+
+
+def agent_rollup(conn: psycopg.Connection) -> list[dict]:
+    """Per-(agent_type, to_status) transition counts + avg latency (ADR-0012)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT agent_type, to_status,
+                   count(*) AS transitions,
+                   COALESCE(avg(latency_ms), 0)::bigint AS avg_latency_ms
+            FROM task_transitions
+            GROUP BY agent_type, to_status
+            ORDER BY agent_type NULLS FIRST, to_status
+            """
+        )
+        rows = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+    return [dict(r) for r in rows]
+
+
+def model_rollup(conn: psycopg.Connection) -> list[dict]:
+    """Per-model call counts, avg latency, and total cost from ``model.call`` events."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload->>'model' AS model,
+                   count(*) AS calls,
+                   COALESCE(avg((payload->>'latency_ms')::bigint), 0)::bigint AS avg_latency_ms,
+                   COALESCE(sum((payload->>'cost_usd')::numeric), 0)::float8 AS cost_usd,
+                   COALESCE(sum((payload->>'input_tokens')::bigint
+                              + (payload->>'output_tokens')::bigint), 0) AS total_tokens
+            FROM events WHERE type = 'model.call'
+            GROUP BY payload->>'model'
+            ORDER BY calls DESC
+            """
+        )
+        rows = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+    return [dict(r) for r in rows]
+
+
+# --- Supervisor recovery ----------------------------------------------------
+
+
 def find_stale_tasks(
     conn: psycopg.Connection, threshold_seconds: float
 ) -> list[Task]:
-    """Return in-progress tasks whose heartbeat is older than the threshold.
+    """Return actively-held tasks whose heartbeat is older than the threshold.
 
-    This is exactly what the non-agent supervisor (ADR-0004) polls to find
-    silently-dropped tasks to re-kick. A null heartbeat also counts as stale.
-    Ordered oldest-heartbeat-first (nulls first) so the most-neglected tasks
-    surface earliest.
+    Exactly what the non-agent supervisor (ADR-0004) polls to find silently-dropped
+    tasks. ``claimed`` (grabbed, never started) and ``in_progress`` tasks both
+    count; a null heartbeat also counts as stale. Oldest-heartbeat-first.
     """
     with conn.cursor() as cur:
         cur.execute(
             f"""
             SELECT {_TASK_COLUMNS} FROM tasks
-            WHERE status = 'in_progress'
+            WHERE status IN ('claimed', 'in_progress')
               AND (heartbeat_at IS NULL
                    OR heartbeat_at < now() - make_interval(secs => %s))
             ORDER BY heartbeat_at ASC NULLS FIRST
@@ -350,42 +757,26 @@ def find_stale_tasks(
             (float(threshold_seconds),),
         )
         rows = cur.fetchall()
-    # The supervisor polls this on a long-lived connection; close the read's
-    # implicit transaction so it is not left idle-in-transaction.
     if not conn.autocommit:
         conn.commit()
     return [Task.model_validate(r) for r in rows]
 
 
 def rekick_task(conn: psycopg.Connection, task_id: UUID) -> Optional[Task]:
-    """Re-queue a stale in-progress task for a fresh worker; emit ``task.rekicked``.
+    """Re-queue a stale held task (→ ``up_for_grabs``) for a fresh worker; ``task.rekicked``.
 
-    This is the non-agent supervisor's core action (ADR-0004): a task whose
-    worker went silent is reset to ``queued`` with its claim and heartbeat
-    cleared and ``retries`` incremented, so the runtime can materialize a fresh
-    worker to service it. Guarded to ``in_progress`` (like :func:`heartbeat`)
-    so a task that changed state between the supervisor's scan and this write is
-    left untouched (returns ``None``, no event). Runs in one transaction so the
-    state change and its event commit atomically.
+    The non-agent supervisor's core recovery (ADR-0004): a task whose worker went
+    silent is returned to the grab pool with its claim/heartbeat cleared and
+    ``retries`` incremented. Handles both ``claimed`` and ``in_progress`` (the
+    latter via the documented in_progress→up_for_grabs recovery edge). Guarded to
+    those two states — a task that changed state is left untouched (``None``).
     """
     with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE tasks
-                SET status = 'queued',
-                    claimed_by = NULL,
-                    heartbeat_at = NULL,
-                    retries = retries + 1,
-                    updated_at = now()
-                WHERE id = %s AND status = 'in_progress'
-                RETURNING {_TASK_COLUMNS}
-                """,
-                (task_id,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            task = Task.model_validate(row)
+        task = transition(
+            conn, task_id, TaskStatus.UP_FOR_GRABS,
+            clear_claim=True, increment_retries=True,
+        )
+        if task is None or task.status is not TaskStatus.UP_FOR_GRABS:
+            return None
         _emit(conn, task, EventType.TASK_REKICKED, retries=task.retries)
     return task

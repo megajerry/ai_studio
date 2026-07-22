@@ -263,12 +263,21 @@ def studio_status(conn: psycopg.Connection) -> StudioStatus:
     if not conn.autocommit:
         conn.commit()
 
+    # Map the canonical lifecycle states (ADR-0015) onto the stakeholder-facing
+    # summary buckets: up_for_grabs = "queued"; claimed/in_progress/ready_for_review/
+    # reviewer_blocked/approved = actively "in progress"; merged = done; abandoned =
+    # failed; blocked (on a 🔴 approval) stays its own bucket.
+    in_flight = (
+        counts.get("claimed", 0) + counts.get("in_progress", 0)
+        + counts.get("ready_for_review", 0) + counts.get("reviewer_blocked", 0)
+        + counts.get("approved", 0)
+    )
     return StudioStatus(
-        queued=counts.get("queued", 0),
-        in_progress=counts.get("in_progress", 0),
+        queued=counts.get("up_for_grabs", 0),
+        in_progress=in_flight,
         blocked=counts.get("blocked", 0),
-        done=counts.get("done", 0),
-        failed=counts.get("failed", 0),
+        done=counts.get("merged", 0),
+        failed=counts.get("abandoned", 0),
         pending_approvals=len(pending_approvals(conn)),
         spent_tokens=spent,
     )

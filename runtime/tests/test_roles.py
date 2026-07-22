@@ -66,7 +66,7 @@ def _collecting_enqueue(bucket: list) -> "callable":
     """A fake enqueue that records each enqueued task (as a QUEUED Task)."""
 
     def fake_enqueue(conn, *, workstream, type, payload=None, priority=0, **kw) -> Task:
-        t = _task(type, payload, workstream).model_copy(update={"status": TaskStatus.QUEUED})
+        t = _task(type, payload, workstream).model_copy(update={"status": TaskStatus.UP_FOR_GRABS})
         bucket.append(t)
         return t
 

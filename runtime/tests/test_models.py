@@ -116,7 +116,7 @@ def test_stale_when_heartbeat_missing():
 
 
 @pytest.mark.parametrize(
-    "status", [TaskStatus.QUEUED, TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.BLOCKED]
+    "status", [TaskStatus.UP_FOR_GRABS, TaskStatus.MERGED, TaskStatus.ABANDONED, TaskStatus.BLOCKED]
 )
 def test_never_stale_unless_in_progress(status):
     t = _task(status=status, heartbeat_at=None)
