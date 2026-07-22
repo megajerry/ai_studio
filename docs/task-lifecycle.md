@@ -110,7 +110,20 @@ Cost links per task because every `call_model` on a task's behalf carries its
 `task_id`. Events and telemetry carry ids / statuses / counts only — never secret
 or argument text (invariants 5 & 6).
 
-## Not in scope (separate follow-up)
+## DB-outage resilience & remote access (part 2)
 
-DB-outage resilience and remote host-restricted DB access are deliberately out of
-scope for this milestone.
+DB-outage resilience and remote host-restricted DB access — deferred from this
+milestone — are now specified in
+[ADR-0017](decisions/0017-db-resilience-and-remote-access.md) and operated per
+[`docs/db-operations.md`](db-operations.md):
+
+- **Degraded-mode contract** (`runtime/db.py`): on DB-unreachable, log degraded +
+  retry with bounded backoff, don't crash — `connect_with_retry` returns a
+  connection or raises the single `DBUnavailable` degraded signal.
+- **Reconnect grace window** (`runtime/supervisor.py`): after recovering from an
+  outage the supervisor defers re-kicks for `SUPERVISOR_RECONNECT_GRACE_S` so live
+  workers re-heartbeat first — avoiding a thundering-herd re-kick of every
+  in-progress task whose heartbeat froze during the outage.
+- **Remote host-restricted access** (`infra/postgres/` + `docker-compose.yml`): a
+  scram-sha-256, allowlist-only pg_hba (never `trust`, never `0.0.0.0/0`) driven
+  by `PG_ALLOWED_HOSTS`, bound to the LAN (not the internet).

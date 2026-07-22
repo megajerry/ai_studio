@@ -32,35 +32,37 @@ cost model · ADRs 0001–0015.
 
 ## 🔄 In progress
 
-- _(nothing in flight)_
+- **DB-outage resilience + remote host-restricted DB access** (branch
+  `runtime/db-resilience`, ADR-0017 — built, awaiting review/merge): degraded-mode
+  contract (`db.connect_with_retry` + `DBUnavailable`), supervisor reconnect grace
+  window (`SUPERVISOR_RECONNECT_GRACE_S`, anti thundering-herd), Postgres LAN bind
+  (`PG_BIND_IP` default loopback) + env-driven `pg_hba` allowlist
+  (`PG_ALLOWED_HOSTS`, scram-sha-256, never trust/0.0.0.0/0). Live: `pytest
+  runtime/tests/ spokesman/tests/` = 411 passed / 0 skips; demo green.
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
-1. **DB-outage resilience + remote host-restricted DB access** (part 2 of the
-   lifecycle milestone) — degraded-mode contract, reconnect grace window (avoid
-   thundering-herd re-kick), git fallback; Postgres LAN bind + `pg_hba` allowlist
-   of authorized hosts (not internet).
-2. **Experiment primitive** (venture-studio brain, first object) — an `experiment`
+1. **Experiment primitive** (venture-studio brain, first object) — an `experiment`
    (hypothesis, success metric, budget, kill/scale decision) + one evaluation step.
    Generic machinery; the *first real* experiment needs a product decision (below).
-3. **Real budget enforcement** — per-workstream $/token caps that actually gate
+2. **Real budget enforcement** — per-workstream $/token caps that actually gate
    (today: router downshift + `OverBudget` on dry-run tokens only).
-4. **Coding-worker dispatch** — route a "Need Prototype" coding task through the
+3. **Coding-worker dispatch** — route a "Need Prototype" coding task through the
    (done) sandbox runner via `invoke` (opencode as the replaceable worker).
-5. **Workstream-bootstrap primitive** (makes starting a vertical config-not-code) —
+4. **Workstream-bootstrap primitive** (makes starting a vertical config-not-code) —
    a workstream config/registration (name/objective/budget/policy grants/tool+skill
    set/memory-seed/DB-scope/object-store bucket) + the **role prompt-assembly layer**
    (shared role base + workstream charter + per-role overlay + skills + lessons +
    task) + a **pluggable verify-checker registry** (structured criterion → domain
    check, e.g. `video_audit`) so verticals augment verification while the learning/
    retro/reviewer/telemetry all still apply. Captured by the vertical-isolation ADR.
-6. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
+5. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
    product→own repo, definition→platform (this repo).
-7. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
+6. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
-8. **Adaptive orchestration intensity** — generalize scaling of review/retro/
+7. **Adaptive orchestration intensity** — generalize scaling of review/retro/
    research by recent error rate + budget/telemetry (today: on_fail/on_risk).
-9. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+8. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
    M1's `EventType` enum).
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)

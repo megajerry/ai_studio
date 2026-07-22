@@ -2,6 +2,27 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
+## Latest (branch `runtime/db-resilience`, ADR-0017 — built, awaiting merge)
+
+**DB-outage resilience + remote host-restricted DB access** (backlog item 1, part
+2 of the lifecycle milestone). Degraded-mode contract in `runtime/db.py`
+(`connect_with_retry` bounded backoff + the single `DBUnavailable` signal;
+`can_connect` kept): on DB-unreachable → log degraded, retry, don't crash. The
+supervisor opens via `connect_with_retry` and adds a **reconnect grace window**
+(`GraceTracker`/`supervised_sweep`, `SUPERVISOR_RECONNECT_GRACE_S` default 60s) so
+after an outage it waits for live workers to re-heartbeat before re-kicking —
+avoiding a thundering-herd re-kick of every task whose heartbeat froze during the
+outage. Remote access (`infra/postgres/` + `docker-compose.yml`): env-driven
+`pg_hba` allowlist (`PG_ALLOWED_HOSTS`, scram-sha-256, renderer refuses
+`trust`/`0.0.0.0/0`), fixed internal subnet, LAN-not-internet port bind
+(`PG_BIND_IP` default `127.0.0.1`), optional TLS documented. Docs:
+[ADR-0017](decisions/0017-db-resilience-and-remote-access.md) +
+[`docs/db-operations.md`](db-operations.md). Evidence:
+`DATABASE_URL=… pytest runtime/tests/ spokesman/tests/` = **411 passed, 0 skips**
+(16 new keyless resilience/allowlist tests); `python -m runtime.demo` exits 0
+(four acts green); outage path shows clean degrade (dead DSN → `DBUnavailable`,
+supervisor loop survives, no crash/hang).
+
 ## Latest (branch `runtime/task-lifecycle`, ADR-0015 — complete, awaiting merge)
 
 **Canonical task-lifecycle state machine.** Task state is now one canonical

@@ -1,0 +1,37 @@
+# AI Studio — PostgreSQL client authentication (pg_hba.conf) TEMPLATE
+# =============================================================================
+# Rendered by infra/postgres/render-pg-hba.sh, which expands the PG_ALLOWED_HOSTS
+# env allowlist into the marked section below and writes the final pg_hba.conf.
+#
+# SECURITY CONTRACT (docs/db-operations.md + ADR-0017):
+#   - Authentication is scram-sha-256 for ALL connections. NEVER `trust`.
+#   - Remote access is an ALLOWLIST of specific LAN hosts/CIDRs. NEVER 0.0.0.0/0
+#     (the renderer refuses an internet-wide CIDR outright).
+#   - The DB is bound to the LAN, not the internet: the host port publish binds to
+#     PG_BIND_IP (default 127.0.0.1) and the host firewall must also restrict the
+#     Postgres port to the same authorized hosts (defense in depth).
+#
+# Column order:  TYPE  DATABASE  USER  ADDRESS  METHOD
+
+# --- Local unix socket (container-internal maintenance / pg_isready) ---------
+local   all             all                             scram-sha-256
+
+# --- Loopback ----------------------------------------------------------------
+host    all             all             127.0.0.1/32    scram-sha-256
+host    all             all             ::1/128         scram-sha-256
+
+# --- Compose internal network (app / supervisor / scheduler + host tools) ----
+# Matches the fixed docker-compose network subnet (172.28.0.0/16). Host tools
+# (migrate/demo/psql) reach Postgres through the published port, whose packets are
+# SNAT'd to the bridge gateway inside this subnet — so THIS rule (not a loopback
+# rule) is what lets the local app connect. It is a PRIVATE range and external
+# exposure is barred by the host port binding + firewall, not by opening pg_hba.
+host    all             all             172.28.0.0/16   scram-sha-256
+
+# --- Authorized remote LAN hosts (ALLOWLIST — the ONLY external access) -------
+# Expanded from PG_ALLOWED_HOSTS by render-pg-hba.sh. Each entry becomes:
+#     host  <POSTGRES_DB>  <POSTGRES_USER>  <CIDR>  scram-sha-256
+# Empty allowlist => no remote access (local/internal only) — the safe default.
+# To add a host: put its /32 (or the subnet's CIDR) in PG_ALLOWED_HOSTS. NEVER
+# add 0.0.0.0/0 — that is the internet, and the renderer rejects it.
+# @PG_ALLOWED_HOSTS@
