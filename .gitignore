@@ -12,6 +12,11 @@ secrets.env
 config.local.*
 .ai_studio/
 
+# Real policy rules live locally; only runtime/policy.example.yaml is committed
+# (rules-as-data; a real deployment may grant broader capabilities — ADR-0011).
+runtime/policy.yaml
+runtime/policy.local.yaml
+
 # Runtime inbound messages captured by the Spokesman may contain personal info
 # (sender numbers, message bodies) — keep them out of git (ADR-0011).
 state/inbox/whatsapp-inbound.jsonl

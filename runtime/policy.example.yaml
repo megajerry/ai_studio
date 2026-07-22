@@ -1,0 +1,59 @@
+# AI Studio — policy rules (EXAMPLE / documented default).
+#
+# Rules are DATA, not code (architecture §5). The policy engine
+# (runtime/policy.py) reads this file to answer, for each tool call:
+#   Can Read? Can Write? Need Approval? Need Budget?
+#
+# Resolution order (runtime.policy.resolve_policy_path):
+#   1. $AI_STUDIO_POLICY_FILE (explicit path)
+#   2. runtime/policy.yaml      (real, git-ignored local policy)
+#   3. runtime/policy.example.yaml  (this file — committed fallback)
+#
+# Copy this to runtime/policy.yaml and edit for a real deployment. This file
+# contains NO secrets or personal info and is safe to commit (ADR-0011).
+
+# --- roles → granted capabilities (least privilege) -------------------------
+# A role may only use capabilities it is granted here; anything else is DENIED
+# by the engine before tier/budget are even considered. Grant the minimum.
+#
+# Capability vocabulary (runtime/capabilities.py):
+#   fs.read  fs.write  fs.delete  shell.exec  git.write
+#   net.fetch  secret.use  spend.money  deploy
+roles:
+  # Reads and searches only — the architecture §5 "Research role" example.
+  researcher:
+    - fs.read
+    - net.fetch
+
+  # Writes code + commits; cannot delete or deploy.
+  builder:
+    - fs.read
+    - fs.write
+    - git.write
+
+  # Reviewer inspects only.
+  reviewer:
+    - fs.read
+
+  # Deploy role — the architecture §5 example: git + deploy + shell, no more.
+  # (deploy / shell.exec are 🔴, so calls still require human approval.)
+  deployer:
+    - fs.read
+    - fs.write
+    - git.write
+    - deploy
+    - shell.exec
+
+  # Uses external paid/authenticated services (secret read from env by the tool,
+  # never handed to the agent). spend.money is 🔴 → approval-gated.
+  operator:
+    - fs.read
+    - net.fetch
+    - secret.use
+    - spend.money
+
+# --- tier overrides (optional) ----------------------------------------------
+# Override the built-in capability→tier map (runtime/capabilities.py) as data.
+# Example (commented): treat network fetches as 🟡 (logged) instead of 🟢.
+tier_overrides: {}
+  # net.fetch: yellow
