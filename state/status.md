@@ -31,6 +31,34 @@ _Last updated: 2026-07-22 (remote session)_
   `tool.invoked` / `approval.requested`; 🔴 never auto-executes. Host TODO: run
   `pytest runtime/tests/` and exercise `DbEventSink` against a live Postgres so
   the emitted events land in the M1 log.
+- **M2 runtime approval mechanism — implemented + VERIFIED on a live Postgres** on
+  `runtime/approvals` (see [`runtime/approvals.md`](../runtime/approvals.md)). The
+  human-in-the-loop grant loop that lets a 🔴 (NEEDS_APPROVAL) action actually
+  proceed after a human approves — the runtime half of ADR-0006's 🛑 "Approve
+  (blocks)" (Spokesman/WhatsApp wiring is a **separate later task**). `runtime/approvals.py`:
+  `request_approval` (durable `pending` row, **idempotent per `request_fingerprint`**
+  = stable hash of `task_id`+tool+sorted-caps), `resolve_approval`
+  (approve/deny, guarded to `pending`), `find_grant` / `consume_grant`
+  (**one-shot**: a grant authorizes exactly ONE execution), `pending_approvals` /
+  `pending_digest` (read side for the future Spokesman), plus `compute_fingerprint`
+  (pure). `enforce.invoke` gains an opt-in `conn`: on NEEDS_APPROVAL it checks
+  `find_grant` FIRST — grant → execute + `consume_grant` + `tool.invoked`
+  (noting `approval_id`); no grant → persist `pending` + PEND. The no-`conn` path
+  is unchanged (ephemeral pend, DB-free unit tests). `worker.py` parks a PENDING
+  work task as `blocked` (approval_id in `result`) and STOPS; `resume_approved`
+  (hooked into the run loop) re-queues a task once its approval is `approved`
+  (emit `approval.resumed`) and **fails** it on `denied`; task helpers
+  `block_task` / `requeue_blocked_task` / `find_blocked_tasks` in `tasks.py`;
+  migration `0007_approvals.sql` (forward-only, idempotent, indexed on `status` +
+  `request_fingerprint`). A 🔴 action cannot execute without an explicit
+  human-approved, un-consumed grant matching its fingerprint — no auto-approve, no
+  bypass of the policy gate; `approval.*` events carry ids/role/tool/tier/reason
+  only (never arg values or secrets). **Verified live: `python -m runtime.migrate`
+  applied 0007 (idempotent); `pytest runtime/tests/` = 247 passed, 0 skips with
+  `DATABASE_URL` set** (13 approval tests: pure fingerprint + full-DB
+  block→approve→resume→execute→consume→done, deny→fail-no-execution, one-shot
+  re-pend, idempotent request, no-secret events); **`python -m runtime.demo` still
+  green** (operate + learn).
 - **M3a — supervisor + scheduler: implemented** on `runtime/supervisor` (see
   [`runtime/supervisor.md`](../runtime/supervisor.md)). The non-agent liveness
   layer (ADR-0004): `sweep` re-kicks in-progress tasks with a stale heartbeat

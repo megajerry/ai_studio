@@ -210,6 +210,91 @@ def complete_task(
     return task
 
 
+def block_task(
+    conn: psycopg.Connection,
+    task_id: UUID,
+    *,
+    approval_id: UUID,
+    reason: str = "",
+) -> Optional[Task]:
+    """Park an ``in_progress`` task as ``blocked`` on a pending 🔴 approval.
+
+    Stores ``approval_id`` in ``result`` so :func:`runtime.worker.resume_approved`
+    can match the task to its approval once a human resolves it. Guarded to
+    ``in_progress`` (like :func:`heartbeat`) so a task that changed state is left
+    untouched (returns ``None``).
+
+    Emits **no** event by design: the ``approval.requested`` event (from
+    :func:`runtime.enforce.invoke`) already records this block with the same
+    ``task_id``, and ``blocked`` is a transient wait state — not a terminal
+    verify→commit transition — so re-logging it would only bloat the log (ADR-0013).
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE tasks
+                SET status = 'blocked',
+                    result = %s,
+                    updated_at = now()
+                WHERE id = %s AND status = 'in_progress'
+                RETURNING {_TASK_COLUMNS}
+                """,
+                (
+                    Jsonb({"blocked_on_approval": str(approval_id), "reason": reason}),
+                    task_id,
+                ),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return Task.model_validate(row)
+
+
+def requeue_blocked_task(conn: psycopg.Connection, task_id: UUID) -> Optional[Task]:
+    """Re-queue a ``blocked`` task once its approval is granted; guarded to ``blocked``.
+
+    Clears the claim and heartbeat so a fresh worker re-claims it and re-runs the
+    action — on that retry :func:`runtime.enforce.invoke` finds the live grant and
+    executes. Emits no event here; the caller (:func:`runtime.worker.resume_approved`)
+    emits ``approval.resumed`` with the grant context.
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE tasks
+                SET status = 'queued',
+                    claimed_by = NULL,
+                    heartbeat_at = NULL,
+                    updated_at = now()
+                WHERE id = %s AND status = 'blocked'
+                RETURNING {_TASK_COLUMNS}
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return Task.model_validate(row)
+
+
+def find_blocked_tasks(conn: psycopg.Connection) -> list[Task]:
+    """Return all tasks currently parked ``blocked`` on an approval (oldest first).
+
+    :func:`runtime.worker.resume_approved` scans these to advance any whose
+    approval a human has now resolved (grant → re-queue, deny → fail).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_TASK_COLUMNS} FROM tasks WHERE status = 'blocked' ORDER BY created_at ASC"
+        )
+        rows = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+    return [Task.model_validate(r) for r in rows]
+
+
 def add_spent_tokens(
     conn: psycopg.Connection, task_id: UUID, tokens: int
 ) -> Optional[Task]:

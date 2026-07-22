@@ -10,9 +10,12 @@ makes those true together:
 4. Branch on the decision:
    - **ALLOW** → emit ``tool.invoked`` and run the tool (🟡 is logged by these
      very events).
-   - **NEEDS_APPROVAL** (🔴 / over-budget) → emit ``approval.requested`` + return
-     a PENDING result **without executing**. The Spokesman/stakeholder loop
-     (ADR-0006) resolves it later; this path never auto-approves.
+   - **NEEDS_APPROVAL** (🔴 / over-budget) → with a ``conn``, first look for a
+     live one-shot **grant** (:mod:`runtime.approvals`): a human-approved grant
+     turns this into an ALLOW (execute once, then consume the grant); otherwise
+     persist a ``pending`` approval and return PENDING **without executing**.
+     With no ``conn`` it pends ephemerally. This path NEVER auto-approves — only
+     an explicit human-resolved grant lets a 🔴 action run (ADR-0006).
    - **DENY** → return a DENIED result without executing.
 
 **Agents must only ever call `invoke`, never a tool's `execute` directly.** The
@@ -32,6 +35,14 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
+from .approvals import (
+    EVENT_APPROVAL_REQUESTED,
+    EVENT_APPROVAL_RESOLVED,
+    compute_fingerprint,
+    consume_grant,
+    find_grant,
+    request_approval,
+)
 from .capabilities import ActionTier
 from .models import EventIn, make_event
 from .policy import Decision, Effect, PolicyConfig, PolicyRequest, decide, load_policy
@@ -40,10 +51,10 @@ from .tools.base import ToolResult
 
 # Canonical event types this layer emits. The events table's `type` column is
 # free-form text (see runtime/README.md), so M2 defines its own alongside M1's
-# task.* types without changing the merged schema.
+# task.* types without changing the merged schema. The approval.* wires are owned
+# by :mod:`runtime.approvals` and re-exported here for a single import surface.
 EVENT_POLICY_DECISION = "policy.decision"
 EVENT_TOOL_INVOKED = "tool.invoked"
-EVENT_APPROVAL_REQUESTED = "approval.requested"
 
 
 # --- Event sinks ------------------------------------------------------------
@@ -131,6 +142,7 @@ def invoke(
     registry: ToolRegistry,
     config: Optional[PolicyConfig] = None,
     events: Optional[EventSink] = None,
+    conn: Any = None,
     workstream: str = "productivity",
     budget=None,
     task_id: Optional[UUID] = None,
@@ -144,6 +156,12 @@ def invoke(
     the tools, ``config`` the policy rules (loaded from the resolved policy file
     if omitted), and ``events`` the sink (defaults to :class:`NullEventSink`;
     production should pass a :class:`DbEventSink`).
+
+    ``conn`` opts the call into the **persisted approval loop** (:mod:`runtime.approvals`):
+    on a NEEDS_APPROVAL decision, an existing one-shot grant lets the call execute
+    (and the grant is consumed); otherwise a durable ``pending`` approval is
+    created and the call PENDs. With ``conn=None`` the call behaves as before —
+    it pends ephemerally with no persistence, keeping pure unit tests DB-free.
     """
     if config is None:
         config = load_policy()
@@ -177,6 +195,39 @@ def invoke(
         return InvokeResult(status=InvokeStatus.DENIED, decision=decision, tool=tool_name)
 
     if decision.effect is Effect.NEEDS_APPROVAL:
+        # A live grant (find_grant) turns 🔴 into a one-shot ALLOW; else PEND.
+        if conn is not None:
+            fingerprint = compute_fingerprint(
+                task_id, tool_name, sorted(c.value for c in required)
+            )
+            grant = find_grant(conn, fingerprint)
+            if grant is not None and consume_grant(conn, grant.id) is not None:
+                # One grant = one execution. Execute, noting which grant authorized it.
+                return _execute(
+                    tool, tool_name, role, decision, events, workstream,
+                    task_id, trace_id, span_id, kwargs, approval_id=grant.id,
+                )
+            # No grant (or lost the race for it) → persist a pending request.
+            approval = request_approval(
+                conn,
+                task_id=task_id,
+                role=role,
+                tool=tool_name,
+                capabilities=sorted(c.value for c in required),
+                tier=decision.tier.value,
+                reason=decision.reason,
+                sink=events,
+                workstream=workstream,
+                fingerprint=fingerprint,
+            )
+            return InvokeResult(
+                status=InvokeStatus.PENDING,
+                decision=decision,
+                tool=tool_name,
+                approval_id=approval.id,
+            )
+
+        # No-conn path (pure/unit): pend ephemerally, no persistence (as before).
         approval_id = uuid4()
         events.emit(
             make_event(
@@ -201,6 +252,35 @@ def invoke(
         )
 
     # ALLOW (🟢 or 🟡). Record the invocation, then run the tool.
+    return _execute(
+        tool, tool_name, role, decision, events, workstream,
+        task_id, trace_id, span_id, kwargs,
+    )
+
+
+def _execute(
+    tool: Any,
+    tool_name: str,
+    role: str,
+    decision: Decision,
+    events: EventSink,
+    workstream: str,
+    task_id: Optional[UUID],
+    trace_id: Optional[str],
+    span_id: Optional[str],
+    kwargs: dict,
+    approval_id: Optional[UUID] = None,
+) -> InvokeResult:
+    """Emit ``tool.invoked`` then run the tool. ``approval_id`` is set only when a
+    🔴 grant authorized this run (one grant = one execution)."""
+    payload = {
+        "tool": tool_name,
+        "role": role,
+        "tier": decision.tier.value,
+        "arg_keys": _arg_keys(kwargs),
+    }
+    if approval_id is not None:
+        payload["approval_id"] = str(approval_id)
     events.emit(
         make_event(
             workstream=workstream,
@@ -208,17 +288,16 @@ def invoke(
             task_id=task_id,
             trace_id=trace_id,
             span_id=span_id,
-            payload={
-                "tool": tool_name,
-                "role": role,
-                "tier": decision.tier.value,
-                "arg_keys": _arg_keys(kwargs),
-            },
+            payload=payload,
         )
     )
     result = tool.execute(**kwargs)
     return InvokeResult(
-        status=InvokeStatus.EXECUTED, decision=decision, tool=tool_name, result=result
+        status=InvokeStatus.EXECUTED,
+        decision=decision,
+        tool=tool_name,
+        result=result,
+        approval_id=approval_id,
     )
 
 

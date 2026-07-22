@@ -19,6 +19,7 @@ role's.
 from __future__ import annotations
 
 from typing import Any, Optional
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -49,6 +50,9 @@ class ExecutorResult(BaseModel):
     marker: Optional[str] = None
     #: Outcome of the policy-gated tool call ("executed" | "denied" | "pending").
     invoke_status: str = InvokeStatus.DENIED.value
+    #: Set when the tool call PENDs on a 🔴 approval — the worker parks the task
+    #: `blocked` on this approval id until it is resolved (runtime/approvals.py).
+    approval_id: Optional[UUID] = None
     note: str = ""
 
 
@@ -103,6 +107,7 @@ def run_executor(
         registry=registry,
         config=config,
         events=sink,
+        conn=conn,  # opt into the persisted approval loop (find grant / pend)
         workstream=task.workstream,
         task_id=task.id,
         op="write",
@@ -118,6 +123,7 @@ def run_executor(
         artifact_path=artifact_path if wrote else None,
         marker=marker,
         invoke_status=result.status.value,
+        approval_id=result.approval_id if result.status is InvokeStatus.PENDING else None,
         note=("wrote artifact" if wrote else f"tool call not executed: {result.status.value}"),
     )
 
