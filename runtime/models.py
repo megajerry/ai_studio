@@ -71,6 +71,11 @@ class Event(BaseModel):
 
     id: UUID
     ts: datetime
+    # Monotonic append-order key assigned by the DB (migration 0004). This, not
+    # ``ts``, is the canonical replay order — ``ts`` is the transaction start
+    # time and is identical for events appended in one transaction. Optional so
+    # unit-constructed events (no DB round-trip) remain valid.
+    seq: Optional[int] = None
     task_id: Optional[UUID] = None
     workstream: str
     type: str

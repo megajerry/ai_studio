@@ -15,7 +15,7 @@ from psycopg.types.json import Jsonb
 
 from .models import Event, EventIn, make_event
 
-_EVENT_COLUMNS = "id, ts, task_id, workstream, type, payload, trace_id, span_id"
+_EVENT_COLUMNS = "id, ts, seq, task_id, workstream, type, payload, trace_id, span_id"
 
 
 def append_event(conn: psycopg.Connection, event: EventIn) -> Event:
@@ -54,9 +54,13 @@ def read_events(
     since: Optional[datetime] = None,
     limit: Optional[int] = None,
 ) -> list[Event]:
-    """Read events in chronological order, optionally filtered.
+    """Read events in true append order, optionally filtered.
 
-    Filters compose (AND). ``since`` is exclusive on ``ts``.
+    Ordering is by ``seq`` (a monotonic identity assigned at insert), not ``ts``:
+    ``ts`` defaults to the transaction start time, so events appended within one
+    transaction share a timestamp and cannot be ordered by it. Filters compose
+    (AND). ``since`` is exclusive on ``ts`` (a time-window filter); ``seq`` still
+    dictates order.
     """
     clauses: list[str] = []
     params: list[object] = []
@@ -78,7 +82,7 @@ def read_events(
 
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT {_EVENT_COLUMNS} FROM events {where} ORDER BY ts, id {limit_sql}",
+            f"SELECT {_EVENT_COLUMNS} FROM events {where} ORDER BY seq ASC {limit_sql}",
             params,
         )
         rows = cur.fetchall()
