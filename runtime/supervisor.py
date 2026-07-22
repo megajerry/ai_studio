@@ -3,9 +3,9 @@
 A dumb, always-on, **non-LLM** loop whose only job is *"no task is ever silently
 dropped."* It scans for in-progress tasks whose heartbeat has gone stale (a
 worker that crashed / hallucinated / ran out of budget before finishing) and
-**re-kicks** them: reset to ``queued``, clear the claim, bump a retry counter,
-emit ``task.rekicked``. Once a task exhausts its retries it is force-failed
-(``task.failed_exhausted``) rather than churning forever.
+**re-kicks** them: reset to ``up_for_grabs``, clear the claim, bump a retry
+counter, emit ``task.rekicked``. Once a task exhausts its retries it is
+force-abandoned (``task.failed_exhausted``) rather than churning forever.
 
 There are **no model calls here** — this layer exists precisely to provide the
 reliability an agent cannot provide for itself (the crash-before-checkpoint gap).
@@ -85,7 +85,7 @@ def _default_fail_exhausted(
         failed = complete_task(
             conn,
             task.id,
-            status=TaskStatus.FAILED,
+            status=TaskStatus.ABANDONED,
             result={
                 "reason": "max_retries_exhausted",
                 "retries": task.retries,
@@ -100,7 +100,7 @@ def _default_fail_exhausted(
                     type=EventType.TASK_FAILED_EXHAUSTED.value,
                     task_id=task.id,
                     payload={
-                        "status": TaskStatus.FAILED.value,
+                        "status": TaskStatus.ABANDONED.value,
                         "retries": task.retries,
                         "max_retries": max_retries,
                     },

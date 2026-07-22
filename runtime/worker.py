@@ -7,12 +7,13 @@ turns the Verifier's verdict into the terminal state — enforcing verify→comm
 (architecture §4, CLAUDE.md invariant 4): a work task is never ``done`` until the
 Verifier passes.
 
-Dispatch:
+Dispatch (all state changes via the canonical guarded ``transition``, ADR-0015):
 
-- ``pm.tick`` → :func:`runtime.roles.pm.run_pm_tick` (plan + enqueue work), commit.
-- ``work.*``  → :func:`runtime.roles.executor.run_executor` then
-  :func:`runtime.roles.verifier.verify`; on pass → ``complete_task(done)``; on
-  fail → a **bounded** re-enqueue (nudge) or ``complete_task(failed)``.
+- ``pm.tick`` → :func:`runtime.roles.pm.run_pm_tick` (plan + enqueue work), merge.
+- ``work.*``  → the unified dev/review loop: submit (``in_progress →
+  ready_for_review``) → :func:`runtime.roles.verifier.verify` as the automated
+  reviewer; on pass → ``approved → merged``; on fail → ``reviewer_blocked`` then a
+  **bounded** retry (``→ in_progress``) or ``→ abandoned``.
 
 All coordination is through the merged M1 queue + event log; all tools go through
 the M2 policy gate (inside the roles); all model calls go through M3b
@@ -69,6 +70,7 @@ from .tasks import (
     find_blocked_tasks,
     heartbeat,
     requeue_blocked_task,
+    transition,
 )
 from .tools import FilesystemTool, ShellTool, ToolRegistry
 
@@ -115,6 +117,7 @@ Heartbeater = Callable[..., Optional[Task]]
 Completer = Callable[..., Optional[Task]]
 Enqueuer = Callable[..., Task]
 Blocker = Callable[..., Optional[Task]]
+Transitioner = Callable[..., Optional[Task]]
 
 
 class RunResult(BaseModel):
@@ -124,7 +127,7 @@ class RunResult(BaseModel):
     task_type: str
     #: "pm" | "work" | "retro" | "review" | "research" | "unknown"
     kind: str
-    #: "done" | "retry" | "failed" | "blocked"
+    #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
     detail: str = ""
 
@@ -154,7 +157,7 @@ def _handle_pm_tick(
 ) -> RunResult:
     plan = run_pm(conn, task, sink, registry=model_registry, skills=skills, enqueue=enqueue)
     heartbeat(conn, task.id, worker_id)
-    complete(conn, task.id, result=plan.model_dump(), status=TaskStatus.DONE)
+    complete(conn, task.id, result=plan.model_dump(), status=TaskStatus.MERGED)
     if plan.decision == "planned":
         detail = f"decomposed into {plan.work_item_count} work item(s): {plan.work_task_ids}"
     elif plan.decision == "pushback":
@@ -311,7 +314,7 @@ def _handle_work(
     config: Optional[PolicyConfig],
     model_registry,
     heartbeat: Heartbeater,
-    complete: Completer,
+    transition: Transitioner,
     enqueue: Enqueuer,
     block: Blocker,
     worker_id: str,
@@ -322,102 +325,111 @@ def _handle_work(
     retro_mode: str = DEFAULT_RETRO_MODE,
     review_mode: str = DEFAULT_REVIEW_MODE,
 ) -> RunResult:
-    # Heartbeat around each phase — liveness while the role does the work.
-    heartbeat(conn, task.id, worker_id)
-    exec_result = run_exec(
-        conn, task, sink, registry=registry, config=config, model_registry=model_registry
-    )
+    """Drive one ``work.*`` task through the unified dev/review lifecycle.
 
-    # 🔴 human-in-the-loop: the Executor's tool call PENDed on an approval. Park the
-    # task `blocked` on that approval and STOP — do NOT verify or complete. invoke
-    # already emitted approval.requested; resume_approved re-queues it once granted.
-    if exec_result.invoke_status == InvokeStatus.PENDING.value:
-        block(conn, task.id, approval_id=exec_result.approval_id,
-              reason="awaiting 🔴 approval")
-        return RunResult(
-            task_id=str(task.id), task_type=task.type, kind="work",
-            outcome="blocked",
-            detail=f"blocked on approval {exec_result.approval_id}",
+    The task arrives ``in_progress`` (claim did grab→start). This drives it, in one
+    pass, through: Executor → submit (``in_progress → ready_for_review``) → the
+    **Verifier as automated reviewer** → pass (``ready_for_review → approved →
+    merged``) or fail (``ready_for_review → reviewer_blocked``; retry
+    ``→ in_progress`` while attempts remain, else ``→ abandoned``). A 🔴 approval
+    pend parks it ``blocked`` (resumed later). Every hop is a guarded transition
+    (telemetry + ``task.transition`` event).
+    """
+    exec_result = None
+    verdict = None
+    for attempt in range(1, max_attempts + 1):
+        # Heartbeat around each phase — liveness while the role does the work.
+        heartbeat(conn, task.id, worker_id)
+        exec_result = run_exec(
+            conn, task, sink, registry=registry, config=config, model_registry=model_registry
         )
 
-    heartbeat(conn, task.id, worker_id)
-    # The Verifier gets the skill registry too, so its prompt carries the
-    # `rigorous-review` (evidence-over-claims) doctrine (ADR-0014).
-    verdict = run_verify(
-        conn, task, exec_result, sink,
-        registry=registry, config=config, model_registry=model_registry,
-        skills=skills,
-    )
-    heartbeat(conn, task.id, worker_id)
+        # 🔴 human-in-the-loop: the Executor's tool call PENDed on an approval. Park
+        # the task `blocked` on that approval and STOP — do NOT review or merge.
+        # invoke already emitted approval.requested; resume_approved re-queues it.
+        if exec_result.invoke_status == InvokeStatus.PENDING.value:
+            block(conn, task.id, approval_id=exec_result.approval_id,
+                  reason="awaiting 🔴 approval")
+            return RunResult(
+                task_id=str(task.id), task_type=task.type, kind="work",
+                outcome="blocked",
+                detail=f"blocked on approval {exec_result.approval_id}",
+            )
 
-    if verdict.passed:
-        # verify → commit: only now is the task done. Capture the finished row so
-        # the Reviewer sees fresh facts (accumulated spent_tokens / retries).
-        finished = complete(
-            conn, task.id,
-            result={"verified": True, "reason": verdict.reason,
-                    "artifact_path": exec_result.artifact_path},
-            status=TaskStatus.DONE,
+        heartbeat(conn, task.id, worker_id)
+        # Submit the produced artifact for review.
+        transition(conn, task.id, TaskStatus.READY_FOR_REVIEW,
+                   agent_id=worker_id, agent_type="executor",
+                   result={"artifact_path": exec_result.artifact_path, "attempt": attempt})
+
+        # The Verifier is the automated reviewer (evidence-over-claims, ADR-0014).
+        verdict = run_verify(
+            conn, task, exec_result, sink,
+            registry=registry, config=config, model_registry=model_registry,
+            skills=skills,
+        )
+        heartbeat(conn, task.id, worker_id)
+
+        if verdict.passed:
+            # review pass → approved → merged (verify→commit: only now is it merged).
+            transition(conn, task.id, TaskStatus.APPROVED,
+                       agent_id=worker_id, agent_type="verifier",
+                       result={"verified": True, "reason": verdict.reason})
+            finished = transition(
+                conn, task.id, TaskStatus.MERGED,
+                agent_id=worker_id, agent_type="verifier",
+                result={"verified": True, "reason": verdict.reason,
+                        "artifact_path": exec_result.artifact_path},
+            ) or task
+            _maybe_enqueue_retro(
+                conn, task, sink, enqueue=enqueue,
+                outcome="done", detail=verdict.reason, retro_mode=retro_mode,
+            )
+            _maybe_enqueue_review(
+                conn, finished, sink, enqueue=enqueue,
+                outcome="done", exec_result=exec_result, review_mode=review_mode,
+            )
+            return RunResult(
+                task_id=str(task.id), task_type=task.type, kind="work",
+                outcome="done", detail=verdict.reason,
+            )
+
+        # review fail → reviewer_blocked. Retry (→ in_progress) if attempts remain.
+        transition(conn, task.id, TaskStatus.REVIEWER_BLOCKED,
+                   agent_id=worker_id, agent_type="verifier",
+                   result={"verified": False, "reason": verdict.reason, "attempt": attempt})
+        if attempt < max_attempts:
+            transition(conn, task.id, TaskStatus.IN_PROGRESS,
+                       agent_id=worker_id, agent_type="executor")
+            sink.emit(
+                make_event(
+                    workstream=task.workstream,
+                    type=EVENT_WORK_RETRY,
+                    task_id=task.id,
+                    payload={"attempt": attempt, "reason": verdict.reason},
+                )
+            )
+            continue
+
+        # Exhausted → abandoned.
+        detail = f"verify failed after {attempt} attempt(s): {verdict.reason}"
+        finished = transition(
+            conn, task.id, TaskStatus.ABANDONED,
+            agent_id=worker_id, agent_type="verifier",
+            result={"verified": False, "reason": verdict.reason, "attempt": attempt},
         ) or task
-        # Terminal (done): fire a retro per policy (default on_fail → skip on done),
-        # then the independent Reviewer/Whistle-blower per its policy (on_risk → a
-        # clean done is skipped). Retro is enqueued first so it is claimed first.
         _maybe_enqueue_retro(
             conn, task, sink, enqueue=enqueue,
-            outcome="done", detail=verdict.reason, retro_mode=retro_mode,
+            outcome="failed", detail=detail, retro_mode=retro_mode,
         )
         _maybe_enqueue_review(
             conn, finished, sink, enqueue=enqueue,
-            outcome="done", exec_result=exec_result, review_mode=review_mode,
+            outcome="failed", exec_result=exec_result, review_mode=review_mode,
         )
         return RunResult(
             task_id=str(task.id), task_type=task.type, kind="work",
-            outcome="done", detail=verdict.reason,
+            outcome="failed", detail=detail,
         )
-
-    # Verify failed — bounded re-enqueue (nudge) or fail.
-    attempt = int((task.payload or {}).get("attempt", 1))
-    finished = complete(
-        conn, task.id,
-        result={"verified": False, "reason": verdict.reason, "attempt": attempt},
-        status=TaskStatus.FAILED,
-    ) or task
-    if attempt < max_attempts:
-        retry = enqueue(
-            conn,
-            workstream=task.workstream,
-            type=task.type,
-            payload={**(task.payload or {}), "attempt": attempt + 1, "nudge": verdict.reason},
-            priority=task.priority,
-        )
-        sink.emit(
-            make_event(
-                workstream=task.workstream,
-                type=EVENT_WORK_RETRY,
-                task_id=task.id,
-                payload={"attempt": attempt, "retry_task_id": str(retry.id),
-                         "reason": verdict.reason},
-            )
-        )
-        return RunResult(
-            task_id=str(task.id), task_type=task.type, kind="work",
-            outcome="retry", detail=f"re-enqueued as {retry.id} (attempt {attempt + 1})",
-        )
-    # Terminal (failed after exhausting retries): fire a retro per policy so the
-    # studio learns from the failure (on_fail + always both trigger here).
-    detail = f"verify failed after {attempt} attempt(s): {verdict.reason}"
-    _maybe_enqueue_retro(
-        conn, task, sink, enqueue=enqueue,
-        outcome="failed", detail=detail, retro_mode=retro_mode,
-    )
-    _maybe_enqueue_review(
-        conn, finished, sink, enqueue=enqueue,
-        outcome="failed", exec_result=exec_result, review_mode=review_mode,
-    )
-    return RunResult(
-        task_id=str(task.id), task_type=task.type, kind="work",
-        outcome="failed", detail=detail,
-    )
 
 
 def _handle_retro(
@@ -439,7 +451,7 @@ def _handle_retro(
     heartbeat(conn, task.id, worker_id)
     result = run_retro(conn, task, sink, model_registry=model_registry)
     heartbeat(conn, task.id, worker_id)
-    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.DONE)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
     return RunResult(
         task_id=str(task.id), task_type=task.type, kind="retro",
         outcome="done", detail=f"distilled {result.lessons_count} lesson(s)",
@@ -472,7 +484,7 @@ def _handle_research(
         model_registry=model_registry, tool_registry=registry, policy=config,
     )
     heartbeat(conn, task.id, worker_id)
-    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.DONE)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
     return RunResult(
         task_id=str(task.id), task_type=task.type, kind="research",
         outcome="done",
@@ -508,7 +520,7 @@ def _handle_review(
         registry=registry, config=config, model_registry=model_registry, skills=skills,
     )
     heartbeat(conn, task.id, worker_id)
-    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.DONE)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
     detail = (
         f"clean (severity=none)" if result.ok
         else f"flagged severity={result.severity}, {len(result.reasons)} signal(s)"
@@ -537,6 +549,7 @@ def run_once(
     claim: Claimer = claim_task,
     heartbeat: Heartbeater = heartbeat,
     complete: Completer = complete_task,
+    transition: Transitioner = transition,
     enqueue: Enqueuer = enqueue_task,
     block: Blocker = block_task,
     run_pm: Callable[..., Any] = run_pm_tick,
@@ -605,7 +618,7 @@ def run_once(
         return _handle_work(
             conn, task, sink,
             registry=registry, config=config, model_registry=model_registry,
-            heartbeat=heartbeat, complete=complete, enqueue=enqueue, block=block,
+            heartbeat=heartbeat, transition=transition, enqueue=enqueue, block=block,
             worker_id=worker_id, max_attempts=max_attempts,
             run_exec=run_exec, run_verify=run_verify, skills=skills,
             retro_mode=resolved_retro_mode, review_mode=resolved_review_mode,
@@ -615,7 +628,7 @@ def run_once(
     complete(
         conn, task.id,
         result={"error": f"no handler for task type {task.type!r}"},
-        status=TaskStatus.FAILED,
+        status=TaskStatus.ABANDONED,
     )
     return RunResult(
         task_id=str(task.id), task_type=task.type, kind="unknown",
@@ -680,7 +693,7 @@ def resume_approved(
                 conn, task.id,
                 result={"approved": False, "reason": approval.reason,
                         "blocked_on_approval": approval_id},
-                status=TaskStatus.FAILED, force=True,
+                status=TaskStatus.ABANDONED, force=True,
             )
             if failed is not None:
                 result.failed.append(str(task.id))

@@ -95,7 +95,7 @@ def test_read_events_since_filter(conn, ws):
 
 def test_enqueue_emits_created_event(conn, ws):
     t = enqueue_task(conn, workstream=ws, type="build", payload={"x": 1}, priority=5)
-    assert t.status is TaskStatus.QUEUED
+    assert t.status is TaskStatus.UP_FOR_GRABS
     events = read_events(conn, task_id=t.id)
     assert [e.type for e in events] == ["task.created"]
 
@@ -109,8 +109,13 @@ def test_claim_picks_highest_priority(conn, ws):
     assert claimed.status is TaskStatus.IN_PROGRESS
     assert claimed.claimed_by == "w1"
     assert claimed.heartbeat_at is not None
+    # claim = grab (up_for_grabs→claimed) + start (claimed→in_progress): two
+    # guarded transitions, each a task.transition event (ADR-0015).
     types = [e.type for e in read_events(conn, task_id=hi.id)]
-    assert types == ["task.created", "task.claimed"]
+    assert types == ["task.created", "task.transition", "task.transition"]
+    tos = [e.payload.get("to") for e in read_events(conn, task_id=hi.id)
+           if e.type == "task.transition"]
+    assert tos == ["claimed", "in_progress"]
 
 
 def test_claim_respects_assignee_targeting(conn, ws):
@@ -139,9 +144,10 @@ def test_heartbeat_emits_no_event(conn, ws):
     claim_task(conn, worker_id="w1", workstream=ws)
     heartbeat(conn, t.id, "w1")
     heartbeat(conn, t.id, "w1")
-    # High-frequency liveness must not bloat the append-only log (ADR-0013).
+    # High-frequency liveness must not bloat the append-only log (ADR-0013):
+    # only the created + claim transitions are logged, never a heartbeat.
     types = [e.type for e in read_events(conn, task_id=t.id)]
-    assert types == ["task.created", "task.claimed"]
+    assert types == ["task.created", "task.transition", "task.transition"]
     assert "task.heartbeat" not in types
 
 
@@ -149,7 +155,7 @@ def test_complete_task_sets_result_and_event(conn, ws):
     t = enqueue_task(conn, workstream=ws, type="t")
     claim_task(conn, worker_id="w1", workstream=ws)
     done = complete_task(conn, t.id, result={"ok": True}, spent_tokens=42)
-    assert done.status is TaskStatus.DONE
+    assert done.status is TaskStatus.MERGED
     assert done.result == {"ok": True}
     assert done.spent_tokens == 42
     types = [e.type for e in read_events(conn, task_id=t.id)]
@@ -159,7 +165,7 @@ def test_complete_task_sets_result_and_event(conn, ws):
 def test_complete_rejects_non_terminal_status(conn, ws):
     t = enqueue_task(conn, workstream=ws, type="t")
     with pytest.raises(ValueError):
-        complete_task(conn, t.id, status=TaskStatus.QUEUED)
+        complete_task(conn, t.id, status=TaskStatus.UP_FOR_GRABS)
 
 
 def test_complete_guard_rejects_non_in_progress_task(conn, ws):
@@ -173,9 +179,9 @@ def test_complete_guard_rejects_non_in_progress_task(conn, ws):
 def test_complete_guard_blocks_double_finalize(conn, ws):
     t = enqueue_task(conn, workstream=ws, type="t")
     claim_task(conn, worker_id="w1", workstream=ws)
-    assert complete_task(conn, t.id, status=TaskStatus.DONE) is not None
+    assert complete_task(conn, t.id, status=TaskStatus.MERGED) is not None
     # Second finalize conflicts (already done) → None, no extra finished event.
-    assert complete_task(conn, t.id, status=TaskStatus.FAILED) is None
+    assert complete_task(conn, t.id, status=TaskStatus.ABANDONED) is None
     types = [e.type for e in read_events(conn, task_id=t.id)]
     assert types.count("task.finished") == 1
 
@@ -184,9 +190,9 @@ def test_complete_force_bypasses_guard(conn, ws):
     # Supervisor force-fails a stale/re-kicked (still queued) task.
     t = enqueue_task(conn, workstream=ws, type="t")
     done = complete_task(
-        conn, t.id, status=TaskStatus.FAILED, result={"reason": "stale"}, force=True
+        conn, t.id, status=TaskStatus.ABANDONED, result={"reason": "stale"}, force=True
     )
-    assert done is not None and done.status is TaskStatus.FAILED
+    assert done is not None and done.status is TaskStatus.ABANDONED
     assert done.result == {"reason": "stale"}
     types = [e.type for e in read_events(conn, task_id=t.id)]
     assert types[-1] == "task.finished"
@@ -229,7 +235,7 @@ def test_rekick_resets_task_and_emits_event(conn, ws):
     claim_task(conn, worker_id="w1", workstream=ws)
     kicked = rekick_task(conn, t.id)
     assert kicked is not None
-    assert kicked.status is TaskStatus.QUEUED
+    assert kicked.status is TaskStatus.UP_FOR_GRABS
     assert kicked.claimed_by is None
     assert kicked.heartbeat_at is None
     assert kicked.retries == 1
@@ -262,7 +268,7 @@ def test_sweep_rekicks_then_force_fails_at_max(conn, ws):
         cur.execute("SELECT status, retries FROM tasks WHERE id = %s", (t.id,))
         row = cur.fetchone()
     conn.commit()
-    assert row["status"] == "failed"
+    assert row["status"] == "abandoned"
     types = [e.type for e in read_events(conn, task_id=t.id)]
     # Both the re-kick and the exhausted-fail are traceable in the log; the fail
     # also emits task.finished (via complete_task). (task.finished and
@@ -286,8 +292,8 @@ def test_sweep_does_not_clobber_self_completed_task(conn, ws):
     stale_snapshot = claimed.model_copy(update={"retries": 5})
 
     # The worker self-completes just before the sweep acts on the snapshot.
-    done = complete_task(conn, t.id, status=TaskStatus.DONE, result={"ok": True})
-    assert done is not None and done.status is TaskStatus.DONE
+    done = complete_task(conn, t.id, status=TaskStatus.MERGED, result={"ok": True})
+    assert done is not None and done.status is TaskStatus.MERGED
 
     # Feed the pre-completion snapshot to the sweep (models the race precisely).
     res = sweep(conn, threshold_s=60, max_retries=5, find_stale=lambda c, s: [stale_snapshot])
@@ -298,7 +304,7 @@ def test_sweep_does_not_clobber_self_completed_task(conn, ws):
         cur.execute("SELECT status, result FROM tasks WHERE id = %s", (t.id,))
         row = cur.fetchone()
     conn.commit()
-    assert row["status"] == "done"
+    assert row["status"] == "merged"
     assert row["result"] == {"ok": True}
 
     # No spurious exhausted-fail event; the finish stays the last state change.
@@ -317,7 +323,7 @@ def test_tick_once_enqueues_then_skips(conn, ws):
     assert tick_once(conn, workstream=ws) is None
     # Finalize it; then a fresh tick is allowed again.
     claim_task(conn, worker_id="pm", workstream=ws)
-    complete_task(conn, first.id, status=TaskStatus.DONE)
+    complete_task(conn, first.id, status=TaskStatus.MERGED)
     assert tick_once(conn, workstream=ws) is not None
 
 

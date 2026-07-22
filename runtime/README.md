@@ -15,10 +15,11 @@ lives in `models.py` and is unit-tested with no database.
 
 | File | Purpose |
 | --- | --- |
-| `models.py` | Enums, pydantic row models, `build_database_url`, `make_event`, `is_stale` (pure) |
+| `models.py` | Enums (`TaskStatus`), pydantic row models, `build_database_url`, `make_event`, `is_stale` (pure) |
+| `task_state.py` | Canonical lifecycle states + `TRANSITIONS` + `can/assert_transition` + dependency-cycle guard (pure, DB-free) |
 | `db.py` | `connect()` / `can_connect()` (short-timeout probe) |
 | `events.py` | `append_event`, `read_events` (insert + read only) |
-| `tasks.py` | `enqueue_task`, `claim_task`, `heartbeat`, `complete_task`, `find_stale_tasks` |
+| `tasks.py` | `transition` (the one guard), `grab_task`/`claim_task`/`start_task`, `enqueue_task`, `heartbeat`, `complete_task`, `ready_tasks`/`waiting_tasks`/`list_for_review`, `task_lifecycle`/`task_cost`/rollups, `find_stale_tasks` |
 | `migrate.py` | Forward-only migration runner (`python -m runtime.migrate`) |
 | `migrations/*.sql` | Schema, applied in filename order |
 | `tests/` | `test_models.py` (no DB) + `test_integration_db.py` (skips w/o DB) |
@@ -47,15 +48,29 @@ data-access API only inserts and reads.
 | `id` | uuid pk | |
 | `workstream` | text | |
 | `type` | text | |
-| `status` | text | `queued \| in_progress \| blocked \| done \| failed` (CHECK) |
+| `status` | text | canonical lifecycle (CHECK): `up_for_grabs \| claimed \| in_progress \| blocked \| ready_for_review \| reviewer_blocked \| approved \| merged \| abandoned` — see [ADR-0015](../docs/decisions/0015-task-lifecycle-state-machine.md) |
 | `priority` | int | higher = more urgent |
 | `assignee` | text null | `host \| offhost` (CHECK); null = any worker (ADR-0010) |
 | `payload` | jsonb | enough state for a fresh agent to resume (ADR-0004) |
 | `result` | jsonb null | |
-| `heartbeat_at` | timestamptz null | liveness ping while `in_progress` |
-| `claimed_by` | text null | worker id holding the claim |
+| `heartbeat_at` | timestamptz null | liveness ping while `claimed`/`in_progress` |
+| `claimed_by` / `agent_type` / `claimed_at` | text / text / timestamptz | worker id + agent kind + grab time |
+| `depends_on` | uuid[] | prerequisite task ids; grabbable only when all are `merged` (ADR-0015) |
 | `budget_tokens` / `spent_tokens` | bigint | per-task cost cap + telemetry (ADR-0012) |
 | `created_at` / `updated_at` | timestamptz | |
+
+The lifecycle state machine (states + legal transitions) lives DB-free in
+`task_state.py`; every state change goes through the single guard
+`tasks.transition` (records a `task_transitions` telemetry row + a `task.transition`
+event). Grab work with `grab_task` (grab-by-sort, `FOR UPDATE SKIP LOCKED`,
+dependency-gated) or `claim_task` (= grab + start). See
+[`docs/task-lifecycle.md`](../docs/task-lifecycle.md).
+
+### `task_transitions` (append-only lifecycle telemetry)
+
+One row per guarded transition: `task_id`, `from_status`, `to_status`, `agent_id`,
+`agent_type`, `at`, `latency_ms` (since the task's previous transition). Query with
+`task_lifecycle` / `task_cost` / `agent_rollup` / `model_rollup` (ADR-0012/0015).
 
 Indexes: `(status, priority DESC, created_at)` for claiming; partial
 `(heartbeat_at) WHERE status='in_progress'` for the supervisor.
@@ -78,18 +93,19 @@ t = enqueue_task(conn, workstream="productivity", type="build",
                  budget_tokens=100_000)                     # emits task.created
 
 claimed = claim_task(conn, worker_id="host-1", assignee=Assignee.HOST)
-#   highest-priority queued task via SELECT ... FOR UPDATE SKIP LOCKED;
-#   sets in_progress + claimed_by + heartbeat_at; emits task.claimed.
-#   A worker gets tasks targeted at its assignee OR unassigned (null).
-#   Returns None if nothing is claimable.
+#   grab the highest-priority grabbable up_for_grabs task via SELECT ...
+#   FOR UPDATE SKIP LOCKED (dependency-gated) + start it: up_for_grabs → claimed
+#   → in_progress, sets claimed_by/agent_type/heartbeat_at; each hop emits a
+#   task.transition. A worker gets tasks for its assignee OR unassigned (null).
+#   Returns None if nothing is grabbable.
 
 heartbeat(conn, t.id, "host-1")   # updates heartbeat_at only; emits NO event
 complete_task(conn, t.id, result={"ok": True},
-              status=TaskStatus.DONE, spent_tokens=1234)     # emits task.finished
+              status=TaskStatus.MERGED, spent_tokens=1234)   # → merged; task.finished
 #   Only finalizes an in_progress task by default (a worker can't finalize a task
 #   it no longer owns / an already-terminal one) → returns None + no event on
-#   conflict. force=True bypasses the guard (supervisor force-failing a re-kicked
-#   task).
+#   conflict. force=True bypasses the guard (supervisor force-abandoning a
+#   re-kicked task). Every state change goes through tasks.transition (ADR-0015).
 
 read_events(conn, task_id=t.id)                              # replay a task
 read_events(conn, workstream="productivity", since=some_ts) # scan a workstream
@@ -122,14 +138,14 @@ task is silently dropped." Its loop polls
 
 ```python
 for task in find_stale_tasks(conn, threshold_seconds=SUPERVISOR_THRESHOLD):
-    # heartbeat older than the threshold (or missing) while in_progress
-    # → re-kick: reset to queued / spawn a fresh worker, or force-finalize a
-    #   dead task with complete_task(..., force=True).
+    # heartbeat older than the threshold (or missing) while claimed/in_progress
+    # → re-kick: reset to up_for_grabs / spawn a fresh worker, or force-finalize a
+    #   dead task with complete_task(..., status=ABANDONED, force=True).
     ...
 ```
 
-`find_stale_tasks` returns `in_progress` tasks whose `heartbeat_at` is older than
-the threshold (nulls treated as stale), oldest-first. The equivalent pure
+`find_stale_tasks` returns `claimed`/`in_progress` tasks whose `heartbeat_at` is
+older than the threshold (nulls treated as stale), oldest-first. The equivalent pure
 predicate `is_stale(task, threshold_seconds, now=...)` is exported for the
 supervisor's own logic and is unit-tested without a DB.
 

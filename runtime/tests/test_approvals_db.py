@@ -316,7 +316,7 @@ def test_worker_block_then_approve_resume_execute_done(conn, ws, tmp_path):
     assert str(task.id) in resumed.resumed
     with conn.cursor() as cur:
         cur.execute("SELECT status FROM tasks WHERE id = %s", (task.id,))
-        assert cur.fetchone()["status"] == "queued"
+        assert cur.fetchone()["status"] == "up_for_grabs"
     conn.commit()
 
     # Worker retry: invoke finds the grant → executes → verify → done.
@@ -324,7 +324,7 @@ def test_worker_block_then_approve_resume_execute_done(conn, ws, tmp_path):
     assert r2 is not None and r2.kind == "work" and r2.outcome == "done"
     with conn.cursor() as cur:
         cur.execute("SELECT status FROM tasks WHERE id = %s", (task.id,))
-        assert cur.fetchone()["status"] == "done"
+        assert cur.fetchone()["status"] == "merged"
     conn.commit()
     assert get_approval(conn, approval_id).status == STATUS_CONSUMED  # grant spent
     assert list(tmp_path.glob("work-*.txt"))  # artifact now exists
@@ -354,7 +354,7 @@ def test_worker_block_then_deny_fails_task_no_execution(conn, ws, tmp_path):
         cur.execute("SELECT status, result FROM tasks WHERE id = %s", (task.id,))
         row = cur.fetchone()
     conn.commit()
-    assert row["status"] == "failed"
+    assert row["status"] == "abandoned"
     assert row["result"]["approved"] is False
     assert not list(tmp_path.glob("work-*.txt"))  # nothing was ever written
     assert get_approval(conn, approval_id).status == STATUS_DENIED

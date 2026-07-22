@@ -37,6 +37,7 @@ import json
 import logging
 import os
 from typing import Any, Callable, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -47,6 +48,7 @@ from ..model.providers.dryrun import PLAN_GOAL_OPT
 from ..model.registry import Registry
 from ..models import Task, make_event
 from ..skills import SkillRegistry, compose_prompt
+from ..task_state import assert_acyclic
 from .lessons import inject_lessons
 
 log = logging.getLogger("runtime.roles.pm")
@@ -85,9 +87,12 @@ _PLAN_PROMPT = (
     "0..1 = your self-scored confidence you can deliver this), feasible (boolean) "
     "and reason (string; if not feasible, why), and work_items (array). Each "
     "work_item is an object with title, type (default \"work.task\"), instructions, "
-    "and success_criterion (concrete + independently checkable). Decompose the goal "
-    "into the work items needed. If the requirement is unreasonable or out of "
-    "scope, set feasible=false and say why. Goal: {goal}"
+    "success_criterion (concrete + independently checkable), and depends_on (array "
+    "of the 1-based indices of the other work items that must finish first — [] if "
+    "it can run in parallel). Decompose the goal into the work items needed and set "
+    "depends_on so independent items run in parallel and dependent ones wait. If the "
+    "requirement is unreasonable or out of scope, set feasible=false and say why. "
+    "Goal: {goal}"
 )
 
 #: Selection query for the PM's planning skills (matches `define-success-criteria`).
@@ -131,7 +136,9 @@ class WorkItem(BaseModel):
     ``success_criterion`` is per-item, concrete + independently checkable so the
     Verifier can judge it against a real artifact. ``marker`` is the token the
     artifact must contain for the deterministic evidence gate; when omitted the PM
-    derives a unique one per item at enqueue time.
+    derives a unique one per item at enqueue time. ``depends_on`` lists the 1-based
+    indices of the *other* work items this one depends on (its prerequisites) — the
+    edges that tell the fleet what is parallel vs sequential (ADR-0015).
     """
 
     title: str = ""
@@ -139,6 +146,7 @@ class WorkItem(BaseModel):
     instructions: str = ""
     success_criterion: str = ""
     marker: Optional[str] = None
+    depends_on: list[int] = Field(default_factory=list)
 
 
 class Plan(BaseModel):
@@ -174,6 +182,33 @@ class PlanResult(BaseModel):
     work_item_count: int = 0
     work_task_ids: list[str] = Field(default_factory=list)
     approval_id: Optional[str] = None
+
+
+def _topo_order(edges: dict[int, list[int]]) -> list[int]:
+    """Return item indices in dependency order (prerequisites first).
+
+    ``edges[i]`` are the prerequisites of item ``i``. Assumes acyclic (the caller
+    runs :func:`assert_acyclic` first). Stable: ties break by ascending index, so a
+    fully-independent plan keeps its natural 1..n order.
+    """
+    order: list[int] = []
+    placed: set[int] = set()
+
+    def visit(n: int, stack: set[int]) -> None:
+        if n in placed:
+            return
+        stack.add(n)
+        for dep in edges.get(n, []):
+            if dep not in stack:  # cycles already rejected; guard defensively
+                visit(dep, stack)
+        stack.discard(n)
+        if n not in placed:
+            placed.add(n)
+            order.append(n)
+
+    for node in sorted(edges):
+        visit(node, set())
+    return order
 
 
 def _resolve_goal(task: Task) -> str:
@@ -361,9 +396,21 @@ def run_pm_tick(
         )
 
     # 3. Decompose → enqueue ONE work task per work item, each carrying its own
-    #    concrete criterion + marker (the Executor/Verifier contract).
-    work_task_ids: list[str] = []
+    #    concrete criterion + marker (the Executor/Verifier contract) and its
+    #    dependency edges. The PM's index-based edges are validated acyclic and
+    #    mapped to the created task ids so dependents wait for their prerequisites
+    #    to merge (ADR-0015).
+    n = len(plan.work_items)
+    # Sanitize edges to valid 1-based, non-self indices; reject cycles up front.
+    edges: dict[int, list[int]] = {}
     for i, item in enumerate(plan.work_items, start=1):
+        edges[i] = sorted({d for d in item.depends_on if 1 <= d <= n and d != i})
+    assert_acyclic(edges)  # DependencyCycle on a cyclic / self-referential plan
+
+    order = _topo_order(edges)  # prerequisites first, so their ids exist on enqueue
+    id_by_index: dict[int, str] = {}
+    for i in order:
+        item = plan.work_items[i - 1]
         marker = (item.marker or "").strip() or f"studio-ok:{task.id}:{i}"
         wtype = item.type if item.type.startswith("work.") else DEFAULT_WORK_TASK_TYPE
         criterion = item.success_criterion or f"The artifact contains the marker {marker!r}."
@@ -377,12 +424,15 @@ def run_pm_tick(
                 "marker": marker,
                 "title": item.title,
                 "item_index": i,
-                "item_count": len(plan.work_items),
+                "item_count": n,
                 "attempt": 1,
             },
             priority=task.priority,
+            depends_on=[UUID(id_by_index[d]) for d in edges[i]],
         )
-        work_task_ids.append(str(work.id))
+        id_by_index[i] = str(work.id)
+    # Report ids in the PM's original item order (stable, human-readable).
+    work_task_ids = [id_by_index[i] for i in range(1, n + 1)]
 
     sink.emit(
         make_event(

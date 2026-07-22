@@ -2,6 +2,34 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
+## Latest (branch `runtime/task-lifecycle`, ADR-0015 — complete, awaiting merge)
+
+**Canonical task-lifecycle state machine.** Task state is now one canonical
+9-state machine (`up_for_grabs → claimed → in_progress → ready_for_review →
+approved → merged`, with `blocked` / `reviewer_blocked` / `abandoned`) defined
+DB-free in `runtime/task_state.py` and enforced by a single guarded
+`runtime.tasks.transition` — **no ad-hoc status writes anywhere**. Migration
+`0008_task_lifecycle.sql` (forward-only + idempotent) widened the status CHECK and
+mapped legacy rows (`queued→up_for_grabs`, `done→merged`, `failed→abandoned`).
+Work is picked up with `grab_task` (grab-by-sort, `FOR UPDATE SKIP LOCKED`,
+dependency-gated); `claim_task` = grab + start (loop unchanged). The worker + the
+**Verifier as automated reviewer** are one unified dev/review loop (submit →
+review → approve → merge; fail → reviewer_blocked → in_progress retry / abandoned;
+🔴 → blocked → re-queue). **Task dependencies** (`depends_on` DAG) make the fleet
+know what's parallel (`ready_tasks`) vs blocked (`waiting_tasks`); the PM sets
+edges when decomposing (cycles rejected). **Lifecycle telemetry**: append-only
+`task_transitions` (from/to/agent/latency) + `task_lifecycle` / `task_cost` /
+`agent_rollup` / `model_rollup`. Both `grab_task` knobs are **injection-safe**:
+`filter` is a structured `{column: value}` mapping (allowlist, values bound as
+params) and `sort` is an allowlist parse into `(column, direction[, nulls])` tokens
+(ORDER BY built only from validated tokens, never raw SQL). Docs:
+[ADR-0015](decisions/0015-task-lifecycle-state-machine.md) +
+[`docs/task-lifecycle.md`](task-lifecycle.md). Evidence (rebased on the merged
+Docker-sandbox `main`): `DATABASE_URL=… pytest runtime/tests/ spokesman/tests/` =
+**395 passed, 0 skips**; `python -m runtime.demo` exits 0 (four acts green, showing
+the canonical `ready_for_review → approved → merged` trail). Follow-up (separate):
+DB-outage resilience + remote host-restricted DB access.
+
 ## Phase
 
 **Runtime operating end-to-end (keyless), against a live Postgres.** The merged

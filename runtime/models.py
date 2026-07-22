@@ -22,13 +22,23 @@ from pydantic import BaseModel, Field
 
 
 class TaskStatus(str, Enum):
-    """Lifecycle states of a queued unit of work."""
+    """Canonical lifecycle states of a unit of work (ADR-0015).
 
-    QUEUED = "queued"
+    The legal transitions between these live in :mod:`runtime.task_state`; every
+    state change goes through :func:`runtime.tasks.transition`. ``MERGED`` and
+    ``ABANDONED`` are terminal. Legacy names map: ``queued→up_for_grabs``,
+    ``done→merged``, ``failed→abandoned``.
+    """
+
+    UP_FOR_GRABS = "up_for_grabs"
+    CLAIMED = "claimed"
     IN_PROGRESS = "in_progress"
     BLOCKED = "blocked"
-    DONE = "done"
-    FAILED = "failed"
+    READY_FOR_REVIEW = "ready_for_review"
+    REVIEWER_BLOCKED = "reviewer_blocked"
+    APPROVED = "approved"
+    MERGED = "merged"
+    ABANDONED = "abandoned"
 
 
 class Assignee(str, Enum):
@@ -46,6 +56,10 @@ class EventType(str, Enum):
     TASK_CLAIMED = "task.claimed"
     TASK_HEARTBEAT = "task.heartbeat"
     TASK_FINISHED = "task.finished"
+    # Every guarded state change (runtime.tasks.transition) emits this with the
+    # from/to statuses, acting agent + type, and latency since the previous
+    # transition — the append-only lifecycle telemetry (ADR-0012/0015).
+    TASK_TRANSITION = "task.transition"
     # Emitted by the non-agent supervisor (ADR-0004) when it re-kicks a task
     # whose worker went stale, or force-fails one that exhausted its retries.
     TASK_REKICKED = "task.rekicked"
@@ -97,6 +111,14 @@ class Task(BaseModel):
     result: Optional[dict[str, Any]] = None
     heartbeat_at: Optional[datetime] = None
     claimed_by: Optional[str] = None
+    # Kind of agent/worker holding (or that last held) the claim, e.g. "executor",
+    # "pm", "reviewer" — recorded on grab for per-agent lifecycle telemetry (ADR-0015).
+    agent_type: Optional[str] = None
+    claimed_at: Optional[datetime] = None
+    # Prerequisite task ids: this task is only grabbable once EVERY prerequisite is
+    # ``merged`` (terminal-success). Empty = no prerequisites → independently
+    # grabbable in parallel (ADR-0015 task dependencies).
+    depends_on: list[UUID] = Field(default_factory=list)
     budget_tokens: Optional[int] = None
     spent_tokens: int = 0
     # Times the supervisor has re-kicked this task after a stale heartbeat
@@ -172,10 +194,11 @@ def is_stale(
     """Return True if an in-progress task's heartbeat is older than the threshold.
 
     This is the exact predicate the non-agent supervisor (ADR-0004) uses to
-    decide a task was silently dropped and must be re-kicked. Only
-    ``in_progress`` tasks are considered; a missing heartbeat counts as stale.
+    decide a task was silently dropped and must be re-kicked. Only actively-held
+    tasks (``claimed`` before start, or ``in_progress``) are considered; a missing
+    heartbeat counts as stale.
     """
-    if task.status != TaskStatus.IN_PROGRESS:
+    if task.status not in (TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS):
         return False
     if task.heartbeat_at is None:
         return True

@@ -31,7 +31,13 @@ break one, stop and flag it.
 3. **Tools are permissioned.** Every tool declares the capabilities it needs;
    the policy engine gates each call (read? write? approve? budget?).
 4. **Mutations go through verify → commit.** No agent writes state directly;
-   changes flow `Planner → Task Graph → Executor → Verifier → Commit`.
+   changes flow `Planner → Task Graph → Executor → Verifier → Commit`. Task state
+   follows one **canonical lifecycle state machine** (`up_for_grabs → claimed →
+   in_progress → ready_for_review → approved → merged`, with `blocked` /
+   `reviewer_blocked` / `abandoned`) — defined in `runtime/task_state.py` and
+   enforced by the single guard `runtime.tasks.transition` (no ad-hoc status
+   writes). See [`docs/task-lifecycle.md`](docs/task-lifecycle.md) and
+   [ADR-0015](docs/decisions/0015-task-lifecycle-state-machine.md).
 5. **Secrets never reach an agent.** They live in the secret manager; tools call
    external services on the agent's behalf.
    - **This is a public repo: no personal info or credentials, ever.** Real values

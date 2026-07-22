@@ -140,7 +140,7 @@ class FakeQueue:
     def enqueue(self, conn, *, workstream, type, payload=None, priority=0,
                 assignee=None, budget_tokens=None) -> Task:
         now = datetime.now(timezone.utc)
-        t = Task(id=uuid4(), workstream=workstream, type=type, status=TaskStatus.QUEUED,
+        t = Task(id=uuid4(), workstream=workstream, type=type, status=TaskStatus.UP_FOR_GRABS,
                  priority=priority, payload=payload or {}, created_at=now, updated_at=now,
                  budget_tokens=budget_tokens)
         self.tasks[t.id] = t
@@ -148,7 +148,7 @@ class FakeQueue:
         return t
 
     def claim(self, conn, *, worker_id, assignee=None, workstream=None):
-        ids = [i for i in self.order if self.tasks[i].status is TaskStatus.QUEUED
+        ids = [i for i in self.order if self.tasks[i].status is TaskStatus.UP_FOR_GRABS
                and (workstream is None or self.tasks[i].workstream == workstream)]
         if not ids:
             return None
@@ -162,7 +162,7 @@ class FakeQueue:
     def heartbeat(self, conn, task_id, worker_id):
         return self.tasks.get(task_id)
 
-    def complete(self, conn, task_id, *, result=None, status=TaskStatus.DONE,
+    def complete(self, conn, task_id, *, result=None, status=TaskStatus.MERGED,
                  spent_tokens=None, force=False):
         t = self.tasks.get(task_id)
         if t is None:
@@ -171,9 +171,22 @@ class FakeQueue:
         self.tasks[task_id] = t
         return t
 
+    def transition(self, conn, task_id, to, *, agent_id=None, agent_type=None,
+                   result=None, spent_tokens=None, expected_from=None,
+                   claimed_by=None, **kw):
+        t = self.tasks.get(task_id)
+        if t is None:
+            return None
+        upd = {"status": to}
+        if result is not None:
+            upd["result"] = result
+        t = t.model_copy(update=upd)
+        self.tasks[task_id] = t
+        return t
+
     def queued_of_type(self, type_: str) -> list:
         return [t for t in self.tasks.values()
-                if t.type == type_ and t.status is TaskStatus.QUEUED]
+                if t.type == type_ and t.status is TaskStatus.UP_FOR_GRABS]
 
 
 def _registry(root) -> ToolRegistry:
@@ -184,7 +197,8 @@ def _registry(root) -> ToolRegistry:
 
 
 def _seams(q: FakeQueue) -> dict:
-    return dict(claim=q.claim, heartbeat=q.heartbeat, complete=q.complete, enqueue=q.enqueue)
+    return dict(claim=q.claim, heartbeat=q.heartbeat, complete=q.complete,
+                enqueue=q.enqueue, transition=q.transition)
 
 
 def _pass(conn, task, result, s, **kw):
