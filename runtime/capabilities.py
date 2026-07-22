@@ -32,6 +32,7 @@ class Capability(str, Enum):
     FS_WRITE = "fs.write"
     FS_DELETE = "fs.delete"
     SHELL_EXEC = "shell.exec"
+    CODE_RUN = "code.run"
     GIT_WRITE = "git.write"
     NET_FETCH = "net.fetch"
     SECRET_USE = "secret.use"
@@ -74,6 +75,9 @@ DEFAULT_CAPABILITY_TIER: dict[Capability, ActionTier] = {
     # 🔴 Red — irreversible / costly / escapes the sandbox; human approval.
     Capability.FS_DELETE: ActionTier.RED,
     Capability.SHELL_EXEC: ActionTier.RED,
+    # Running a coding worker (opencode) executes agent-authored code in the
+    # sandbox — same escape-the-sandbox risk class as shell.exec, so 🔴.
+    Capability.CODE_RUN: ActionTier.RED,
     Capability.SPEND_MONEY: ActionTier.RED,
     Capability.DEPLOY: ActionTier.RED,
 }

@@ -13,6 +13,7 @@ reference tools are *not* auto-registered into — the caller registers the tool
 from __future__ import annotations
 
 from .base import Tool, ToolResult
+from .coding import CodingTool
 from .filesystem import FilesystemTool
 from .shell import SandboxRunner, ShellTool
 
@@ -48,6 +49,7 @@ default_registry = ToolRegistry()
 
 
 __all__ = [
+    "CodingTool",
     "FilesystemTool",
     "SandboxRunner",
     "ShellTool",

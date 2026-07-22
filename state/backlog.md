@@ -27,7 +27,11 @@ window; loopback-default bind + env `pg_hba` scram allowlist, never trust/`0.0.0
 · **Experiment primitive** (ADR-0016: `runtime/experiment/`; hypothesis + metric +
 budget + guarded `proposed→running→evaluated→kept|scaled|killed`; evidence-based
 kill/scale — over-budget/missed→killed, met→kept, strongly-met→scaled + 🛑;
-migration 0009) · onboarding/secrets · model shortlist + cost model · ADRs 0001–0017.
+migration 0009) · **Coding-worker dispatch** (architecture §14: `work.code`/
+`prototype` → policy-gated `coding` tool → opencode INSIDE the sandbox; `code.run`
+🔴/approval-gated via `invoke`; opencode swappable via `CODING_WORKER_CMD`;
+loop-free worker path; env-allowlist-only, no host secrets) · onboarding/secrets ·
+model shortlist + cost model · ADRs 0001–0017.
 
 ## 🔄 In progress
 
@@ -35,9 +39,7 @@ migration 0009) · onboarding/secrets · model shortlist + cost model · ADRs 00
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
-1. **Coding-worker dispatch** — route a "Need Prototype" coding task through the
-   (done) sandbox runner via `invoke` (opencode as the replaceable worker).
-2. **Workstream-bootstrap primitive** (makes starting a vertical config-not-code) —
+1. **Workstream-bootstrap primitive** (makes starting a vertical config-not-code) —
    a workstream config/registration (name/objective/budget/policy grants/tool+skill
    set/memory-seed/DB-scope/object-store bucket) + the **role prompt-assembly layer**
    (shared role base + workstream charter + per-role overlay + skills + lessons +
@@ -45,13 +47,13 @@ migration 0009) · onboarding/secrets · model shortlist + cost model · ADRs 00
    check, e.g. `video_audit`) + the **cross-workstream request contract** (typed
    `feature_request` + receiving-PM intake/triage/prioritize/approve/decompose +
    symmetric escalation). Captured by the vertical-isolation ADR.
-3. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
+2. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
    product→own repo, definition→platform (this repo).
-4. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
+3. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
-5. **Adaptive orchestration intensity** — generalize scaling of review/retro/
+4. **Adaptive orchestration intensity** — generalize scaling of review/retro/
    research by recent error rate + budget/telemetry (today: on_fail/on_risk).
-6. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+5. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
    M1's `EventType` enum).
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)
