@@ -7,12 +7,13 @@ turns the Verifier's verdict into the terminal state — enforcing verify→comm
 (architecture §4, CLAUDE.md invariant 4): a work task is never ``done`` until the
 Verifier passes.
 
-Dispatch:
+Dispatch (all state changes via the canonical guarded ``transition``, ADR-0015):
 
-- ``pm.tick`` → :func:`runtime.roles.pm.run_pm_tick` (plan + enqueue work), commit.
-- ``work.*``  → :func:`runtime.roles.executor.run_executor` then
-  :func:`runtime.roles.verifier.verify`; on pass → ``complete_task(done)``; on
-  fail → a **bounded** re-enqueue (nudge) or ``complete_task(failed)``.
+- ``pm.tick`` → :func:`runtime.roles.pm.run_pm_tick` (plan + enqueue work), merge.
+- ``work.*``  → the unified dev/review loop: submit (``in_progress →
+  ready_for_review``) → :func:`runtime.roles.verifier.verify` as the automated
+  reviewer; on pass → ``approved → merged``; on fail → ``reviewer_blocked`` then a
+  **bounded** retry (``→ in_progress``) or ``→ abandoned``.
 
 All coordination is through the merged M1 queue + event log; all tools go through
 the M2 policy gate (inside the roles); all model calls go through M3b
@@ -126,7 +127,7 @@ class RunResult(BaseModel):
     task_type: str
     #: "pm" | "work" | "retro" | "review" | "research" | "unknown"
     kind: str
-    #: "done" | "retry" | "failed" | "blocked"
+    #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
     detail: str = ""
 

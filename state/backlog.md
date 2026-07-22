@@ -20,16 +20,19 @@ lessons + candidate skills `reviewed: false`) · WhatsApp Spokesman service +
 inbound approve/deny resolves real approvals) · **Docker sandbox runner**
 (`DockerSandboxRunner` behind `ShellTool`: network-off / non-root / read-only /
 cap-drop ALL / resource+timeout / scoped-mount w/ realpath / no-secret-env; real
-container host-verified) · onboarding/secrets · model shortlist + cost model ·
-ADRs 0001–0014.
+container host-verified) · **Task-lifecycle state machine + dependency DAG +
+lifecycle telemetry** (ADR-0015 — canonical 9-state machine in `runtime/task_state.py`
++ single guarded `tasks.transition`, no ad-hoc status writes; legacy statuses
+migrated `queued→up_for_grabs`/`done→merged`/`failed→abandoned` (migration 0008,
+idempotent); grab-by-sort + `FOR UPDATE SKIP LOCKED`; Verifier-as-Reviewer unified
+dev/review loop; prerequisite DAG `depends_on` with `ready_tasks`/`waiting_tasks`;
+append-only `task_transitions` telemetry + `task_lifecycle`/`task_cost`/agent+model
+rollups; docs `docs/task-lifecycle.md`) · onboarding/secrets · model shortlist +
+cost model · ADRs 0001–0015.
 
 ## 🔄 In progress
 
-- **Task lifecycle state machine + dependency DAG + lifecycle telemetry** —
-  canonical states (up_for_grabs→claimed→in_progress→ready_for_review→
-  reviewer_blocked|approved→merged, +blocked/abandoned), grab-by-sort,
-  Verifier-as-Reviewer unification, prerequisite DAG (parallel vs blocked),
-  per-transition/agent/model/token/latency telemetry, canonical ADR+docs. *(building)*
+- _(nothing in flight)_
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 

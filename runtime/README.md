@@ -15,10 +15,11 @@ lives in `models.py` and is unit-tested with no database.
 
 | File | Purpose |
 | --- | --- |
-| `models.py` | Enums, pydantic row models, `build_database_url`, `make_event`, `is_stale` (pure) |
+| `models.py` | Enums (`TaskStatus`), pydantic row models, `build_database_url`, `make_event`, `is_stale` (pure) |
+| `task_state.py` | Canonical lifecycle states + `TRANSITIONS` + `can/assert_transition` + dependency-cycle guard (pure, DB-free) |
 | `db.py` | `connect()` / `can_connect()` (short-timeout probe) |
 | `events.py` | `append_event`, `read_events` (insert + read only) |
-| `tasks.py` | `enqueue_task`, `claim_task`, `heartbeat`, `complete_task`, `find_stale_tasks` |
+| `tasks.py` | `transition` (the one guard), `grab_task`/`claim_task`/`start_task`, `enqueue_task`, `heartbeat`, `complete_task`, `ready_tasks`/`waiting_tasks`/`list_for_review`, `task_lifecycle`/`task_cost`/rollups, `find_stale_tasks` |
 | `migrate.py` | Forward-only migration runner (`python -m runtime.migrate`) |
 | `migrations/*.sql` | Schema, applied in filename order |
 | `tests/` | `test_models.py` (no DB) + `test_integration_db.py` (skips w/o DB) |
@@ -47,15 +48,29 @@ data-access API only inserts and reads.
 | `id` | uuid pk | |
 | `workstream` | text | |
 | `type` | text | |
-| `status` | text | `queued \| in_progress \| blocked \| done \| failed` (CHECK) |
+| `status` | text | canonical lifecycle (CHECK): `up_for_grabs \| claimed \| in_progress \| blocked \| ready_for_review \| reviewer_blocked \| approved \| merged \| abandoned` — see [ADR-0015](../docs/decisions/0015-task-lifecycle-state-machine.md) |
 | `priority` | int | higher = more urgent |
 | `assignee` | text null | `host \| offhost` (CHECK); null = any worker (ADR-0010) |
 | `payload` | jsonb | enough state for a fresh agent to resume (ADR-0004) |
 | `result` | jsonb null | |
-| `heartbeat_at` | timestamptz null | liveness ping while `in_progress` |
-| `claimed_by` | text null | worker id holding the claim |
+| `heartbeat_at` | timestamptz null | liveness ping while `claimed`/`in_progress` |
+| `claimed_by` / `agent_type` / `claimed_at` | text / text / timestamptz | worker id + agent kind + grab time |
+| `depends_on` | uuid[] | prerequisite task ids; grabbable only when all are `merged` (ADR-0015) |
 | `budget_tokens` / `spent_tokens` | bigint | per-task cost cap + telemetry (ADR-0012) |
 | `created_at` / `updated_at` | timestamptz | |
+
+The lifecycle state machine (states + legal transitions) lives DB-free in
+`task_state.py`; every state change goes through the single guard
+`tasks.transition` (records a `task_transitions` telemetry row + a `task.transition`
+event). Grab work with `grab_task` (grab-by-sort, `FOR UPDATE SKIP LOCKED`,
+dependency-gated) or `claim_task` (= grab + start). See
+[`docs/task-lifecycle.md`](../docs/task-lifecycle.md).
+
+### `task_transitions` (append-only lifecycle telemetry)
+
+One row per guarded transition: `task_id`, `from_status`, `to_status`, `agent_id`,
+`agent_type`, `at`, `latency_ms` (since the task's previous transition). Query with
+`task_lifecycle` / `task_cost` / `agent_rollup` / `model_rollup` (ADR-0012/0015).
 
 Indexes: `(status, priority DESC, created_at)` for claiming; partial
 `(heartbeat_at) WHERE status='in_progress'` for the supervisor.
