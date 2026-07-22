@@ -45,8 +45,8 @@ A **task** = one delegated unit of work. Cost depends overwhelmingly on its
 | Class | Cumulative input / output | Executor | ~$/task (no cache) | ~$/task (cached) |
 | --- | --- | --- | --- | --- |
 | **Light** (classify, summarize, short research, small edit) | ~20k / 3k | local 8B / Flash-Lite | ~$0.01 | ~$0.005 |
-| **Mid** (real agentic task, few tools, scoped context) | ~150–300k / 15k | budget-open-weight API / Flash | ~$0.15–0.45 | ~$0.08–0.20 |
-| **Heavy** (long agentic coding/research, context grows to 300k+) | ~600k–1M / 40k | Sonnet 5 / Gemini Flash | **~$2–3** | **~$1.3–1.8** |
+| **Mid** (real agentic task, few tools, scoped context) | ~150–300k / 15k | budget-open-weight API / Flash | ~$0.15–0.60 | ~$0.08–0.30 |
+| **Heavy** (long agentic coding/research, context grows to 300k+) | ~600k–1M / 40k | Sonnet 5 / Gemini Flash | **~$2–4** | **~$1.3–2** |
 
 Worked heavy example (Sonnet 5, 800k cumulative in / 40k out): no-cache
 `0.8M×$3 + 0.04M×$15 = $2.40 + $0.60 = $3.00`; with an ~80%-cached stable prefix
@@ -106,8 +106,8 @@ With lean pulse (~$40/mo) + aggressive routing/caching, at a **$200/mo** cap
 | If the work is mostly… | ~$/task | **Tasks/day @ $200** |
 | --- | --- | --- |
 | Light | ~$0.005–0.01 | **hundreds** |
-| Mid | ~$0.10–0.20 | **25–50** |
-| Heavy (frontier-quality agentic) | ~$1.3–3 | **~2–4** |
+| Mid | ~$0.08–0.30 | **~20–50** |
+| Heavy (frontier-quality agentic) | ~$1.3–2 | **~2–4** |
 
 **Be clear-eyed:** naïve heavy-task throughput is low, and lower than v1 implied.
 Autonomous, multi-step, frontier-quality work is genuinely expensive and frontier
