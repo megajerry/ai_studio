@@ -62,6 +62,29 @@ def test_append_and_read_events(conn, ws):
     assert got[1].trace_id == "tr"
 
 
+def test_append_order_preserved_within_one_transaction(conn, ws):
+    # Regression: `ts` defaults to now() = transaction start time, so many events
+    # appended in a single transaction share an identical `ts`. Ordering by `ts`
+    # made their read-back order non-deterministic; ordering by the monotonic
+    # `seq` must replay them in true insertion order.
+    n = 50
+    with conn.transaction():
+        appended = [
+            append_event(conn, make_event(workstream=ws, type="e", payload={"i": i}))
+            for i in range(n)
+        ]
+    # All share one transaction timestamp, confirming the hazard is exercised.
+    assert len({e.ts for e in appended}) == 1
+    got = read_events(conn, workstream=ws)
+    assert [e.id for e in got] == [e.id for e in appended]
+    assert [e.payload["i"] for e in got] == list(range(n))
+    # seq is assigned, strictly increasing, and matches insertion order.
+    seqs = [e.seq for e in got]
+    assert all(s is not None for s in seqs)
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == n
+
+
 def test_read_events_since_filter(conn, ws):
     e1 = append_event(conn, make_event(workstream=ws, type="a"))
     e2 = append_event(conn, make_event(workstream=ws, type="b"))
