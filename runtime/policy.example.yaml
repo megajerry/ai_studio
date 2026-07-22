@@ -20,6 +20,26 @@
 #   fs.read  fs.write  fs.delete  shell.exec  git.write
 #   net.fetch  secret.use  spend.money  deploy
 roles:
+  # --- Studio operating loop roles (M3c) ------------------------------------
+  # The PM plans; it never does the work itself. It reads state and calls a
+  # planning model, then enqueues a work task (task-queue coordination, not a
+  # direct call). Least privilege: read only.
+  pm:
+    - fs.read
+
+  # The Executor DOES the work: it writes a scratch artifact (fs.write, 🟡) and
+  # calls an execution model. It cannot delete (fs.delete 🔴) or shell
+  # (shell.exec 🔴) — those are denied by least privilege, proving the gate.
+  executor:
+    - fs.read
+    - fs.write
+
+  # The Verifier is the INDEPENDENT verify→commit gate: it only reads back the
+  # artifact to check the success criterion. Read-only by design so it can never
+  # "fix" the work it is judging.
+  verifier:
+    - fs.read
+
   # Reads and searches only — the architecture §5 "Research role" example.
   researcher:
     - fs.read
