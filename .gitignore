@@ -22,6 +22,11 @@ runtime/policy.local.yaml
 runtime/models.yaml
 runtime/models.local.yaml
 
+# Real search config lives locally; only runtime/search.example.yaml is
+# committed (rules-as-data; ADR-0005/0011).
+runtime/search.yaml
+runtime/search.local.yaml
+
 # Runtime inbound messages captured by the Spokesman may contain personal info
 # (sender numbers, message bodies) — keep them out of git (ADR-0011).
 state/inbox/whatsapp-inbound.jsonl
