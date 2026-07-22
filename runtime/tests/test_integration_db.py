@@ -107,6 +107,17 @@ def test_heartbeat_only_by_holder(conn, ws):
     assert beat is not None and beat.heartbeat_at is not None
 
 
+def test_heartbeat_emits_no_event(conn, ws):
+    t = enqueue_task(conn, workstream=ws, type="t")
+    claim_task(conn, worker_id="w1", workstream=ws)
+    heartbeat(conn, t.id, "w1")
+    heartbeat(conn, t.id, "w1")
+    # High-frequency liveness must not bloat the append-only log (ADR-0013).
+    types = [e.type for e in read_events(conn, task_id=t.id)]
+    assert types == ["task.created", "task.claimed"]
+    assert "task.heartbeat" not in types
+
+
 def test_complete_task_sets_result_and_event(conn, ws):
     t = enqueue_task(conn, workstream=ws, type="t")
     claim_task(conn, worker_id="w1", workstream=ws)
@@ -122,6 +133,40 @@ def test_complete_rejects_non_terminal_status(conn, ws):
     t = enqueue_task(conn, workstream=ws, type="t")
     with pytest.raises(ValueError):
         complete_task(conn, t.id, status=TaskStatus.QUEUED)
+
+
+def test_complete_guard_rejects_non_in_progress_task(conn, ws):
+    # A queued (unclaimed) task cannot be finalized by default; no event emitted.
+    t = enqueue_task(conn, workstream=ws, type="t")
+    assert complete_task(conn, t.id, result={"x": 1}) is None
+    types = [e.type for e in read_events(conn, task_id=t.id)]
+    assert types == ["task.created"]
+
+
+def test_complete_guard_blocks_double_finalize(conn, ws):
+    t = enqueue_task(conn, workstream=ws, type="t")
+    claim_task(conn, worker_id="w1", workstream=ws)
+    assert complete_task(conn, t.id, status=TaskStatus.DONE) is not None
+    # Second finalize conflicts (already done) → None, no extra finished event.
+    assert complete_task(conn, t.id, status=TaskStatus.FAILED) is None
+    types = [e.type for e in read_events(conn, task_id=t.id)]
+    assert types.count("task.finished") == 1
+
+
+def test_complete_force_bypasses_guard(conn, ws):
+    # Supervisor force-fails a stale/re-kicked (still queued) task.
+    t = enqueue_task(conn, workstream=ws, type="t")
+    done = complete_task(
+        conn, t.id, status=TaskStatus.FAILED, result={"reason": "stale"}, force=True
+    )
+    assert done is not None and done.status is TaskStatus.FAILED
+    assert done.result == {"reason": "stale"}
+    types = [e.type for e in read_events(conn, task_id=t.id)]
+    assert types[-1] == "task.finished"
+
+
+def test_complete_missing_task_returns_none(conn, ws):
+    assert complete_task(conn, uuid4(), force=True) is None
 
 
 def test_find_stale_tasks(conn, ws):

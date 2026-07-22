@@ -33,7 +33,7 @@ lives in `models.py` and is unit-tested with no database.
 | `ts` | timestamptz | `default now()` |
 | `task_id` | uuid null | null for task-independent events |
 | `workstream` | text | |
-| `type` | text | e.g. `task.created`, `task.claimed`, `task.heartbeat`, `task.finished` |
+| `type` | text | e.g. `task.created`, `task.claimed`, `task.finished` (heartbeats are **not** logged — high-frequency, zero replay value; ADR-0013) |
 | `payload` | jsonb | defaults `{}` |
 | `trace_id` / `span_id` | text null | OpenTelemetry context (ADR-0012) |
 
@@ -83,9 +83,13 @@ claimed = claim_task(conn, worker_id="host-1", assignee=Assignee.HOST)
 #   A worker gets tasks targeted at its assignee OR unassigned (null).
 #   Returns None if nothing is claimable.
 
-heartbeat(conn, t.id, "host-1")                              # emits task.heartbeat
+heartbeat(conn, t.id, "host-1")   # updates heartbeat_at only; emits NO event
 complete_task(conn, t.id, result={"ok": True},
               status=TaskStatus.DONE, spent_tokens=1234)     # emits task.finished
+#   Only finalizes an in_progress task by default (a worker can't finalize a task
+#   it no longer owns / an already-terminal one) → returns None + no event on
+#   conflict. force=True bypasses the guard (supervisor force-failing a re-kicked
+#   task).
 
 read_events(conn, task_id=t.id)                              # replay a task
 read_events(conn, workstream="productivity", since=some_ts) # scan a workstream
@@ -119,7 +123,8 @@ task is silently dropped." Its loop polls
 ```python
 for task in find_stale_tasks(conn, threshold_seconds=SUPERVISOR_THRESHOLD):
     # heartbeat older than the threshold (or missing) while in_progress
-    # → re-kick: reset to queued / spawn a fresh worker, and emit an event.
+    # → re-kick: reset to queued / spawn a fresh worker, or force-finalize a
+    #   dead task with complete_task(..., force=True).
     ...
 ```
 

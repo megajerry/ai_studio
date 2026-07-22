@@ -135,7 +135,10 @@ def heartbeat(
     """Refresh a task's heartbeat; returns the task, or None if not held.
 
     Only the worker holding the claim may heartbeat (guards against a stale
-    worker resurrecting a re-kicked task). Emits ``task.heartbeat``.
+    worker resurrecting a re-kicked task). Deliberately emits **no** event:
+    heartbeats are high-frequency liveness with zero replay value, and logging
+    each one would bloat the append-only log (ADR-0013). ``EventType.TASK_HEARTBEAT``
+    remains defined for occasional manual/explicit use.
     """
     with conn.transaction():
         with conn.cursor() as cur:
@@ -149,11 +152,9 @@ def heartbeat(
                 (task_id, worker_id),
             )
             row = cur.fetchone()
-            if row is None:
-                return None
-            task = Task.model_validate(row)
-        _emit(conn, task, EventType.TASK_HEARTBEAT, claimed_by=worker_id)
-    return task
+    if row is None:
+        return None
+    return Task.model_validate(row)
 
 
 def complete_task(
@@ -163,15 +164,24 @@ def complete_task(
     result: Optional[dict] = None,
     status: TaskStatus = TaskStatus.DONE,
     spent_tokens: Optional[int] = None,
-) -> Task:
+    force: bool = False,
+) -> Optional[Task]:
     """Mark a task done/failed with a result and emit ``task.finished``.
 
-    ``status`` must be a terminal state. ``spent_tokens`` (if given) records
-    final cost for telemetry (ADR-0012).
+    ``status`` must be a terminal state. By default only an ``in_progress`` task
+    is finalized — a worker cannot finalize a task it no longer owns (e.g. one
+    the supervisor already re-kicked, or an already-terminal task). On such a
+    conflict (or a missing task) the row is left untouched, **no event is
+    emitted**, and ``None`` is returned.
+
+    ``force=True`` bypasses the in-progress guard so the supervisor can
+    force-fail a stale/re-kicked task regardless of its current state.
+    ``spent_tokens`` (if given) records final cost for telemetry (ADR-0012).
     """
     if status not in (TaskStatus.DONE, TaskStatus.FAILED):
         raise ValueError("complete_task status must be 'done' or 'failed'")
 
+    guard = "" if force else "AND status = 'in_progress'"
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
@@ -181,7 +191,7 @@ def complete_task(
                     result = %s,
                     spent_tokens = COALESCE(%s, spent_tokens),
                     updated_at = now()
-                WHERE id = %s
+                WHERE id = %s {guard}
                 RETURNING {_TASK_COLUMNS}
                 """,
                 (
@@ -193,7 +203,7 @@ def complete_task(
             )
             row = cur.fetchone()
             if row is None:
-                raise LookupError(f"task {task_id} not found")
+                return None
             task = Task.model_validate(row)
         _emit(conn, task, EventType.TASK_FINISHED, spent_tokens=task.spent_tokens)
     return task
@@ -221,4 +231,8 @@ def find_stale_tasks(
             (float(threshold_seconds),),
         )
         rows = cur.fetchall()
+    # The supervisor polls this on a long-lived connection; close the read's
+    # implicit transaction so it is not left idle-in-transaction.
+    if not conn.autocommit:
+        conn.commit()
     return [Task.model_validate(r) for r in rows]

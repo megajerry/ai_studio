@@ -76,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Connecting to {build_database_url()!r}")
     with connect() as conn:
+        # Autocommit so each migration's own transaction commits independently:
+        # a failure at file N must not roll back files already applied.
+        conn.autocommit = True
         if args.status:
             done = _applied(conn)
             for name in all_files:

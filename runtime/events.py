@@ -82,6 +82,10 @@ def read_events(
             params,
         )
         rows = cur.fetchall()
+    # Close the read's implicit transaction so a long-lived (e.g. supervisor)
+    # connection is not left idle-in-transaction. No-op under autocommit.
+    if not conn.autocommit:
+        conn.commit()
     return [Event.model_validate(r) for r in rows]
 
 
