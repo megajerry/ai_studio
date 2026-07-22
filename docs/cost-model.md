@@ -1,120 +1,193 @@
 # Cost & ROI model — for stakeholder review
 
 **Purpose:** turn the [model shortlist](model-shortlist.md) into economics —
-ballpark token consumption and $/month under a concrete routing strategy, the
-dominant cost drivers, and the levers to pull if it's over budget.
+realistic token consumption and $/month under a routing strategy, the dominant
+cost driver, and the levers to pull if it's over budget.
 
-> **These are estimates (±2–3×).** They exist to frame the decision, not to be
-> precise. Real numbers come from **telemetry** once the studio runs
-> ([ADR-0012](decisions/0012-telemetry-metrics.md)) — which is exactly why
-> observability is a day-one requirement. All prices are the 2026-07 snapshot
-> from [model-shortlist.md](model-shortlist.md) (USD per 1M tokens, in/out).
+> **These are estimates (±2–3×), and deliberately not optimistic.** Real numbers
+> come from **telemetry** once the studio runs ([ADR-0012](decisions/0012-telemetry-metrics.md))
+> — until then we're flying blind (see the callout in §3). All prices are the
+> 2026-07 snapshot from [model-shortlist.md](model-shortlist.md) (USD per 1M
+> tokens, in/out). Caching and context discipline move real cost more than model
+> choice does.
 
-## 1. The routing strategy (this *is* the cost strategy)
+## 1. The one thing that dominates cost: context size
 
-Match models to roles — most spend should land on cheap/mid tiers, with the
-premium model reserved for the highest-leverage role:
+Per-task cost is driven **less by which model you pick than by how many tokens
+you feed it** — and in an agentic loop, **context grows every step** as tool
+outputs accumulate. A task is not a fixed prompt; its *cumulative* input is the
+sum of a context that starts small and balloons.
+
+- A single LLM call might be 20k–150k tokens.
+- An 8–12 step agentic task whose context grows to 300k+ can bill **500k–1.5M
+  cumulative input tokens** — several times the naïve single-call figure.
+
+So the headline levers (§5) are **caching** and **context scoping**, not model
+price. The [routing strategy](#2-the-routing-strategy) matters, but it's second.
+
+## 2. The routing strategy
+
+Match models to roles — most spend on cheap/mid tiers, premium reserved for the
+highest-leverage role:
 
 | Role | Model tier | Default model | in/out $/1M |
 | --- | --- | --- | --- |
 | PM / planner | premium | Claude Opus 4.8 | 5 / 25 |
-| Executor (general/coding) | mid | Sonnet 5 *or* Gemini 3.5 Flash | 3/15 · 1.5/9 |
-| Verifier / classifier / router | cheap | Haiku 4.5 *or* Gemini Flash-Lite | 1/5 · 0.125/0.75 |
-| Embeddings | — | Google `text-embedding-005` | 0.006 |
+| Executor (general/coding) | mid *or* budget-open-weight | Sonnet 5 / Gemini Flash / DeepSeek·Qwen API | 3/15 · 1.5/9 · ~0.2–0.9 |
+| Verifier / classifier / router | cheap *or* local | Haiku 4.5 / Flash-Lite / local 8B | 1/5 · 0.125/0.75 · ~0 |
+| Embeddings | — | Google `text-embedding-005` / local | 0.006 · ~0 |
 
-## 2. Unit cost — one "task"
+## 3. Unit cost — one "task"
 
-A **task** = one delegated unit of work (research a question, prototype a feature,
-review a change). A mid-size agentic task, rough token envelope:
+A **task** = one delegated unit of work. Cost depends overwhelmingly on its
+**context weight**, so we model three classes rather than one average:
 
-| Component | Model | Input tok | Output tok | Cost (no cache) | Cost (w/ caching) |
-| --- | --- | --- | --- | --- | --- |
-| PM plan + confidence gate | Opus 4.8 | 15k | 3k | $0.15 | $0.10 |
-| Executor (agentic ~8–12 steps) | Sonnet 5 | 150k | 20k | $0.75 | $0.47 |
-| Verifier | Haiku 4.5 | 20k | 2k | $0.03 | $0.02 |
-| Overhead (routing, retro amortized) | — | — | — | +15% | +15% |
-| **Total / task** | | | | **~$1.07** | **~$0.68** |
+| Class | Cumulative input / output | Executor | ~$/task (no cache) | ~$/task (cached) |
+| --- | --- | --- | --- | --- |
+| **Light** (classify, summarize, short research, small edit) | ~20k / 3k | local 8B / Flash-Lite | ~$0.01 | ~$0.005 |
+| **Mid** (real agentic task, few tools, scoped context) | ~150–300k / 15k | budget-open-weight API / Flash | ~$0.15–0.45 | ~$0.08–0.20 |
+| **Heavy** (long agentic coding/research, context grows to 300k+) | ~600k–1M / 40k | Sonnet 5 / Gemini Flash | **~$2–3** | **~$1.3–1.8** |
 
-If the executor runs on **Gemini 3.5 Flash** instead of Sonnet 5:
-**~$0.67 (no cache) / ~$0.44 (cached)** per task.
+Worked heavy example (Sonnet 5, 800k cumulative in / 40k out): no-cache
+`0.8M×$3 + 0.04M×$15 = $2.40 + $0.60 = $3.00`; with an ~80%-cached stable prefix
+(cache reads at ~10%) the input drops to ~$0.67 → **~$1.3** + PM/verifier.
 
-> The **executor's input tokens dominate** — agentic loops replay context every
-> step. That single fact drives most of the cost and most of the levers.
+> **The earlier v1 of this doc assumed a fixed 150k-input "heavy" task (~$0.55).
+> That was optimistic** — it ignored context growth. The numbers above supersede
+> it: heavy tasks are ~$1.3–3, not ~$0.55.
 
-Typical blended assumption used below: **~$0.55/task** (mixed tiers, caching on).
+### Reality check: this very session
 
-## 3. Standing cost — the PM pulse (idle heartbeat)
+I (the PM session that wrote this) am the **anti-pattern**: one monolithic thread
+carrying **~350k+ tokens and growing**, re-billed every turn, to produce ~8 merged
+deliverables via ~13 delegated subagent runs. I **can't give exact $ because I'm
+not instrumented** — which is the whole argument for [ADR-0012](decisions/0012-telemetry-metrics.md).
+Directionally: low-tens of dollars for those 8 deliverables ≈ **~$2–4 each** —
+matching the *heavy* row, not the old $0.55. Note the subagents each ran in
+**~20–90k** contexts — a fraction of my thread. **That contrast is the ROI game.**
 
-The PM wakes on a cadence even when little is happening. This is a real,
-often-overlooked cost:
+## 4. Standing cost — the PM pulse (idle heartbeat)
 
 | Pulse strategy | Cost/day | Cost/month |
 | --- | --- | --- |
 | Every 15 min on Opus, no cache (naïve) | ~$17 | ~$500 |
-| Every 15 min, cheap **triage** model (Haiku), escalate to Opus only on action | ~$3.4 | ~$100 |
-| **Event-driven wake** (only when events arrive) + cheap triage | ~$1–3 | ~$30–90 |
+| Every 15 min, cheap **triage** model, escalate only on action | ~$3.4 | ~$100 |
+| **Event-driven wake** + cheap triage | ~$1–3 | ~$30–90 |
 
-**Recommendation: event-driven + cheap-triage pulse.** Idle cost should be tens of
-dollars, not hundreds.
+**Use event-driven + cheap triage.** Idle cost should be tens of dollars.
 
-## 4. Monthly cost by activity level
+## 5. Levers, ranked by impact
 
-Blended ~$0.55/task (caching on, mixed tiers) + an event-driven pulse (~$50–100/mo):
+1. **Context scoping** — the biggest lever, because context size dominates
+   (§1). Give each task only its own scoped inputs; **don't carry a monolithic
+   history**. Atomic tasks + scoped memory + delegating to small-context
+   subagents (this repo's whole design) is what keeps per-task tokens — and thus
+   cost — small. This session vs. a scoped subagent is a **4–15× context
+   difference.**
+2. **Prompt caching** — for agentic loops the large stable prefix is highly
+   cacheable (Opus cached input $0.50 vs $5). ~−70–90% of input cost. Free;
+   enable everywhere.
+3. **Model routing / downshift** — reserve Opus for the PM; executors on
+   Flash / budget-open-weight; verify/classify on Haiku/Flash-Lite/local.
+4. **Cap agentic iterations + reflection (~2)** — fewer steps = less context
+   growth = less cost (compounds with §1).
+5. **Batch API (−50%)** for non-urgent async work (research, retro).
+6. **Hard per-workstream budget caps** (policy engine + router) — enforce a
+   ceiling; the PM trades quality/speed within it.
+7. **Off-host agent offload** — delegate host-resource-free work to the
+   intermittent remote session at zero marginal API cost.
+8. **Flat-rate / self-host substrates** — see §7.
 
-| Activity | Tasks/day | Task cost/mo | + Pulse | **Total/mo (ballpark)** |
-| --- | --- | --- | --- | --- |
-| **Low** | 10 | ~$165 | ~$50 | **$150–300** |
-| **Medium** | 50 | ~$825 | ~$100 | **$700–1,500** |
-| **High** | 200 | ~$3,300 | ~$150 | **$2,500–6,000** |
+## 6. Monthly cost & honest throughput
 
-Worst case (no caching, everything on frontier models) is **~3–5× higher**;
-aggressive levers (below) can push **~3–5× lower**. Embeddings are negligible
-(<$20/mo even at high volume).
+With lean pulse (~$40/mo) + aggressive routing/caching, at a **$200/mo** cap
+(~$160 for work):
 
-## 5. Budget → capacity
+| If the work is mostly… | ~$/task | **Tasks/day @ $200** |
+| --- | --- | --- |
+| Light | ~$0.005–0.01 | **hundreds** |
+| Mid | ~$0.10–0.20 | **25–50** |
+| Heavy (frontier-quality agentic) | ~$1.3–3 | **~2–4** |
 
-Inverting the model (recommended routing + caching, ~$0.55/task, ~$100/mo pulse):
+**Be clear-eyed:** naïve heavy-task throughput is low, and lower than v1 implied.
+Autonomous, multi-step, frontier-quality work is genuinely expensive and frontier
+prices are *rising*. The studio's value is not a magic low price — it's the
+Productivity workstream **driving tokens-per-useful-outcome down over time**
+(scoping, caching, routing), which it can only do once instrumented.
 
-| Monthly budget | ≈ sustainable throughput |
-| --- | --- |
-| $200 | ~6 tasks/day |
-| $500 | ~24 tasks/day |
-| $1,000 | ~55 tasks/day |
-| $2,000 | ~115 tasks/day |
+Scaling bands (mixed workload, same levers): **$200–300/mo** = a handful of heavy
++ tens of mid + hundreds of light per day; **~$1k/mo** ≈ 3–5× that; **~$3k+/mo**
+for sustained heavy throughput.
 
-## 6. Levers, if it's over budget (ranked by impact)
+## 7. Substrate options: metered API, flat-rate, or self-host
 
-1. **Prompt caching** — up to −90% on repeated input; ~−30–50% total. Free; enable everywhere.
-2. **Model routing / downshift** — reserve Opus for the PM; executors on Flash/Sonnet; verify/classify on Haiku/Flash-Lite. −40–70% vs all-frontier.
-3. **Event-driven pulse + cheap triage** — −50–90% of idle cost.
-4. **Batch API (−50%)** for non-urgent async work (research, retro).
-5. **Context / memory scoping** — smaller executor inputs; loops are input-dominated. −20–40%.
-6. **Cap agentic iterations + reflection (~2)** — prevents runaway loops (diminishing returns after ~2, per the reflection research).
-7. **Hard per-workstream budget caps** (policy engine + router) — enforce a ceiling; the PM then trades quality/speed within it.
-8. **Off-host agent offload** — delegate host-resource-free work to the intermittent remote session (this one) at zero marginal API cost where applicable.
-9. **Open-weight self-host** (Kimi K3 / GLM-5.2 / Qwen3) for high-volume cheap tasks — swaps per-token cost for fixed GPU cost at scale.
+The executor tier is where most volume lands, so its substrate drives ROI:
 
-## 7. ROI framing
+- **Metered API** — simplest, pay-per-use; costs as modeled above.
+- **Flat-rate subscription** (Claude Max / Codex-style, ~$100–200/mo *flat*) —
+  for a single power user driving lots of coding, this can beat metered by a wide
+  margin: you escape per-token billing entirely. Often the **best $/throughput
+  for a solo operator's executor/coding tier.**
+- **Self-host / usage-rented GPU** — see below; marginal cost → ~0 at volume.
 
-Cost scales with **throughput** (tasks); value is **experiments shipped / signal
-generated per dollar**. The system is designed to be **budget-bounded**:
+### Self-hosting (local & open-weight)
+Fits the local-first thesis. Three regimes:
 
-- Set a monthly ceiling. The **router + policy budget caps keep spend under it**;
-  the PM manages the quality ↔ speed ↔ cost tradeoff within the cap.
-- Raising the budget or changing scope is a **🛑 stakeholder approval**
-  ([ADR-0006](decisions/0006-stakeholder-comms.md)) — the studio can't silently
-  spend more.
-- **Telemetry closes the loop**: real token/cost/latency per task and per
-  workstream ([ADR-0012](decisions/0012-telemetry-metrics.md)) lets the PM and
-  Retro role see where money goes and optimize, and lets the Spokesman report
-  actual burn vs. budget.
+- **(a) Small local 1B–8B — recommended, near-free.** Runs on the host Mac
+  (Ollama 0.19+ uses an MLX backend). Point the **cheap tier** (routing,
+  classification, extraction) and **local embeddings** (BGE-M3 / Qwen3-Embedding)
+  at it → that whole tier drops toward **$0**. Not for reasoning.
+- **(b) 32B–~200B on one Mac — viable executor.** A Mac Studio M3 Ultra / 192 GB
+  (~$4k) runs Llama-70B at ~25–30 tok/s fully in unified memory; sweet spot
+  32B–200B at 10–30 tok/s for single-user use. Weak at high concurrency. ~6-month
+  payback vs. a ~$700/mo API, and the box also does all the (a) work.
+- **(c) 200B–300B+ (DeepSeek/Qwen-235B/GLM) — don't run your own GPUs solo.**
+  Needs 4–8 datacenter GPUs. **Use a budget open-weight *API* instead** (below).
+
+### On "usage-based GPU rental lowers cost" — yes, and here's the precise picture
+The cost killer is **idle time**, not the hourly rate; reserved 24/7 GPUs waste
+money on bursty solo workloads. Usage-based billing fixes that — but it comes in
+a hierarchy, cheapest first:
+
+1. **Per-token open-weight APIs** (Together / DeepInfra / Fireworks, ~$0.14–0.90/M)
+   — this *is* usage-based GPU rental, abstracted to tokens, with the provider
+   keeping the fleet warm and batched at a scale you can't match. **Cheapest and
+   simplest** for DeepSeek/Qwen/GLM.
+2. **Serverless GPU** (Modal / RunPod serverless / Replicate) — per-second,
+   scale-to-zero, *you* run the server. Wins only for **custom/fine-tuned weights
+   or data control**; you eat **cold-start** (loading hundreds of GB for a 300B
+   takes minutes each cold burst → painful for agentic loops; keeping it warm =
+   paying for idle again).
+3. **On-demand hourly pods** — start/stop yourself; good for *scheduled batch*.
+4. **Reserved** — cheapest per-hour, only for steady high utilization.
+
+**Net:** usage-based is the right instinct, and for standard big open models its
+cheapest form *is a per-token open-weight API* — rental-by-usage done for you.
+Raw serverless/on-demand GPUs win only for custom weights, data residency, or
+sustained high volume (>~100M tok/day). Break-even ≈
+`(monthly GPU cost × 1.3–2.0 ops factor) ÷ blended API $/token`, utilization-adjusted.
+Usage-rented GPUs are also a **no-capex alternative to buying the 192 GB Mac** for
+regime (b). The router treats `local`/rented as just another provider, and
+telemetry ([ADR-0012](decisions/0012-telemetry-metrics.md)) signals when volume
+crosses a break-even.
+
+## 8. ROI framing
+
+Cost scales with **throughput × context weight**; value is **experiments shipped
+/ signal generated per dollar**. The system is **budget-bounded**: set a monthly
+ceiling; the router + policy caps keep spend under it; raising the budget or scope
+is a **🛑 stakeholder approval** ([ADR-0006](decisions/0006-stakeholder-comms.md)).
+Telemetry closes the loop so the PM/Retro can push tokens-per-outcome down.
 
 **Recommended start:** a low cap (**$200–300/mo**), caching on, aggressive
-routing, event-driven pulse. Watch real telemetry in Grafana, and only raise the
-cap for a workstream that has demonstrated ROI.
+scoping + routing, event-driven pulse, cheap tier + embeddings local; executor on
+a flat-rate coding plan or budget-open-weight API. Watch real telemetry; raise the
+cap only for a workstream that has demonstrated ROI.
 
 ## Action for you
 
-This is context for the model-key decision, not a new ask. If a target monthly
-budget is already in your head, tell me and I'll set the initial router policy +
-caps to it. Otherwise I'll default to the $200–300/mo starting envelope above.
+Two inputs shape the initial router policy (neither blocks other work):
+1. **Monthly budget ceiling** — a number, or I default to $200–300/mo.
+2. **Executor substrate** — flat-rate coding subscription (best $/throughput if
+   driven hard), metered API (simplest), or self-host/rented GPU (best at volume).
+   I'll default to a blend: PM on metered frontier + executor on flat-rate/local.
