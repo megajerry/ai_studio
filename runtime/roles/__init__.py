@@ -26,9 +26,21 @@ still an inline string template; skills are injected on top of it.
 
 from __future__ import annotations
 
+from .checkers import (
+    DEFAULT_REGISTRY,
+    ArtifactRef,
+    Checker,
+    CheckerRegistry,
+    CheckResult,
+    UnknownChecker,
+    default_registry,
+    marker_check,
+    resolve_criterion,
+)
 from .executor import ExecutorResult, run_executor
-from .lessons import compose_lessons, inject_lessons
+from .lessons import compose_lessons, inject_lessons, recall_lesson_texts
 from .pm import PlanResult, run_pm_tick
+from .prompt import compose_role_prompt
 from .researcher import (
     RESEARCH_TASK_TYPE,
     ResearchResult,
@@ -54,4 +66,15 @@ __all__ = [
     "RESEARCH_TASK_TYPE",
     "compose_lessons",
     "inject_lessons",
+    "recall_lesson_texts",
+    "compose_role_prompt",
+    "CheckResult",
+    "ArtifactRef",
+    "Checker",
+    "CheckerRegistry",
+    "UnknownChecker",
+    "marker_check",
+    "resolve_criterion",
+    "default_registry",
+    "DEFAULT_REGISTRY",
 ]
