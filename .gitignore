@@ -32,6 +32,10 @@ runtime/search.local.yaml
 state/inbox/whatsapp-inbound.jsonl
 state/inbox/whatsapp-*.jsonl
 
+# Spokesman runtime working state (the notifier's event-log seq cursor) — a
+# per-host runtime pointer, not a committable record (ADR-0011).
+state/spokesman/
+
 # --- Python ---
 __pycache__/
 *.py[cod]

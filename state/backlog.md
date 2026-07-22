@@ -14,33 +14,31 @@ capability-gated tools · M3a supervisor + scheduler · M3b model router · M3c 
 Learning loop (Retro → lessons → injected) · deterministic event replay (bug fix)
 · concurrency/hardening · human-in-loop approvals · review-rigor doctrine
 (ADR-0014) · **real PM** (understand → confidence gate → decompose) · Reviewer /
-Whistle-blower role · WhatsApp Spokesman service (standalone, dormant) ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0014.
+Whistle-blower role · **Researcher role** (external mining → distilled Knowledge
+lessons + candidate skills `reviewed: false`) · WhatsApp Spokesman service +
+**Spokesman↔runtime wiring** (event log / tasks / approvals / spend → 🛑/📣/🚨;
+inbound approve/deny resolves real approvals) · onboarding/secrets · model
+shortlist + cost model · ADRs 0001–0014.
 
 ## 🔄 In progress
 
-- **Researcher role** — mines external via the search gateway → distilled
-  Knowledge lessons + candidate skills (`reviewed: false`). *(building)*
+- _(nothing in flight)_
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
-1. **Spokesman ↔ runtime wiring** — give the Spokesman read access to the runtime
-   event log / tasks / approvals / spend so 🛑/📣/🚨 reflect real studio state, and
-   inbound approve/deny → `approvals.resolve_approval`; batch the pending digest.
-   (Read-side `pending_approvals`/`pending_digest` already exist.)
-2. **Experiment primitive** (venture-studio brain, first object) — an `experiment`
+1. **Experiment primitive** (venture-studio brain, first object) — an `experiment`
    (hypothesis, success metric, budget, kill/scale decision) + one evaluation step.
    Generic machinery; the *first real* experiment needs a product decision (below).
-3. **Real budget enforcement** — per-workstream $/token caps that actually gate
+2. **Real budget enforcement** — per-workstream $/token caps that actually gate
    (today: router downshift + `OverBudget` on dry-run tokens only).
-4. **opencode / Docker sandbox worker** — implement a `SandboxRunner` behind the
+3. **opencode / Docker sandbox worker** — implement a `SandboxRunner` behind the
    `ShellTool` seam and dispatch a "Need Prototype" coding task. (Docker verified
    on host.)
-5. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
+4. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
-6. **Adaptive orchestration intensity** — generalize scaling of review/retro/
+5. **Adaptive orchestration intensity** — generalize scaling of review/retro/
    research by recent error rate + budget/telemetry (today: on_fail/on_risk).
-7. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+6. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
    M1's `EventType` enum).
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)

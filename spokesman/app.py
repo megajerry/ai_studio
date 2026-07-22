@@ -7,19 +7,26 @@ Endpoints:
 - ``POST /webhook``       — inbound messages (HMAC-SHA256 signature verified).
 - ``POST /notify``        — classify + route a studio output (ADR-0006).
 - ``POST /digest/flush``  — send the pending approve/inform digest.
+- ``POST /poll``          — one runtime-bridge notifier pass (event log → sends).
 
-``/notify`` and ``/digest/flush`` are the control plane and require the
-``X-Spokesman-Token`` header (shared secret ``SPOKESMAN_API_TOKEN``); ``/webhook``
-and ``/health`` are public.
+``/notify``, ``/digest/flush`` and ``/poll`` are the control plane and require
+the ``X-Spokesman-Token`` header (shared secret ``SPOKESMAN_API_TOKEN``);
+``/webhook`` and ``/health`` are public.
+
+The Spokesman is wired to the runtime DB via :mod:`spokesman.runtime_bridge`:
+``/poll`` reads new events (past a persisted ``seq`` cursor), routes 🚨 alarms
+immediately and batches 🛑/📣 into the digest; inbound ``approve <id>`` /
+``deny <id>`` resolve a real approval and ``status`` returns live DB counts.
 
 All config/secrets come from the environment (ADR-0011). Runs with no live
-credentials when ``SPOKESMAN_DRY_RUN=1``.
+credentials when ``SPOKESMAN_DRY_RUN=1``; the DB is the live runtime Postgres.
 """
 
 from __future__ import annotations
 
 import hmac
 import logging
+from typing import Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -27,8 +34,17 @@ from pydantic import BaseModel, Field
 
 from .classify import Notifier
 from .config import Settings, get_settings
+from .runtime_bridge import (
+    load_cursor,
+    poll_notifications,
+    resolve,
+    save_cursor,
+    studio_status,
+)
 from .state import (
+    InboundMessage,
     iter_inbound_messages,
+    mask_number,
     record_inbound,
     status_summary,
 )
@@ -37,6 +53,17 @@ from .whatsapp import WhatsAppClient, verify_signature
 logger = logging.getLogger("spokesman.app")
 
 STATUS_KEYWORD = "status"
+#: Inbound command verbs that resolve an approval: ``<verb> <approval-id>``.
+_RESOLVE_VERBS = {"approve", "approved", "deny", "denied", "reject", "yes", "no"}
+
+#: Default DB connection factory (the live runtime Postgres). Injectable for tests.
+ConnectFn = Callable[[], object]
+
+
+def _default_connect() -> object:
+    from runtime import db
+
+    return db.connect()
 
 
 class NotifyRequest(BaseModel):
@@ -44,9 +71,130 @@ class NotifyRequest(BaseModel):
     text: str = Field(..., min_length=1)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    """Application factory (lets tests inject settings / env overrides)."""
+def run_notifier_pass(
+    settings: Settings,
+    notifier: Notifier,
+    connect: ConnectFn,
+) -> dict:
+    """One runtime-bridge pass: event log → classified sends, cursor persisted.
+
+    Reads new events past the persisted ``seq`` cursor, sends 🚨 alarms
+    immediately and batches 🛑/📣 into the pending digest (both via the existing
+    :class:`~spokesman.classify.Notifier` routing), then advances the cursor so no
+    event is ever notified twice. Returns per-tier counts + the new cursor.
+    """
+    conn = connect()
+    try:
+        cursor = load_cursor(settings.state_dir)
+        batch = poll_notifications(conn, cursor)
+    finally:
+        _close(conn)
+
+    alarms = 0
+    digested = 0
+    for item in batch.items:
+        notifier.notify(item.kind.value, item.text)
+        if item.kind.value == "alarm":
+            alarms += 1
+        else:
+            digested += 1
+
+    if batch.cursor != cursor:
+        save_cursor(settings.state_dir, batch.cursor)
+
+    return {
+        "scanned_to_seq": batch.cursor,
+        "alarms_sent": alarms,
+        "digest_queued": digested,
+        "pending_digest": notifier.pending_count,
+    }
+
+
+def handle_inbound_command(
+    settings: Settings,
+    client: WhatsAppClient,
+    connect: ConnectFn,
+    msg: InboundMessage,
+) -> Optional[dict]:
+    """Interpret one inbound message and act (status / approve / deny), or None.
+
+    - ``status``            → live DB summary (falls back to ``state/status.md``).
+    - ``approve <id>`` /
+      ``deny <id>``         → resolve the real approval via the runtime store.
+
+    A reply is always sent for a recognized command (so the stakeholder gets
+    confirmation); unrecognized text is ignored (returns ``None``). The webhook's
+    HMAC gate already authenticated the sender, so no extra auth here.
+    """
+    parts = msg.text.strip().split()
+    if not parts:
+        return None
+    verb = parts[0].lower()
+    to = msg.sender or None
+
+    if verb == STATUS_KEYWORD:
+        try:
+            conn = connect()
+            try:
+                summary = studio_status(conn).render()
+            finally:
+                _close(conn)
+        except Exception:  # DB unreachable → fall back to the git status.md
+            logger.warning("status: DB unreachable, falling back to state/status.md")
+            summary = status_summary(settings)
+        client.send_text(summary, to=to)
+        return {"command": "status"}
+
+    if verb in _RESOLVE_VERBS:
+        if len(parts) < 2:
+            client.send_text(f"Usage: {verb} <approval-id>", to=to)
+            return {"command": verb, "ok": False, "error": "missing id"}
+        approval_id = parts[1]
+        resolver = f"whatsapp:{mask_number(msg.sender)}"
+        try:
+            conn = connect()
+            try:
+                approval = resolve(conn, approval_id, verb, resolver)
+            finally:
+                _close(conn)
+        except ValueError:
+            client.send_text(f"Invalid approval id: {approval_id}", to=to)
+            return {"command": verb, "ok": False, "error": "invalid id"}
+        except Exception:  # noqa: BLE001 - DB unreachable / transient
+            logger.exception("resolve failed for approval %s", approval_id)
+            client.send_text("Could not reach the runtime; try again shortly.", to=to)
+            return {"command": verb, "ok": False, "error": "db unavailable"}
+
+        if approval is None:
+            client.send_text(
+                f"Approval {approval_id} not found or already resolved.", to=to
+            )
+            return {"command": verb, "ok": False, "error": "not pending"}
+        client.send_text(f"Approval {approval_id} {approval.status}.", to=to)
+        return {"command": verb, "ok": True, "status": approval.status}
+
+    return None
+
+
+def _close(conn: object) -> None:
+    try:
+        conn.close()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        pass
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    connect: ConnectFn | None = None,
+) -> FastAPI:
+    """Application factory (lets tests inject settings / a DB connection factory).
+
+    ``connect`` returns an open runtime DB connection (defaults to the live
+    ``runtime.db.connect``); the app closes each connection it opens.
+    """
     settings = settings or get_settings()
+    connect = connect or _default_connect
     client = WhatsAppClient(settings)
     notifier = Notifier(client)
 
@@ -117,8 +265,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         replies = 0
         for msg in messages:
-            if msg.text.strip().lower() == STATUS_KEYWORD:
-                client.send_text(status_summary(settings), to=msg.sender or None)
+            if handle_inbound_command(settings, client, connect, msg) is not None:
                 replies += 1
 
         return JSONResponse({"received": len(messages), "replies": replies})
@@ -130,6 +277,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/digest/flush", dependencies=[Depends(require_api_token)])
     def flush_digest() -> dict:
         return notifier.flush()
+
+    @app.post("/poll", dependencies=[Depends(require_api_token)])
+    def poll() -> dict:
+        return run_notifier_pass(settings, notifier, connect)
 
     return app
 

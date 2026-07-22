@@ -29,9 +29,28 @@ into recallable Knowledge lessons).
 
 - **Genesis task for the host agent:** [`inbox/0001-genesis.md`](inbox/0001-genesis.md)
   — run `./scripts/onboarding.sh` then `./bootstrap` to verify M0 on the host.
-- **Spokesman / WhatsApp channel** — **v1 built** (containerized FastAPI:
-  signature-verified webhook, alarm/approve/inform routing + digest, inbox/status
-  state integration; runs in dry-run with no creds). See
+- **Spokesman / WhatsApp channel — v1 + runtime wiring built & VERIFIED on a live
+  Postgres.** v1: containerized FastAPI (signature-verified webhook,
+  alarm/approve/inform routing + digest, inbox/status state integration; dry-run,
+  no creds). **Runtime wiring** (`spokesman/runtime_bridge.py`, architecture §9):
+  the Spokesman now aggregates all-workstream state from the live event log —
+  `poll_notifications(conn, since_cursor)` reads new events past a monotonic `seq`
+  **cursor** and classifies them 🛑 `approval.requested` (batched digest) / 🚨
+  `review.alarm` (immediate) / 📣 `task.failed_exhausted`+non-HIGH `review.flagged`
+  (feed); `studio_status(conn)` returns live task/approval/spend counts;
+  `resolve(conn, id, approve|deny, resolver)` wraps `approvals.resolve_approval`
+  (worker `resume_approved` then re-queues/fails the blocked task). Wired into the
+  app: `POST /poll` (token-gated) sends 🚨 now + batches 🛑/📣 and persists the
+  cursor (git-ignored `state/spokesman/notify-cursor.txt` → no re-notify); inbound
+  `approve <id>` / `deny <id>` resolve real approvals and `status` replies with DB
+  counts — all keyless dry-run, no secret/arg leakage (notifications built from
+  leak-free payload fields only). Read-side `read_events` gained an additive
+  `since_seq` cursor param. Evidence: `DATABASE_URL=… pytest runtime/tests/
+  spokesman/tests/` = **334 passed, 0 skips** (47 spokesman incl. 17 new
+  runtime-bridge tests: pending 🛑 in poll+digest, 🚨 immediate, inbound
+  approve→resolved+resume_approved re-queues, deny→denied, status real counts,
+  cursor no-dupe, no-secret-leak, `/poll` gated, signed-webhook approve e2e);
+  `python -m runtime.demo` exits 0 (four acts green). See
   [`docs/spokesman-whatsapp.md`](../docs/spokesman-whatsapp.md). Remaining: WhatsApp
   Business provisioning (stakeholder credentials + a public tunnel) + host verify.
 - **M1 — event log / task queue: implemented** on `runtime/eventlog` (see
