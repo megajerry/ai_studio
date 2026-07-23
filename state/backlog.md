@@ -40,6 +40,11 @@ risk/downside/missed_opportunity/alternative concerns + proceed/revise/escalate;
 BOUNDED consult↔revise loop in `roles/pm.py` that decomposes on consensus or
 escalates a genuine disagreement 🛑; opt-in + behavior-preserving; distinct from the
 after-the-fact Reviewer; `critic.reviewed`/`pm.consensus` leak no bodies) ·
+**Evaluation harness v1** (empirical quality framework: coverage wired via
+`pytest-cov`/`.coveragerc`/`make coverage`; seeded-defect **Verifier
+precision/recall** = 1.0/1.0 on a labeled GOOD/BAD corpus incl. hallucinated-success
++ `video_audit` defects; **PM structural decomposition** eval; telemetry-driven
+**`quality_report`** in `runtime/quality.py`; `python -m evals`; `docs/evaluation.md`) ·
 onboarding/secrets · model shortlist + cost model · ADRs 0001–0019.
 
 ## 🔄 In progress
@@ -63,6 +68,12 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0019.
   tunnel, to take the Spokesman channel live. See `docs/spokesman-whatsapp.md`.
 - **Real live-model end-to-end slice** — depends on the keys above; proves a real
   model producing real work + real spend enforced (unblocks after go-live).
+- **Real-model evals + real-integration smoke** — the go-live half of the
+  evaluation harness: real-model golden-set + LLM-as-judge OUTCOME evals, and
+  end-to-end smoke against Docker/Qdrant/live providers/WhatsApp. The harness
+  framework, seams, and report shape already exist (`evals/`, `runtime/quality.py`,
+  `docs/evaluation.md`); this item is the real-model/real-integration content that
+  only becomes measurable once keys land.
 
 ## 🐛 Known follow-up nits (tracked, non-blocking)
 

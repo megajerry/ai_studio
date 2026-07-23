@@ -17,6 +17,7 @@ _Updated: 2026-07-22. Pointers: **what's left** → [`backlog.md`](backlog.md);
 - **Depth:** four-layer Memory · Search gateway · Skills · Learning loop · human-in-loop approvals · budget enforcement · experiment primitive · coding-worker (opencode in sandbox) · DB-outage resilience + remote allowlist · Spokesman↔runtime.
 - **Verticals are config-not-code:** `workstreams/<name>/config.yaml` drives charter/overlays/budget/policy/checkers/memory via the role seams (`docs/task-lifecycle.md`, `workstreams/README.md`); cross-workstream request contract; ADR-0018 isolation.
 - **Doctrine:** evidence-over-claims validators (ADR-0014); every merge gated by an independent review agent.
+- **Evaluation harness v1 (empirical quality):** coverage wired (`make coverage`); seeded-defect **Verifier precision/recall = 1.0/1.0** on a labeled GOOD/BAD corpus (incl. hallucinated-success + `video_audit` defects); **PM structural decomposition** eval; telemetry-driven **`quality_report`** (`runtime/quality.py`); `python -m evals`; honest now-vs-go-live in [`docs/evaluation.md`](../docs/evaluation.md).
 
 ## Boundary — needs stakeholder input (see [`backlog.md`](backlog.md))
 
