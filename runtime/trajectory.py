@@ -182,8 +182,9 @@ def start_trajectory(
                 VALUES (
                     %s, %s, %s, 'open', 'verbatim',
                     COALESCE(%s::timestamptz, now()),
-                    CASE WHEN %s IS NULL THEN NULL
-                         ELSE COALESCE(%s::timestamptz, now()) + make_interval(secs => %s)
+                    CASE WHEN %s::double precision IS NULL THEN NULL
+                         ELSE COALESCE(%s::timestamptz, now())
+                              + make_interval(secs => %s::double precision)
                     END,
                     %s
                 )
