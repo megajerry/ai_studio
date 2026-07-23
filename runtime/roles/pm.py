@@ -71,7 +71,8 @@ from ..model.registry import Registry
 from ..models import Task, TaskStatus, make_event
 from ..skills import SkillRegistry
 from ..task_state import assert_acyclic
-from .critic import CRITIC_ESCALATE, Critique
+from ..trajectory import add_step, close_trajectory, start_trajectory
+from .critic import CRITIC_ESCALATE, CRITIC_REVISE, Critique
 from .lessons import recall_lesson_texts
 from .prompt import compose_role_prompt
 
@@ -108,6 +109,48 @@ CONSENSUS_ESCALATED = "escalated"
 
 #: Default objective when a pulse carries no explicit goal.
 DEFAULT_OBJECTIVE = "Prove the studio operates end-to-end in dry-run."
+
+
+# --- Trajectory recording (ADR-0020) — observe-only, DB-outage-safe ----------
+#
+# The PM's reasoning is persisted as a first-class trajectory (ADR-0020): it is the
+# most critical, least-reversible role, so how it reached a decision must be
+# replayable. Recording is STRICTLY observe-only — it never changes a PM decision —
+# and DEGRADES GRACEFULLY (ADR-0017): with no `conn` (the fake-queue unit paths) or
+# on any trajectory-write failure it logs + returns None so the PM's core function
+# (plan → gate → decompose) NEVER blocks or crashes. Every write goes through the
+# single guarded writer in :mod:`runtime.trajectory` (no ad-hoc SQL here).
+
+
+def _traj_start(conn: Any, workstream: str, goal: str) -> Optional[UUID]:
+    """Open the PM's reasoning trajectory, or ``None`` if unavailable/degraded."""
+    if conn is None:
+        return None
+    try:
+        return start_trajectory(conn, "pm", workstream, goal)
+    except Exception:  # pragma: no cover - defensive: never let recording break the PM
+        log.warning("PM trajectory start failed; proceeding without a trajectory", exc_info=True)
+        return None
+
+
+def _traj_step(conn: Any, tid: Optional[UUID], step_type: str, summary: str, **kw: Any) -> None:
+    """Append one reasoning step, degrading to a no-op on any failure (ADR-0017)."""
+    if conn is None or tid is None:
+        return
+    try:
+        add_step(conn, tid, step_type, summary, **kw)
+    except Exception:  # pragma: no cover - defensive: recording is never load-bearing
+        log.warning("PM trajectory step %r failed; proceeding", step_type, exc_info=True)
+
+
+def _traj_close(conn: Any, tid: Optional[UUID], *, outcome_summary: Optional[str] = None) -> None:
+    """Close the trajectory, degrading to a no-op on any failure (ADR-0017)."""
+    if conn is None or tid is None:
+        return
+    try:
+        close_trajectory(conn, tid, outcome_summary=outcome_summary)
+    except Exception:  # pragma: no cover - defensive
+        log.warning("PM trajectory close failed; proceeding", exc_info=True)
 
 # Base persona prompt. On-demand skills (ADR-0008) are composed in on top of this
 # when a SkillRegistry is supplied — see `_compose_plan_prompt`. The prompt asks
@@ -442,6 +485,7 @@ def _run_consensus(
     skills: Optional[SkillRegistry],
     charter: Optional[str],
     overlay: Optional[str],
+    tid: Optional[UUID] = None,
 ) -> tuple[Plan, str, int, int]:
     """Drive the bounded PM↔Critic consensus loop over ``plan``.
 
@@ -450,6 +494,10 @@ def _run_consensus(
     critic consults happen (hard bound — no infinite loop): each blocking round that
     is not the last revises the plan and re-consults; an ``escalate`` recommendation,
     or the last round still blocking, escalates.
+
+    ``tid`` is the PM's open trajectory (ADR-0020): each consult is recorded by the
+    Critic (via ``trajectory_id``) and each PM revision as a ``revise`` step here.
+    Recording is observe-only — it changes NONE of the loop's decisions.
     """
     current = plan
     outcome = CONSENSUS_AGREED
@@ -469,6 +517,7 @@ def _run_consensus(
             skills=skills,
             charter=charter,
             overlay=overlay,
+            trajectory_id=tid,  # the Critic records the consult step (verdict + concerns)
         )
         concern_count = len(critique.concerns)
         if not critique.blocking:
@@ -481,6 +530,18 @@ def _run_consensus(
             break
         # Blocking + revise, and rounds remain → the PM revises, then re-consults.
         current = _revise_plan(current)
+        _traj_step(
+            conn, tid, "revise",
+            f"revised the plan after the Critic's round {r} blocking critique",
+            rationale=(
+                "Addressed the Critic's addressable gaps deterministically: filled "
+                "any missing per-item success criterion/marker and synthesized an "
+                "aggregate success criterion where the plan had none. No work items "
+                "invented — a genuine structural objection still drives escalation."
+            ),
+            choice=CRITIC_REVISE,
+            refs={"round": r, "concern_count": concern_count},
+        )
     return current, outcome, rounds_run, concern_count
 
 
@@ -519,6 +580,11 @@ def run_pm_tick(
     sink = sink or NullEventSink()
     goal = _resolve_goal(task)
 
+    # Open ONE reasoning trajectory for this pm.tick (ADR-0020). Observe-only +
+    # DB-outage-safe: with no conn / on failure `tid` is None and every _traj_*
+    # below is a no-op, so the PM behaves exactly as before (behavior-preserving).
+    tid = _traj_start(conn, task.workstream, goal)
+
     plan = _obtain_plan(
         conn, task, goal, sink,
         registry=registry, skills=skills, call_model=call_model,
@@ -526,11 +592,43 @@ def run_pm_tick(
     )
     threshold = _confidence_threshold()
 
+    # Record what the PM understood + the decomposition it drafted (verbatim).
+    _traj_step(
+        conn, tid, "observe", "understood the goal and parsed the model's plan",
+        rationale=(
+            f"Goal: {goal}\n"
+            f"Restated goal: {plan.restated_goal}\n"
+            f"Feasible: {plan.feasible}; model reason: {plan.reason or '(none)'}\n"
+            f"Self-scored confidence: {plan.confidence:.2f}"
+        ),
+        confidence=plan.confidence,
+    )
+    _traj_step(
+        conn, tid, "plan",
+        f"drafted a decomposition of {len(plan.work_items)} work item(s)",
+        rationale=(
+            "Success criteria:\n"
+            + ("\n".join(f"- {c}" for c in plan.success_criteria) or "- (none)")
+            + "\nWork items:\n"
+            + ("\n".join(f"- {it.title}: {it.instructions}" for it in plan.work_items)
+               or "- (none)")
+        ),
+        options_considered=[it.title for it in plan.work_items],
+        confidence=plan.confidence,
+    )
+
     # --- Confidence gate (ADR-0003) -----------------------------------------
 
     # 1. Not feasible → push back (a first-class output). Raise a 🛑 approval so a
     #    human decides on the objective/scope concern; enqueue NO work.
     if not plan.feasible:
+        _traj_step(
+            conn, tid, "decide",
+            "confidence gate: judged infeasible → push back",
+            rationale=plan.reason or "requirement judged infeasible / out of scope",
+            options_considered=["decompose", "clarify", "pushback"],
+            choice="pushback", confidence=plan.confidence,
+        )
         sink.emit(
             make_event(
                 workstream=task.workstream,
@@ -554,10 +652,19 @@ def run_pm_tick(
             sink=sink,
             workstream=task.workstream,
         )
+        approval_id = str(approval.id) if approval is not None else None
+        _traj_step(
+            conn, tid, "escalate",
+            "raised a 🛑 pushback approval for a human decision (infeasible)",
+            rationale=plan.reason or "requirement judged infeasible / out of scope",
+            choice=PUSHBACK_TIER, confidence=plan.confidence,
+            refs={"approval_id": approval_id},
+        )
+        _traj_close(conn, tid, outcome_summary="pushback: infeasible / out of scope")
         return PlanResult(
             goal=goal, decision="pushback", restated_goal=plan.restated_goal,
             confidence=plan.confidence, feasible=False, reason=plan.reason,
-            approval_id=str(approval.id) if approval is not None else None,
+            approval_id=approval_id,
         )
 
     # 2. Below threshold (or nothing to decompose) → clarify instead of executing.
@@ -580,10 +687,32 @@ def run_pm_tick(
                 },
             )
         )
+        _traj_step(
+            conn, tid, "decide",
+            "confidence gate: below threshold / nothing to decompose → clarify",
+            rationale=reason,
+            options_considered=["decompose", "clarify", "pushback"],
+            choice="needs_clarification", confidence=plan.confidence,
+            refs={"threshold": threshold},
+        )
+        _traj_close(conn, tid, outcome_summary="needs_clarification")
         return PlanResult(
             goal=goal, decision="needs_clarification", restated_goal=plan.restated_goal,
             confidence=plan.confidence, feasible=True, reason=reason,
         )
+
+    # Gate opened: the plan is feasible + confident enough to commit to.
+    _traj_step(
+        conn, tid, "decide",
+        "confidence gate: feasible and confident → proceed to decompose",
+        rationale=(
+            f"confidence {plan.confidence:.2f} >= threshold {threshold:.2f}; "
+            f"{len(plan.work_items)} work item(s) to decompose"
+        ),
+        options_considered=["decompose", "clarify", "pushback"],
+        choice="proceed", confidence=plan.confidence,
+        refs={"threshold": threshold},
+    )
 
     # 2b. PM↔Critic consensus (ADR-0019, opt-in). The plan is feasible + confident;
     #     BEFORE committing (decompose/enqueue) the PM consults the Critic. The loop
@@ -596,6 +725,7 @@ def run_pm_tick(
             conn, task, plan, threshold, sink,
             critic=critic, rounds=max(1, rounds),
             registry=registry, skills=skills, charter=charter, overlay=overlay,
+            tid=tid,
         )
         sink.emit(
             make_event(
@@ -634,10 +764,20 @@ def run_pm_tick(
                 sink=sink,
                 workstream=task.workstream,
             )
+            approval_id = str(approval.id) if approval is not None else None
+            _traj_step(
+                conn, tid, "escalate",
+                "PM↔Critic could not reach consensus → raised a 🛑 pushback",
+                rationale=reason,
+                choice=PUSHBACK_TIER, confidence=plan.confidence,
+                refs={"rounds": rounds_run, "concern_count": concern_count,
+                      "approval_id": approval_id},
+            )
+            _traj_close(conn, tid, outcome_summary="escalated: unresolved disagreement")
             return PlanResult(
                 goal=goal, decision="pushback", restated_goal=plan.restated_goal,
                 confidence=plan.confidence, feasible=True, reason=reason,
-                approval_id=str(approval.id) if approval is not None else None,
+                approval_id=approval_id,
             )
 
     # 3. Decompose → enqueue ONE work task per work item, each carrying its own
@@ -653,6 +793,10 @@ def run_pm_tick(
     assert_acyclic(edges)  # DependencyCycle on a cyclic / self-referential plan
 
     order = _topo_order(edges)  # prerequisites first, so their ids exist on enqueue
+    # Stamp every created task with this trajectory (ADR-0020 outcome attribution),
+    # but only when a trajectory is actually open — omit the kwarg otherwise so a
+    # fake enqueue seam that predates it keeps working (behavior-preserving).
+    traj_link = {"trajectory_id": tid} if tid is not None else {}
     id_by_index: dict[int, str] = {}
     for i in order:
         item = plan.work_items[i - 1]
@@ -674,10 +818,24 @@ def run_pm_tick(
             },
             priority=task.priority,
             depends_on=[UUID(id_by_index[d]) for d in edges[i]],
+            **traj_link,
         )
         id_by_index[i] = str(work.id)
     # Report ids in the PM's original item order (stable, human-readable).
     work_task_ids = [id_by_index[i] for i in range(1, n + 1)]
+
+    _traj_step(
+        conn, tid, "decompose",
+        f"decomposed the goal into {n} up_for_grabs work item(s)",
+        rationale=(
+            "Enqueued one up_for_grabs task per work item, each carrying its own "
+            "concrete success criterion + marker (the Executor/Verifier contract) "
+            "and its dependency edges, and linked back to this trajectory for "
+            "outcome attribution."
+        ),
+        choice="decompose", confidence=plan.confidence,
+        refs={"task_ids": work_task_ids, "item_count": n},
+    )
 
     sink.emit(
         make_event(
@@ -692,6 +850,17 @@ def run_pm_tick(
             },
         )
     )
+    _traj_step(
+        conn, tid, "commit",
+        f"committed the decomposition (emitted pm.planned; {n} work item(s))",
+        rationale=(
+            f"All {n} work item(s) enqueued and linked to this trajectory; the "
+            "decision is now observable and attributable to its outcomes."
+        ),
+        choice="planned", confidence=plan.confidence,
+        refs={"task_ids": work_task_ids},
+    )
+    _traj_close(conn, tid, outcome_summary=f"planned: decomposed into {n} work item(s)")
     return PlanResult(
         goal=goal, decision="planned", restated_goal=plan.restated_goal,
         confidence=plan.confidence, feasible=True, reason=plan.reason,
