@@ -27,6 +27,13 @@ runtime/models.local.yaml
 runtime/search.yaml
 runtime/search.local.yaml
 
+# Sourcing-agent candidate registry proposals are REVIEWABLE artifacts, not
+# committable records — they go through the PR + review loop before adopting into
+# runtime/models.yaml (ADR-0005). Keep candidates + the proposals dir out of git.
+runtime/models.candidate.yaml
+runtime/proposals/
+proposals/
+
 # Runtime inbound messages captured by the Spokesman may contain personal info
 # (sender numbers, message bodies) — keep them out of git (ADR-0011).
 state/inbox/whatsapp-inbound.jsonl

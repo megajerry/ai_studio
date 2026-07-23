@@ -2,6 +2,37 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
+## Latest (branch `runtime/sourcing` — complete, awaiting review/merge)
+
+**Model Sourcing agent — keeps the registry current through the PR + review loop
+(ADR-0005).** `runtime/roles/sourcing.py` `run_sourcing(conn, task, sink, …)`
+researches models/pricing via the **policy-gated cached search gateway**
+(`search(role="sourcing", …)`, `net.fetch`, keyless dry-run — a role without it is
+DENIED, nothing fetched/cached), synthesizes a PROPOSED registry update whose
+**provenance is grounded in the search results' URLs** (never a bare claim; evidence
+over claims, ADR-0014), runs a traceability-only dry-run `call_model` (does NOT
+decide), and applies the **approval envelope**: a new provider / new tier
+(objective/scope-affecting) / budget-increasing swap → a real 🛑 `request_approval`
+("adopt model registry update"); an in-band swap within the cost/quality band →
+auto-adopt + 📣 `sourcing.autoadopted`. The reviewable candidate is written via the
+policy-gated filesystem tool (`invoke(role="sourcing", fs.write, …)`) to
+`proposals/models.candidate.yaml` (under the confined tool root; git-ignored) — the
+runtime analogue of a PR; it **never mutates the live registry**. `sourcing.*`
+events carry model ids / counts / a provenance **hash** / the decision — never a
+secret/API key or a raw provenance URL. `worker.py` dispatches a
+`research.models`/`sourcing` task to `run_sourcing` and threads NO `enqueue` seam —
+**no sourcing-loop**; `sourcing` added to `policy.example.yaml` at least-privilege
+(`fs.read, fs.write, net.fetch`). Disjoint file set: `runtime/roles/sourcing.py`,
+`runtime/roles/__init__.py` (export), `runtime/worker.py` (dispatch),
+`runtime/policy.example.yaml`, `.gitignore`, tests, `runtime/sourcing.md`. Evidence:
+`DATABASE_URL=… pytest runtime/tests/ spokesman/tests/` = **562 passed, 0 skips**
+(18 new sourcing tests: synthesis grounded in evidence, envelope classification
+in-band/new-provider/budget/new-tier/scope, YAML render, dispatch + no loop for both
+task types, live gateway-gated research, `net.fetch` denial, in-band auto-adopt+📣,
+new-provider **and** budget-increase real 🛑 approval, candidate-write denied without
+`fs.write`, events leak no secret/URL, live registry never mutated); `python -m
+runtime.demo` exits 0 (all five acts green).
+
 ## Latest (branch `runtime/cross-workstream` — complete, awaiting review/merge)
 
 **Cross-workstream request contract — the second half of workstream-bootstrap.**
