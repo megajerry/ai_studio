@@ -45,7 +45,12 @@ after-the-fact Reviewer; `critic.reviewed`/`pm.consensus` leak no bodies) ·
 precision/recall** = 1.0/1.0 on a labeled GOOD/BAD corpus incl. hallucinated-success
 + `video_audit` defects; **PM structural decomposition** eval; telemetry-driven
 **`quality_report`** in `runtime/quality.py`; `python -m evals`; `docs/evaluation.md`) ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0019.
+**Trajectory observability — persistence + writer foundation** (ADR-0020; migration
+0011: `trajectories` + `trajectory_steps` + `tasks.trajectory_id`; single guarded
+writer `runtime/trajectory.py` with gapless per-trajectory `seq`, injectable `now`,
+verbatim→lean rotation + TTL expiry; body-free `trajectory.*` events; outcome-
+attribution join) ·
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0020.
 
 ## 🔄 In progress
 
