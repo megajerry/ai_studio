@@ -100,6 +100,16 @@ EVENT_RESEARCH_COMPLETED = "research.completed"
 EVENT_SOURCING_PROPOSED = "sourcing.proposed"
 EVENT_SOURCING_AUTOADOPTED = "sourcing.autoadopted"
 
+# --- Trajectory observability (runtime.trajectory) --------------------------
+#: The reasoning-trajectory writer (ADR-0020). These are BODY-FREE: payloads carry
+#: ONLY ids / types / seq / step_type / counts — NEVER rationale, summary, goal, or
+#: outcome text (those bodies live in the local DB only; invariants 5 & 6).
+EVENT_TRAJECTORY_STARTED = "trajectory.started"
+EVENT_TRAJECTORY_STEP_ADDED = "trajectory.step_added"
+EVENT_TRAJECTORY_CLOSED = "trajectory.closed"
+EVENT_TRAJECTORY_COMPACTED = "trajectory.compacted"
+EVENT_TRAJECTORY_EXPIRED = "trajectory.expired"
+
 # --- Experiments (runtime.experiment) ---------------------------------------
 EVENT_PROPOSED = "experiment.proposed"
 EVENT_STARTED = "experiment.started"
