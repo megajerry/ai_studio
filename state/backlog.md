@@ -33,7 +33,9 @@ budget headroom; evidence-based, bounded, off by default → behavior-preserving
 models/pricing via the policy-gated search gateway → proposes a reviewable candidate
 registry update + the approval envelope 🛑 provider/budget / auto+📣 in-band;
 evidence-grounded provenance; never mutates the live registry; no loop) ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0018.
+**Event-type constants consolidated** (single `runtime/event_types.py`, pure
+refactor, zero wire-value drift) · onboarding/secrets · model shortlist + cost
+model · ADRs 0001–0018.
 
 ## 🔄 In progress
 
@@ -41,11 +43,9 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0018.
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
-1. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
-   M1's `EventType` enum). Run last / alone (touches many modules).
-
-_After this one, the **buildable** backlog is exhausted — only the
-stakeholder-boundary items below remain._
+- **✅ NONE — the buildable backlog is exhausted.** Everything achievable without
+  stakeholder input (keys / budget / product-scope / provisioning) is built,
+  reviewed under evidence rigor, and merged. Only the boundary items below remain.
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)
 
