@@ -42,11 +42,27 @@ from uuid import UUID
 from pydantic import BaseModel, Field, ValidationError
 
 from ..approvals import request_approval as _request_approval
+from ..crossworkstream import (
+    EVENT_REQUEST_ACCEPTED,
+    EVENT_REQUEST_DECLINED,
+    EVENT_REQUEST_ESCALATED,
+    EVENT_REQUEST_NEEDS_CLARIFICATION,
+    EVENT_REQUEST_UNDER_REVIEW,
+    FEATURE_REQUEST_TYPE,
+    STATUS_ACCEPTED,
+    STATUS_DECLINED,
+    STATUS_ESCALATED,
+    STATUS_NEEDS_CLARIFICATION,
+    STATUS_UNDER_REVIEW,
+    FeatureRequest,
+    emit_request_event,
+    set_request_status,
+)
 from ..enforce import EventSink, NullEventSink
 from ..model.call import call_model as _call_model
 from ..model.providers.dryrun import PLAN_GOAL_OPT
 from ..model.registry import Registry
-from ..models import Task, make_event
+from ..models import Task, TaskStatus, make_event
 from ..skills import SkillRegistry
 from ..task_state import assert_acyclic
 from .lessons import recall_lesson_texts
@@ -474,4 +490,329 @@ def run_pm_tick(
         goal=goal, decision="planned", restated_goal=plan.restated_goal,
         confidence=plan.confidence, feasible=True, reason=plan.reason,
         work_item_count=len(work_task_ids), work_task_ids=work_task_ids,
+    )
+
+
+# --- Cross-workstream request intake / triage (ADR-0018 coordination) --------
+#
+# The RECEIVING PM's added path: it evaluates a `feature_request` addressed to
+# ITS workstream through its OWN success lens and either accepts (decomposes into
+# work items linked to the request), declines (pushback is first-class), asks for
+# clarification, or escalates a portfolio/resource decision as a 🛑 approval.
+# This is additive to `run_pm_tick` — the pm.tick planning path is untouched.
+
+#: The four triage outcomes a receiving PM may return.
+TRIAGE_ACCEPT = "accept"
+TRIAGE_DECLINE = "decline"
+TRIAGE_CLARIFY = "needs_clarification"
+TRIAGE_ESCALATE = "escalate"
+_TRIAGE_DECISIONS = frozenset({TRIAGE_ACCEPT, TRIAGE_DECLINE, TRIAGE_CLARIFY, TRIAGE_ESCALATE})
+
+#: Tier for the 🛑 approval an escalation raises (ADR-0006 "approve (blocks)").
+ESCALATION_TIER = "🛑"
+
+
+class TriageDecision(BaseModel):
+    """A receiving PM's verdict on a feature request (its own-lens evaluation).
+
+    ``decision`` is one of ``accept`` / ``decline`` / ``needs_clarification`` /
+    ``escalate``. On ``accept`` the PM may supply ``work_items`` (its chosen
+    decomposition); if it does not, the request's ``success_criteria`` are
+    decomposed one-per-item. ``reason`` records the rationale for pushback /
+    clarification / escalation (carried on the event, never a body).
+    """
+
+    decision: str
+    reason: str = ""
+    work_items: list[WorkItem] = Field(default_factory=list)
+
+
+class TriageResult(BaseModel):
+    """What the receiving PM decided on a request (ids/counts only, no bodies)."""
+
+    request_id: str
+    from_workstream: str
+    to_workstream: str
+    decision: str
+    reason: str = ""
+    work_item_count: int = 0
+    work_task_ids: list[str] = Field(default_factory=list)
+    approval_id: Optional[str] = None
+
+
+def _default_triage(task: Task, request: FeatureRequest) -> TriageDecision:
+    """The keyless default lens: accept a well-specified request, else clarify.
+
+    A request with no ``success_criteria`` **and** no ``desired_capability`` gives
+    the receiver nothing checkable to build against → ask for clarification. A real
+    model (wired later) can return any of the four via the ``evaluate`` seam; this
+    deterministic default keeps the contract exercisable dry-run/keyless.
+    """
+    if not request.success_criteria and not request.desired_capability.strip():
+        return TriageDecision(
+            decision=TRIAGE_CLARIFY,
+            reason="no success criteria or desired capability to build against",
+        )
+    return TriageDecision(decision=TRIAGE_ACCEPT)
+
+
+def _ensure_in_progress(conn: Any, task: Task, worker_id: str) -> None:
+    """Pick the request task up (up_for_grabs → claimed → in_progress) as the PM.
+
+    Guarded + idempotent: if the task is already past these states each hop
+    no-ops, so triage is safe to run on a freshly-submitted or already-claimed
+    request. Uses the single guarded :func:`runtime.tasks.transition`.
+    """
+    from ..tasks import transition
+
+    transition(
+        conn, task.id, TaskStatus.CLAIMED,
+        agent_id=worker_id, agent_type="pm", claimed_by=worker_id,
+        set_claimed_at=True, set_heartbeat=True,
+        expected_from=TaskStatus.UP_FOR_GRABS,
+    )
+    transition(
+        conn, task.id, TaskStatus.IN_PROGRESS,
+        agent_id=worker_id, agent_type="pm",
+        expected_from=TaskStatus.CLAIMED,
+    )
+
+
+def _decompose_request(
+    conn: Any,
+    task: Task,
+    request: FeatureRequest,
+    items: list[WorkItem],
+    enqueue: Callable[..., Task],
+) -> list[str]:
+    """Enqueue one ``up_for_grabs`` work item per criterion, linked to the request.
+
+    Each work item lands on the RECEIVING workstream's board (``task.workstream``)
+    carrying the requester's ``success_criterion`` as its checkable criterion (the
+    requester defines "done"; the receiver owns "how") plus a back-link
+    (``request_id`` / ``from_workstream``) so the accepted work is traceable to the
+    ask. Runs after :func:`_ensure_in_progress`; returns the created task ids.
+    """
+    n = len(items)
+    ids: list[str] = []
+    for i, item in enumerate(items, start=1):
+        marker = (item.marker or "").strip() or f"request-ok:{task.id}:{i}"
+        wtype = item.type if item.type.startswith("work.") else DEFAULT_WORK_TASK_TYPE
+        criterion = item.success_criterion or f"The artifact contains the marker {marker!r}."
+        work = enqueue(
+            conn,
+            workstream=task.workstream,
+            type=wtype,
+            payload={
+                "goal": item.instructions or request.desired_capability or request.title,
+                "criterion": criterion,
+                "marker": marker,
+                "title": item.title or request.title,
+                "request_id": str(task.id),
+                "from_workstream": request.from_workstream,
+                "item_index": i,
+                "item_count": n,
+                "attempt": 1,
+            },
+            priority=task.priority,
+        )
+        ids.append(str(work.id))
+    return ids
+
+
+def _items_for_accept(decision: TriageDecision, request: FeatureRequest) -> list[WorkItem]:
+    """The decomposition to enqueue on accept: the PM's own, else one per criterion.
+
+    Falls back to a single item built from ``desired_capability`` when the request
+    carries no explicit ``success_criteria`` (the accept branch is only reached
+    when there IS something checkable — see :func:`_default_triage`).
+    """
+    if decision.work_items:
+        return decision.work_items
+    if request.success_criteria:
+        return [
+            WorkItem(
+                title=f"{request.title}: criterion {i}",
+                success_criterion=crit,
+                instructions=request.desired_capability or request.problem,
+            )
+            for i, crit in enumerate(request.success_criteria, start=1)
+        ]
+    return [
+        WorkItem(
+            title=request.title,
+            success_criterion=request.desired_capability,
+            instructions=request.desired_capability or request.problem,
+        )
+    ]
+
+
+def triage_request(
+    conn: Any,
+    task: Task,
+    sink: Optional[EventSink] = None,
+    *,
+    decision: Optional[str] = None,
+    reason: str = "",
+    work_items: Optional[list[WorkItem]] = None,
+    receiving_workstream: Optional[str] = None,
+    worker_id: str = "pm",
+    evaluate: Optional[Callable[[Task, FeatureRequest], TriageDecision]] = None,
+    enqueue: Callable[..., Task] = None,  # type: ignore[assignment]
+    request_approval: Callable[..., Any] = _request_approval,
+) -> TriageResult:
+    """Receiving-PM intake for a ``feature_request`` addressed to its workstream.
+
+    The PM evaluates the request through **its own** success lens and takes one of
+    four first-class paths (pushback/decline is as valid as accept):
+
+    - **accept** → decompose into ``up_for_grabs`` work items linked to the request
+      (the request's ``success_criteria`` become the items' criteria) + emit
+      ``request.accepted``; the request task is driven to ``merged``.
+    - **decline** → emit ``request.declined`` (reason); enqueue NO work; the request
+      task is ``abandoned``.
+    - **needs_clarification** → emit ``request.needs_clarification`` back to the
+      requester; the request task returns to ``up_for_grabs`` to await a reply.
+    - **escalate** → emit ``request.escalated`` + raise a 🛑 ``request_approval``
+      (a portfolio/resource decision — either side may escalate); the request task
+      is parked ``blocked`` on that approval.
+
+    Scope is respected: the task's ``workstream`` is the receiver, and if
+    ``receiving_workstream`` is supplied it must match (else ``ValueError`` — a PM
+    never triages another workstream's request). The decision comes from an
+    explicit ``decision=`` argument, else the injectable ``evaluate`` lens, else the
+    keyless default. ``enqueue`` / ``request_approval`` are injectable for tests.
+    All ``request.*`` events carry ids/decision/reason only — never request bodies.
+    """
+    if task.type != FEATURE_REQUEST_TYPE:
+        raise ValueError(
+            f"triage_request expects a {FEATURE_REQUEST_TYPE!r} task, got {task.type!r}"
+        )
+    if receiving_workstream is not None and receiving_workstream != task.workstream:
+        raise ValueError(
+            f"scope violation: {receiving_workstream!r} may not triage a request "
+            f"addressed to {task.workstream!r}"
+        )
+    if enqueue is None:  # deferred default to avoid an import cycle at module load
+        from ..tasks import enqueue_task
+        enqueue = enqueue_task
+    sink = sink or NullEventSink()
+
+    request = FeatureRequest.from_task(task)
+    to_ws, from_ws = task.workstream, request.from_workstream
+
+    # The PM picks the request up and puts it under review (identity-only event).
+    _ensure_in_progress(conn, task, worker_id)
+    set_request_status(conn, task.id, STATUS_UNDER_REVIEW)
+    emit_request_event(
+        sink, type=EVENT_REQUEST_UNDER_REVIEW, request_id=task.id,
+        from_workstream=from_ws, to_workstream=to_ws, status=STATUS_UNDER_REVIEW,
+    )
+
+    # Resolve the verdict: explicit arg > injected lens > keyless default.
+    if decision is not None:
+        verdict = TriageDecision(
+            decision=decision, reason=reason, work_items=work_items or [],
+        )
+    elif evaluate is not None:
+        verdict = evaluate(task, request)
+    else:
+        verdict = _default_triage(task, request)
+    if verdict.decision not in _TRIAGE_DECISIONS:
+        raise ValueError(
+            f"invalid triage decision {verdict.decision!r} "
+            f"(one of {sorted(_TRIAGE_DECISIONS)})"
+        )
+    verdict_reason = reason or verdict.reason
+
+    from ..tasks import block_task, complete_task, transition
+
+    # --- accept → decompose + link, then merge the request ------------------
+    if verdict.decision == TRIAGE_ACCEPT:
+        items = _items_for_accept(verdict, request)
+        work_task_ids = _decompose_request(conn, task, request, items, enqueue)
+        set_request_status(
+            conn, task.id, STATUS_ACCEPTED, reason=verdict_reason,
+            work_task_ids=work_task_ids,
+        )
+        emit_request_event(
+            sink, type=EVENT_REQUEST_ACCEPTED, request_id=task.id,
+            from_workstream=from_ws, to_workstream=to_ws, status=STATUS_ACCEPTED,
+            decision=STATUS_ACCEPTED, reason=verdict_reason,
+            work_item_count=len(work_task_ids), work_task_ids=work_task_ids,
+        )
+        complete_task(
+            conn, task.id, status=TaskStatus.MERGED,
+            result={"decision": STATUS_ACCEPTED, "work_task_ids": work_task_ids},
+        )
+        return TriageResult(
+            request_id=str(task.id), from_workstream=from_ws, to_workstream=to_ws,
+            decision=STATUS_ACCEPTED, reason=verdict_reason,
+            work_item_count=len(work_task_ids), work_task_ids=work_task_ids,
+        )
+
+    # --- decline → reason, NO work, abandon the request ---------------------
+    if verdict.decision == TRIAGE_DECLINE:
+        set_request_status(conn, task.id, STATUS_DECLINED, reason=verdict_reason)
+        emit_request_event(
+            sink, type=EVENT_REQUEST_DECLINED, request_id=task.id,
+            from_workstream=from_ws, to_workstream=to_ws, status=STATUS_DECLINED,
+            decision=STATUS_DECLINED, reason=verdict_reason,
+        )
+        complete_task(
+            conn, task.id, status=TaskStatus.ABANDONED,
+            result={"decision": STATUS_DECLINED, "reason": verdict_reason},
+        )
+        return TriageResult(
+            request_id=str(task.id), from_workstream=from_ws, to_workstream=to_ws,
+            decision=STATUS_DECLINED, reason=verdict_reason,
+        )
+
+    # --- needs_clarification → back to the requester; re-queue to await reply
+    if verdict.decision == TRIAGE_CLARIFY:
+        set_request_status(
+            conn, task.id, STATUS_NEEDS_CLARIFICATION, reason=verdict_reason,
+        )
+        emit_request_event(
+            sink, type=EVENT_REQUEST_NEEDS_CLARIFICATION, request_id=task.id,
+            from_workstream=from_ws, to_workstream=to_ws,
+            status=STATUS_NEEDS_CLARIFICATION,
+            decision=STATUS_NEEDS_CLARIFICATION, reason=verdict_reason,
+        )
+        # Return the request to the board so a clarified re-submission can be
+        # re-triaged (in_progress → up_for_grabs is the documented recovery edge).
+        transition(
+            conn, task.id, TaskStatus.UP_FOR_GRABS,
+            expected_from=TaskStatus.IN_PROGRESS, clear_claim=True,
+        )
+        return TriageResult(
+            request_id=str(task.id), from_workstream=from_ws, to_workstream=to_ws,
+            decision=STATUS_NEEDS_CLARIFICATION, reason=verdict_reason,
+        )
+
+    # --- escalate → 🛑 approval (portfolio/resource); park the request blocked
+    escalate_reason = verdict_reason or "cross-workstream portfolio/resource decision"
+    approval = request_approval(
+        conn,
+        task_id=task.id,
+        role="pm",
+        tool="request.escalate",
+        capabilities=[],
+        tier=ESCALATION_TIER,
+        reason=escalate_reason,
+        sink=sink,
+        workstream=to_ws,
+    )
+    approval_id = str(approval.id) if approval is not None else None
+    set_request_status(conn, task.id, STATUS_ESCALATED, reason=escalate_reason)
+    emit_request_event(
+        sink, type=EVENT_REQUEST_ESCALATED, request_id=task.id,
+        from_workstream=from_ws, to_workstream=to_ws, status=STATUS_ESCALATED,
+        decision=STATUS_ESCALATED, reason=escalate_reason, approval_id=approval_id,
+    )
+    if approval_id is not None:
+        block_task(conn, task.id, approval_id=approval.id, reason=escalate_reason)
+    return TriageResult(
+        request_id=str(task.id), from_workstream=from_ws, to_workstream=to_ws,
+        decision=STATUS_ESCALATED, reason=escalate_reason, approval_id=approval_id,
     )
