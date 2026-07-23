@@ -79,6 +79,10 @@ EVENT_REQUEST_ESCALATED = "request.escalated"
 EVENT_PM_PLANNED = "pm.planned"
 EVENT_PM_NEEDS_CLARIFICATION = "pm.needs_clarification"
 EVENT_PM_PUSHBACK = "pm.pushback"
+#: PM↔Critic consensus loop outcome (runtime.roles.pm) — rounds + outcome only.
+EVENT_PM_CONSENSUS = "pm.consensus"
+#: Critic (runtime.roles.critic) — a forward-looking critique of a decision.
+EVENT_CRITIC_REVIEWED = "critic.reviewed"
 #: Executor (runtime.roles.executor).
 EVENT_EXECUTOR_ACTED = "executor.acted"
 #: Verifier (runtime.roles.verifier) — the verify→commit decision.

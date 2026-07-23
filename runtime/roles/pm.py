@@ -60,6 +60,7 @@ from ..crossworkstream import (
 )
 from ..enforce import EventSink, NullEventSink
 from ..event_types import (
+    EVENT_PM_CONSENSUS,
     EVENT_PM_NEEDS_CLARIFICATION,
     EVENT_PM_PLANNED,
     EVENT_PM_PUSHBACK,
@@ -70,6 +71,7 @@ from ..model.registry import Registry
 from ..models import Task, TaskStatus, make_event
 from ..skills import SkillRegistry
 from ..task_state import assert_acyclic
+from .critic import CRITIC_ESCALATE, Critique
 from .lessons import recall_lesson_texts
 from .prompt import compose_role_prompt
 
@@ -93,6 +95,16 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.6
 
 #: Tier shown on the 🛑 pushback approval (ADR-0006 "approve (blocks)" class).
 PUSHBACK_TIER = "🛑"
+
+#: Env var + default for the bounded PM↔Critic consensus rounds (ADR-0019). This
+#: caps the consult→revise loop so it can NEVER run unbounded; the last allowed
+#: round, if the Critic still blocks, escalates a genuine disagreement to a human.
+PM_CRITIC_ROUNDS_ENV = "PM_CRITIC_ROUNDS"
+DEFAULT_PM_CRITIC_ROUNDS = 2
+
+#: The two consensus outcomes (emitted on ``pm.consensus``).
+CONSENSUS_AGREED = "consensus"
+CONSENSUS_ESCALATED = "escalated"
 
 #: Default objective when a pulse carries no explicit goal.
 DEFAULT_OBJECTIVE = "Prove the studio operates end-to-end in dry-run."
@@ -133,6 +145,21 @@ def _confidence_threshold() -> float:
             CONFIDENCE_THRESHOLD_ENV, raw, DEFAULT_CONFIDENCE_THRESHOLD,
         )
         return DEFAULT_CONFIDENCE_THRESHOLD
+
+
+def _critic_rounds() -> int:
+    """Bounded PM↔Critic rounds (env ``PM_CRITIC_ROUNDS`` or default; min 1)."""
+    raw = os.environ.get(PM_CRITIC_ROUNDS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_PM_CRITIC_ROUNDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        log.warning(
+            "invalid %s=%r; using default %s",
+            PM_CRITIC_ROUNDS_ENV, raw, DEFAULT_PM_CRITIC_ROUNDS,
+        )
+        return DEFAULT_PM_CRITIC_ROUNDS
 
 
 def _compose_plan_prompt(
@@ -346,6 +373,117 @@ def _obtain_plan(
     return _parse_plan(getattr(completion, "text", ""), goal)
 
 
+# --- PM↔Critic consensus loop (ADR-0019) ------------------------------------
+#
+# After the PM produces a feasible, confident Plan and BEFORE it decomposes /
+# enqueues, it consults the Critic (an opt-in adversarial partner). The loop is
+# BOUNDED (:data:`DEFAULT_PM_CRITIC_ROUNDS`): each round the Critic critiques the
+# CURRENT plan; a non-blocking critique → consensus; a blocking one → the PM
+# revises and re-consults (up to the round cap); an explicit ``escalate`` — or the
+# cap being reached while still blocked — escalates a genuine disagreement to the
+# stakeholder (🛑). Behavior-preserving: with no ``critic`` wired the whole loop is
+# skipped and the PM behaves exactly as before.
+
+
+def _plan_facts(plan: Plan, threshold: float) -> dict:
+    """The plan's STRUCTURED FACTS for the Critic — numbers/flags only (no bodies).
+
+    Everything here is a count or flag safe to compute a fact-based critique from;
+    no instruction, criterion, or goal text is included, so nothing leaks even if a
+    critique were (it never is) logged verbatim.
+    """
+    items = plan.work_items
+    return {
+        "kind": "plan",
+        "confidence": plan.confidence,
+        "threshold": threshold,
+        "feasible": plan.feasible,
+        "n_items": len(items),
+        "n_success_criteria": len(plan.success_criteria),
+        "items_missing_criterion": sum(1 for it in items if not (it.success_criterion or "").strip()),
+        "items_missing_marker": sum(1 for it in items if not (it.marker or "").strip()),
+        "has_dependencies": any(it.depends_on for it in items),
+    }
+
+
+def _revise_plan(plan: Plan) -> Plan:
+    """Deterministically address the Critic's addressable gaps before re-consulting.
+
+    Fills any missing per-item success criterion / marker and synthesizes an
+    aggregate success criterion when the plan has none — the exact gaps the Critic's
+    fact-based ``risk`` concerns flag. Pure (returns a copy); it never invents work
+    items, so a genuine structural objection is NOT silently "fixed" and instead
+    drives the loop to escalation.
+    """
+    revised = plan.model_copy(deep=True)
+    for i, item in enumerate(revised.work_items, start=1):
+        if not (item.marker or "").strip():
+            item.marker = f"studio-ok:revised:{i}"
+        if not (item.success_criterion or "").strip():
+            item.success_criterion = f"The artifact contains the marker {item.marker!r}."
+    if not revised.success_criteria and revised.work_items:
+        revised.success_criteria = [
+            f"All {len(revised.work_items)} work items complete and each artifact "
+            "contains its success marker."
+        ]
+    return revised
+
+
+def _run_consensus(
+    conn: Any,
+    task: Task,
+    plan: Plan,
+    threshold: float,
+    sink: EventSink,
+    *,
+    critic: Callable[..., Critique],
+    rounds: int,
+    registry: Optional[Registry],
+    skills: Optional[SkillRegistry],
+    charter: Optional[str],
+    overlay: Optional[str],
+) -> tuple[Plan, str, int, int]:
+    """Drive the bounded PM↔Critic consensus loop over ``plan``.
+
+    Returns ``(plan, outcome, rounds_run, final_concern_count)`` where ``outcome`` is
+    :data:`CONSENSUS_AGREED` or :data:`CONSENSUS_ESCALATED`. At most ``rounds``
+    critic consults happen (hard bound — no infinite loop): each blocking round that
+    is not the last revises the plan and re-consults; an ``escalate`` recommendation,
+    or the last round still blocking, escalates.
+    """
+    current = plan
+    outcome = CONSENSUS_AGREED
+    rounds_run = 0
+    concern_count = 0
+    for r in range(1, rounds + 1):
+        rounds_run = r
+        critique = critic(
+            "plan",
+            _plan_facts(current, threshold),
+            sink=sink,
+            conn=conn,
+            task_id=task.id,
+            workstream=task.workstream,
+            subject_kind="plan",
+            registry=registry,
+            skills=skills,
+            charter=charter,
+            overlay=overlay,
+        )
+        concern_count = len(critique.concerns)
+        if not critique.blocking:
+            outcome = CONSENSUS_AGREED
+            break
+        if critique.recommendation == CRITIC_ESCALATE or r == rounds:
+            # Genuine disagreement — an explicit escalate, or the bound reached
+            # while still blocked. The PM could not drive to consensus → 🛑.
+            outcome = CONSENSUS_ESCALATED
+            break
+        # Blocking + revise, and rounds remain → the PM revises, then re-consults.
+        current = _revise_plan(current)
+    return current, outcome, rounds_run, concern_count
+
+
 def run_pm_tick(
     conn: Any,
     task: Task,
@@ -355,6 +493,8 @@ def run_pm_tick(
     skills: Optional[SkillRegistry] = None,
     charter: Optional[str] = None,
     overlay: Optional[str] = None,
+    critic: Optional[Callable[..., Critique]] = None,
+    critic_rounds: Optional[int] = None,
     enqueue: Callable[..., Task] = None,  # type: ignore[assignment]
     call_model: Callable[..., Any] = _call_model,
     request_approval: Callable[..., Any] = _request_approval,
@@ -365,6 +505,13 @@ def run_pm_tick(
     DB) and to ``call_model`` for token accounting. ``enqueue``, ``call_model`` and
     ``request_approval`` are injectable so a test drives every gate branch with
     fakes and no database (defaults are the real functions).
+
+    ``critic`` is the opt-in PM↔Critic consensus seam (ADR-0019): when supplied
+    (a :func:`runtime.roles.critic.run_critic`-shaped callable), a feasible +
+    confident plan is critiqued BEFORE decompose in a BOUNDED loop
+    (``critic_rounds`` / ``PM_CRITIC_ROUNDS``); an unresolved genuine disagreement
+    escalates a 🛑 ``pushback`` and enqueues no work. With ``critic=None`` (default)
+    the consult is skipped and behavior is unchanged.
     """
     if enqueue is None:  # deferred default to avoid an import cycle at module load
         from ..tasks import enqueue_task
@@ -437,6 +584,61 @@ def run_pm_tick(
             goal=goal, decision="needs_clarification", restated_goal=plan.restated_goal,
             confidence=plan.confidence, feasible=True, reason=reason,
         )
+
+    # 2b. PM↔Critic consensus (ADR-0019, opt-in). The plan is feasible + confident;
+    #     BEFORE committing (decompose/enqueue) the PM consults the Critic. The loop
+    #     is BOUNDED; on unresolved genuine disagreement it escalates a 🛑 pushback
+    #     to the stakeholder and enqueues NO work. With no critic wired this whole
+    #     block is skipped — the PM behaves exactly as before (behavior-preserving).
+    if critic is not None:
+        rounds = critic_rounds if critic_rounds is not None else _critic_rounds()
+        plan, outcome, rounds_run, concern_count = _run_consensus(
+            conn, task, plan, threshold, sink,
+            critic=critic, rounds=max(1, rounds),
+            registry=registry, skills=skills, charter=charter, overlay=overlay,
+        )
+        sink.emit(
+            make_event(
+                workstream=task.workstream,
+                type=EVENT_PM_CONSENSUS,
+                task_id=task.id,
+                payload={
+                    "goal": goal,
+                    "rounds": rounds_run,
+                    "outcome": outcome,
+                    "concern_count": concern_count,
+                },
+            )
+        )
+        if outcome == CONSENSUS_ESCALATED:
+            reason = (
+                "PM↔Critic could not reach consensus after "
+                f"{rounds_run} round(s); escalating a genuine disagreement"
+            )
+            sink.emit(
+                make_event(
+                    workstream=task.workstream,
+                    type=EVENT_PM_PUSHBACK,
+                    task_id=task.id,
+                    payload={"goal": goal, "confidence": plan.confidence, "reason": reason},
+                )
+            )
+            approval = request_approval(
+                conn,
+                task_id=task.id,
+                role="pm",
+                tool="pm.consensus",
+                capabilities=[],
+                tier=PUSHBACK_TIER,
+                reason=reason,
+                sink=sink,
+                workstream=task.workstream,
+            )
+            return PlanResult(
+                goal=goal, decision="pushback", restated_goal=plan.restated_goal,
+                confidence=plan.confidence, feasible=True, reason=reason,
+                approval_id=str(approval.id) if approval is not None else None,
+            )
 
     # 3. Decompose → enqueue ONE work task per work item, each carrying its own
     #    concrete criterion + marker (the Executor/Verifier contract) and its

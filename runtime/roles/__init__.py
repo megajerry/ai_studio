@@ -37,6 +37,13 @@ from .checkers import (
     marker_check,
     resolve_criterion,
 )
+from .critic import (
+    Concern,
+    Critique,
+    assess_concerns,
+    decide as critic_decide,
+    run_critic,
+)
 from .executor import ExecutorResult, run_executor
 from .lessons import compose_lessons, inject_lessons, recall_lesson_texts
 from .pm import PlanResult, run_pm_tick
@@ -61,6 +68,11 @@ from .verifier import VerifyResult, verify
 __all__ = [
     "PlanResult",
     "run_pm_tick",
+    "Concern",
+    "Critique",
+    "run_critic",
+    "assess_concerns",
+    "critic_decide",
     "ExecutorResult",
     "run_executor",
     "VerifyResult",

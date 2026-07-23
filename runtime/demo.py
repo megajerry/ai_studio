@@ -29,7 +29,15 @@ from .memory import recall_lessons
 from .migrate import migrate
 from .models import Task, TaskStatus, make_event
 from .policy import load_policy
+from .roles.critic import (
+    KIND_RISK,
+    SEVERITY_HIGH,
+    Concern,
+    Critique,
+    run_critic,
+)
 from .roles.lessons import inject_lessons
+from .roles.pm import run_pm_tick
 from .roles.researcher import RESEARCH_TASK_TYPE
 from .roles.reviewer import REVIEW_TASK_TYPE, run_review
 from .roles.verifier import VerifyResult
@@ -213,6 +221,45 @@ def _demonstrate_research(conn, registry, config, worker_id: str) -> bool:
                 and len(after) > before and n_tasks == 1)
 
 
+def _demonstrate_critic(conn, skills) -> bool:
+    """Show the Critic as a FORWARD adversarial partner + the PM↔Critic consensus
+    loop: (1) on a healthy plan the Critic finds nothing blocking → the PM drives to
+    consensus and decomposes; (2) on an unresolved genuine disagreement the loop is
+    BOUNDED and escalates a 🛑 pushback to the stakeholder (never an infinite loop).
+    Distinct from the after-the-fact Reviewer: it critiques BEFORE commitment."""
+    ws = f"critic-{uuid4().hex[:8]}"
+    sink = DbEventSink(conn)
+    print(f"\n=== critic / PM↔Critic consensus demo (workstream={ws}) ===")
+
+    # 1. Consensus — the real Critic critiques the PM's (dry-run) plan; nothing
+    #    blocking → the PM proceeds and decomposes into work items.
+    pm_task = enqueue_task(conn, workstream=ws, type="pm.tick",
+                           payload={"goal": "prove the critic partners on decisions"})
+    consented = run_pm_tick(conn, pm_task, sink, skills=skills,
+                            critic=run_critic, critic_rounds=2)
+    n_work = _count_work_tasks(conn, ws)
+    print(f"  consensus: PM decision={consented.decision!r} → decomposed into {n_work} work item(s)")
+
+    # 2. Escalation — a Critic that keeps a fundamental objection through the bound.
+    #    The PM cannot drive to consensus → 🛑 pushback (no work enqueued).
+    def stubborn(subject, context=None, **kw):
+        run_critic(subject, context, sink=sink, conn=conn,
+                   workstream=ws, task_id=kw.get("task_id"))  # still emits critic.reviewed
+        return Critique(subject_kind="plan", blocking=True, recommendation="revise",
+                        concerns=[Concern(kind=KIND_RISK, severity=SEVERITY_HIGH,
+                                          statement="fundamental objection")])
+
+    esc_task = enqueue_task(conn, workstream=ws, type="pm.tick",
+                            payload={"goal": "ship despite a fundamental objection"})
+    escalated = run_pm_tick(conn, esc_task, sink, skills=skills,
+                            critic=stubborn, critic_rounds=2)
+    print(f"  escalation: PM decision={escalated.decision!r} "
+          f"(🛑 approval raised={bool(escalated.approval_id)})")
+
+    return bool(consented.decision == "planned" and n_work > 1
+                and escalated.decision == "pushback" and escalated.approval_id)
+
+
 def _demonstrate_workstream_config(conn, scratch: str) -> bool:
     """Show a vertical is CONFIG, not code: a workstreams/<name>/config.yaml drives
     the runtime. Bootstrap seeds its memory (idempotently) + budget; the config's
@@ -361,7 +408,11 @@ def main() -> int:
         configured = _demonstrate_workstream_config(conn, scratch)
         print(f"runtime.demo: {'OK — vertical defined by config drove the runtime (charter/checker/budget/policy/seed, scope-isolated)' if configured else 'WORKSTREAM-CONFIG INCOMPLETE'}")
 
-        return 0 if (ok and learned and reviewed and researched and configured) else 1
+        # Sixth act: demonstrate the Critic (forward partner) + PM↔Critic consensus.
+        critiqued = _demonstrate_critic(conn, skills)
+        print(f"runtime.demo: {'OK — critic partnered forward (consensus decomposed, unresolved disagreement escalated 🛑)' if critiqued else 'CRITIC INCOMPLETE'}")
+
+        return 0 if (ok and learned and reviewed and researched and configured and critiqued) else 1
     finally:
         conn.close()
 
