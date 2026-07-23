@@ -23,13 +23,13 @@ from typing import Optional
 from uuid import UUID
 
 from ..enforce import EventSink, NullEventSink
+from ..event_types import EVENT_MODEL_ROUTED
 from ..models import make_event
 from ..policy import BudgetContext
 from .registry import ModelSpec, Registry, Tier, load_registry
 
-#: Canonical event type for a routing decision (free-form `type` column; sits
-#: alongside M1 `task.*` and M2 `policy.*`/`tool.*` types).
-EVENT_MODEL_ROUTED = "model.routed"
+#: The routing-decision event type (``model.routed``) is imported from the
+#: canonical :mod:`runtime.event_types`.
 
 _VALID_QUALITY = {"high", "standard", "low"}
 

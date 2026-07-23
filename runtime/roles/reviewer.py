@@ -52,6 +52,18 @@ from pydantic import BaseModel, Field
 from ..approvals import request_approval as _request_approval
 from ..enforce import EventSink, InvokeStatus, NullEventSink, invoke
 from ..events import read_events
+from ..event_types import (
+    EVENT_APPROVAL_REQUESTED,
+    EVENT_POLICY_DECISION,
+    EVENT_REVIEW_ALARM,
+    EVENT_REVIEW_FLAGGED,
+    EVENT_REVIEW_PASSED,
+    EVENT_TASK_FINISHED,
+    EVENT_TASK_REKICKED,
+    EVENT_VERIFY_FAILED,
+    EVENT_VERIFY_PASSED,
+    EVENT_WORK_RETRY,
+)
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
@@ -59,11 +71,9 @@ from ..policy import PolicyConfig
 from ..skills import SkillRegistry, compose_prompt
 from ..tools import ToolRegistry
 
-#: Role events. ``review.passed`` / ``review.flagged`` are the verdict; ``review.alarm``
-#: is the 🚨 raised on a HIGH-severity finding (ADR-0006).
-EVENT_REVIEW_PASSED = "review.passed"
-EVENT_REVIEW_FLAGGED = "review.flagged"
-EVENT_REVIEW_ALARM = "review.alarm"
+#: Role verdict/alarm events (``review.passed`` / ``review.flagged``; ``review.alarm``
+#: is the 🚨 raised on a HIGH-severity finding, ADR-0006) are imported from the
+#: canonical :mod:`runtime.event_types`.
 
 #: The queue task type the worker enqueues to run a review (dispatched to run_review).
 REVIEW_TASK_TYPE = "review"
@@ -253,21 +263,21 @@ def _gather_facts_from_trail(
 
     # A success CLAIM (to be tested), read from the trail or the recorded outcome.
     finished_done = any(
-        getattr(e, "type", "") == "task.finished"
+        getattr(e, "type", "") == EVENT_TASK_FINISHED
         and (getattr(e, "payload", {}) or {}).get("status") == "done"
         for e in events
     )
-    claims_success = outcome == "done" or "verify.passed" in types or finished_done
+    claims_success = outcome == "done" or EVENT_VERIFY_PASSED in types or finished_done
 
     fail_signals = (
-        types.count("verify.failed") + types.count("work.retry") + types.count("task.rekicked")
+        types.count(EVENT_VERIFY_FAILED) + types.count(EVENT_WORK_RETRY) + types.count(EVENT_TASK_REKICKED)
     )
     deny_count = sum(
         1 for e in events
-        if getattr(e, "type", "") == "policy.decision"
+        if getattr(e, "type", "") == EVENT_POLICY_DECISION
         and (getattr(e, "payload", {}) or {}).get("effect") == "deny"
     )
-    pend_count = types.count("approval.requested")
+    pend_count = types.count(EVENT_APPROVAL_REQUESTED)
 
     return ReviewFacts(
         claims_success=claims_success,

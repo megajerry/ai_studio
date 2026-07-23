@@ -36,6 +36,7 @@ from typing import Any, Optional
 from pydantic import BaseModel
 
 from ..enforce import EventSink, NullEventSink
+from ..event_types import EVENT_VERIFY_FAILED, EVENT_VERIFY_PASSED
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
@@ -46,9 +47,8 @@ from .checkers import DEFAULT_REGISTRY, ArtifactRef, CheckerRegistry, resolve_cr
 from .executor import ExecutorResult
 from .prompt import compose_role_prompt
 
-#: Role events for the verify→commit decision.
-EVENT_VERIFY_PASSED = "verify.passed"
-EVENT_VERIFY_FAILED = "verify.failed"
+#: The verify→commit decision events (``verify.passed`` / ``verify.failed``) are
+#: imported from the canonical :mod:`runtime.event_types`.
 
 # Base persona prompt. On-demand skills (ADR-0008) — notably `rigorous-review`
 # (ADR-0014, the evidence-over-claims doctrine) — are composed on top when a

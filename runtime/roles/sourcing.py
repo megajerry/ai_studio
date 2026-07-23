@@ -66,6 +66,7 @@ from pydantic import BaseModel, Field
 
 from ..approvals import request_approval as _request_approval
 from ..enforce import EventSink, InvokeStatus, NullEventSink, invoke
+from ..event_types import EVENT_SOURCING_AUTOADOPTED, EVENT_SOURCING_PROPOSED
 from ..model.call import call_model as _call_model
 from ..model.registry import ModelSpec, Registry, Tier, load_registry
 from ..models import Task, make_event
@@ -75,11 +76,9 @@ from ..tools import ToolRegistry
 
 log = logging.getLogger("runtime.roles.sourcing")
 
-#: Role event: a candidate registry update was proposed (counts/ids/hash/decision).
-EVENT_SOURCING_PROPOSED = "sourcing.proposed"
-
-#: 📣 Role event: an in-band swap was auto-adopted (within the cost/quality band).
-EVENT_SOURCING_AUTOADOPTED = "sourcing.autoadopted"
+#: The sourcing events (``sourcing.proposed`` — a candidate registry update was
+#: proposed; 📣 ``sourcing.autoadopted`` — an in-band swap within the cost/quality
+#: band) are imported from the canonical :mod:`runtime.event_types`.
 
 #: The queue task types the worker dispatches to :func:`run_sourcing`.
 SOURCING_TASK_TYPES = ("research.models", "sourcing")

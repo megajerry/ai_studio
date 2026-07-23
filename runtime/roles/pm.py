@@ -59,6 +59,11 @@ from ..crossworkstream import (
     set_request_status,
 )
 from ..enforce import EventSink, NullEventSink
+from ..event_types import (
+    EVENT_PM_NEEDS_CLARIFICATION,
+    EVENT_PM_PLANNED,
+    EVENT_PM_PUSHBACK,
+)
 from ..model.call import call_model as _call_model
 from ..model.providers.dryrun import PLAN_GOAL_OPT
 from ..model.registry import Registry
@@ -70,10 +75,9 @@ from .prompt import compose_role_prompt
 
 log = logging.getLogger("runtime.roles.pm")
 
-#: Role events for the three confidence-gate outcomes.
-EVENT_PM_PLANNED = "pm.planned"
-EVENT_PM_NEEDS_CLARIFICATION = "pm.needs_clarification"
-EVENT_PM_PUSHBACK = "pm.pushback"
+#: The three confidence-gate outcome events (``pm.planned`` /
+#: ``pm.needs_clarification`` / ``pm.pushback``) are imported from the canonical
+#: :mod:`runtime.event_types`.
 
 #: Default work-task type for an item that does not name one (Executor + Verifier
 #: service any ``work.*`` task). A non-``work.*`` type is coerced to this so the

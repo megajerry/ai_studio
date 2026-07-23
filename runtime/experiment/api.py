@@ -30,6 +30,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from ..approvals import request_approval
+from ..event_types import EVENT_EVALUATED, EVENT_OBSERVED, EVENT_PROPOSED, EVENT_STARTED
 from ..models import make_event
 from ..tasks import enqueue_task, task_cost
 from .models import (
@@ -47,11 +48,8 @@ from .models import (
 if TYPE_CHECKING:  # avoid importing psycopg-heavy modules at runtime just for types
     from ..enforce import EventSink
 
-# --- Canonical event types (owned here) -------------------------------------
-EVENT_PROPOSED = "experiment.proposed"
-EVENT_STARTED = "experiment.started"
-EVENT_OBSERVED = "experiment.observation"
-EVENT_EVALUATED = "experiment.evaluated"
+# The ``experiment.*`` event types are imported from the canonical
+# :mod:`runtime.event_types` and re-exported from :mod:`runtime.experiment`.
 
 #: Success-metric names read straight from spend telemetry (fully evidence-based,
 #: no observation needed): maps a metric name → which measured spend it reads.

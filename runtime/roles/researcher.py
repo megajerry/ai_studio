@@ -47,6 +47,7 @@ from ..enforce import EventSink, InvokeStatus, NullEventSink, invoke
 from ..memory import add_lesson as _add_lesson
 from ..model.call import call_model as _call_model
 from ..model.registry import Registry
+from ..event_types import EVENT_RESEARCH_COMPLETED
 from ..models import Task, make_event
 from ..policy import PolicyConfig
 from ..search import SearchResult, search as _search
@@ -54,8 +55,8 @@ from ..tools import ToolRegistry
 
 log = logging.getLogger("runtime.roles.researcher")
 
-#: Role event: a research task gathered N results and distilled M lessons.
-EVENT_RESEARCH_COMPLETED = "research.completed"
+#: Role event (``research.completed``): a research task gathered N results and
+#: distilled M lessons. Imported from the canonical :mod:`runtime.event_types`.
 
 #: The queue task type the worker dispatches to :func:`run_research`.
 RESEARCH_TASK_TYPE = "research"

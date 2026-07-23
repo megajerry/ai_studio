@@ -37,6 +37,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+from .event_types import EVENT_TASK_REKICKED, EVENT_VERIFY_FAILED
+
 log = logging.getLogger("runtime.adaptive")
 
 # --- Legal, bounded mode vocabularies (mirror runtime.worker's constants) -----
@@ -62,7 +64,7 @@ RESEARCH_OFF = "off"
 #: episode as "went wrong". These are facts the runtime already records: a failed
 #: verify and a supervisor re-kick. (Abandonment + review.flagged are handled
 #: separately below because they are attributed differently.)
-_ERROR_EVENT_TYPES = ("verify.failed", "task.rekicked")
+_ERROR_EVENT_TYPES = (EVENT_VERIFY_FAILED, EVENT_TASK_REKICKED)
 
 
 # --- Configuration (env defaults; deterministic thresholds) ------------------

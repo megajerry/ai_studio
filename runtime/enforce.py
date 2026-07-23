@@ -44,17 +44,17 @@ from .approvals import (
     request_approval,
 )
 from .capabilities import ActionTier
+from .event_types import EVENT_POLICY_DECISION, EVENT_TOOL_INVOKED
 from .models import EventIn, make_event
 from .policy import Decision, Effect, PolicyConfig, PolicyRequest, decide, load_policy
 from .tools import ToolRegistry
 from .tools.base import ToolResult
 
-# Canonical event types this layer emits. The events table's `type` column is
-# free-form text (see runtime/README.md), so M2 defines its own alongside M1's
-# task.* types without changing the merged schema. The approval.* wires are owned
-# by :mod:`runtime.approvals` and re-exported here for a single import surface.
-EVENT_POLICY_DECISION = "policy.decision"
-EVENT_TOOL_INVOKED = "tool.invoked"
+# The event types this layer emits (``policy.decision`` / ``tool.invoked``) come
+# from the canonical :mod:`runtime.event_types`; the events table's ``type``
+# column is free-form text (see runtime/README.md). The approval.* wires are
+# imported from :mod:`runtime.approvals` above and re-exported here for a single
+# import surface.
 
 
 # --- Event sinks ------------------------------------------------------------
