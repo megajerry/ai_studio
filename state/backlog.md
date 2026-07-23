@@ -20,21 +20,16 @@ DAG + telemetry** (ADR-0015; migration 0008) · **Real per-workstream budget
 enforcement** (migration 0010) · **DB-outage resilience + remote host-restricted
 access** (ADR-0017) · **Experiment primitive** (ADR-0016; migration 0009) ·
 **Coding-worker dispatch** (opencode inside the sandbox; `code.run` 🔴) ·
-**Role-customization seams** (`runtime/roles/prompt.py` `compose_role_prompt`
-[base→charter→overlay→skills→lessons→task, behavior-preserving] + `roles/checkers.py`
-pluggable verify-checker registry [structured criterion, marker back-compat,
-evidence-based, e.g. `video_audit`]) · **Workstream config/registration** (a
-vertical is config-not-code: `runtime/workstream/` `WorkstreamConfig` from
-`workstreams/<name>/config.yaml` [charter/overlays/budget/policy-grants/skills/
-checkers/memory-seed/bucket] drives the runtime seams via minimal worker wiring,
-behavior-preserving with no config, scope-isolated; `bootstrap_workstream`
-idempotently seeds memory+budget; ADR-0018 vertical isolation) · **Cross-workstream
-request contract** (the other half of workstream-bootstrap: a typed
-`feature_request` on the receiver's task board + receiving-PM
-intake/triage/decompose/decline/clarify + symmetric 🛑 escalation; verticals
-coordinate via the board/event log, never direct calls; events leak no bodies;
-`runtime/crossworkstream.py` + `roles/pm.py` `triage_request`; `docs/cross-workstream.md`)
-· onboarding/secrets · model shortlist + cost model · ADRs 0001–0018.
+**Role-customization seams** (prompt-assembly layer + pluggable verify-checker
+registry, e.g. `video_audit`) · **Workstream config/registration** (a vertical is
+config-not-code; `runtime/workstream/`; ADR-0018 vertical isolation) ·
+**Cross-workstream request contract** (typed `feature_request` + receiving-PM
+intake/triage/decompose/decline/clarify + symmetric 🛑 escalation; coordinate via
+the board, never direct calls; `runtime/crossworkstream.py` + `roles/pm.py`
+`triage_request`) · **Adaptive orchestration intensity** (ADR-0003:
+`runtime/adaptive.py` scales review/retro/research by real recent error rate +
+budget headroom; evidence-based, bounded, off by default → behavior-preserving) ·
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0018.
 
 ## 🔄 In progress
 
@@ -44,11 +39,11 @@ coordinate via the board/event log, never direct calls; events leak no bodies;
 
 1. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
-2. **Adaptive orchestration intensity** — generalize scaling of review/retro/
-   research by recent error rate + budget/telemetry (today: on_fail/on_risk).
-3. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
-   M1's `EventType` enum). Do last / alone (touches many modules). _(Now also
-   includes the `request.*` wires in `runtime/crossworkstream.py`.)_
+2. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+   M1's `EventType` enum). Run last / alone (touches many modules).
+
+_After these two, the **buildable** backlog is exhausted — only the
+stakeholder-boundary items below remain._
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)
 
@@ -70,11 +65,13 @@ coordinate via the board/event log, never direct calls; events leak no bodies;
 - `state/status.md` should keep an evidence-based (command + count) status line.
 - Budget pre-call USD estimate uses input-only pricing (conservative under-count).
 - `call.py` budget step-comment numbering is off-by-one (cosmetic).
+- `effective_policy` REPLACE-not-union for a workstream's role grants (documented).
 
 ## Context (from the PM audit, 2026-07-22)
 
 Verdict was **AT-RISK**: the *platform substrate* is A-grade and verified, but the
-*venture-studio value layer* had not begun and the PM was a stub. The real-PM +
-experiment-primitive + role-customization-seam milestones close most of that gap;
-a first real vertical (needs a product decision) remains the path to an actual
-venture studio. Everything is still **dry-run/keyless** until go-live keys.
+*venture-studio value layer* had not begun and the PM was a stub. The real-PM,
+experiment-primitive, role-customization-seam, and workstream-bootstrap milestones
+close that gap; a **first real vertical** (needs a product decision) remains the
+path to an actual venture studio. Everything is still **dry-run/keyless** until
+go-live keys.
