@@ -4,7 +4,7 @@ _Maintained by the Productivity workstream. Updated as items land. Milestone
 detail + evidence live in `git log` and `state/status.md`; this file is the
 "what's left" list._
 
-_Last updated: 2026-07-22._
+_Last updated: 2026-07-23._
 
 ## ✅ Done (merged to `main`, verified on a live Postgres unless noted)
 
@@ -40,16 +40,31 @@ risk/downside/missed_opportunity/alternative concerns + proceed/revise/escalate;
 BOUNDED consult↔revise loop in `roles/pm.py` that decomposes on consensus or
 escalates a genuine disagreement 🛑; opt-in + behavior-preserving; distinct from the
 after-the-fact Reviewer; `critic.reviewed`/`pm.consensus` leak no bodies) ·
-**Evaluation harness v1** (empirical quality framework: coverage wired via
-`pytest-cov`/`.coveragerc`/`make coverage`; seeded-defect **Verifier
-precision/recall** = 1.0/1.0 on a labeled GOOD/BAD corpus incl. hallucinated-success
-+ `video_audit` defects; **PM structural decomposition** eval; telemetry-driven
-**`quality_report`** in `runtime/quality.py`; `python -m evals`; `docs/evaluation.md`) ·
-**Trajectory observability — persistence + writer foundation** (ADR-0020; migration
-0011: `trajectories` + `trajectory_steps` + `tasks.trajectory_id`; single guarded
-writer `runtime/trajectory.py` with gapless per-trajectory `seq`, injectable `now`,
-verbatim→lean rotation + TTL expiry; body-free `trajectory.*` events; outcome-
-attribution join) ·
+**Evaluation harness v2** (empirical quality framework, now statistically honest:
+**corpus-as-data** `evals/corpus/*.yaml` (7 verifier + 3 PM cases, all v1 coverage
+preserved); **CI-aware metrics** — every rate carries `n` + Wilson 95% CI +
+`INSUFFICIENT(n<30)` flag, so a 1.0 on tiny n reads as `[0.566,1.0] INSUFFICIENT`,
+not a trustworthy number; **swappable LLM-judge** (`evals/judge.py` via
+`runtime.model.call` — dry-run today, real model at go-live with zero code change,
+proven by a replay cassette); **record/replay** VCR (`evals/replay.py`);
+**trajectory-level eval** scoring a persisted PM trajectory against a rubric;
+coverage wired (`make coverage`); telemetry `quality_report`; `python -m evals`;
+`docs/evaluation.md` corrects the v1 tiny-n overclaim) ·
+**Trajectory observability — full stack** (ADR-0020; migration 0011:
+`trajectories` + `trajectory_steps` + `tasks.trajectory_id`): single guarded writer
+`runtime/trajectory.py` (gapless per-trajectory `seq`, injectable `now`, body-free
+`trajectory.*` events, verbatim→lean rotation + TTL expiry) · **PM + Critic emit
+reasoning trajectories** (`roles/pm.py`/`roles/critic.py`: ordered
+observe→plan→decide→consult→revise→decompose→escalate→commit steps w/ verbatim
+rationale + confidence; decomposed tasks stamped w/ `trajectory_id`; DB-outage-safe,
+behavior-preserving) · **outcome attribution + CI-aware PM decision-quality metrics**
+(`runtime/quality.py`: joins trajectory→tasks→lifecycle outcomes → first-pass-merge
+/rework/escalation/abandoned rates, each w/ `n` + Wilson CI + insufficient-sample
+flag) · **live-session ingest bridge** (`runtime/trajectory_ingest.py` + CLI —
+ingests an off-host/uninstrumented agent's trajectory via the guarded writer so the
+running session is measurable) · **learning-agent rotation/TTL worker**
+(`runtime/trajectory_worker.py` + launchd plist: TTL expiry + opt-in verbatim→lean
+rotation of Retro-mined trajectories) ·
 onboarding/secrets · model shortlist + cost model · ADRs 0001–0020.
 
 ## 🔄 In progress
@@ -74,11 +89,13 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0020.
 - **Real live-model end-to-end slice** — depends on the keys above; proves a real
   model producing real work + real spend enforced (unblocks after go-live).
 - **Real-model evals + real-integration smoke** — the go-live half of the
-  evaluation harness: real-model golden-set + LLM-as-judge OUTCOME evals, and
-  end-to-end smoke against Docker/Qdrant/live providers/WhatsApp. The harness
-  framework, seams, and report shape already exist (`evals/`, `runtime/quality.py`,
-  `docs/evaluation.md`); this item is the real-model/real-integration content that
-  only becomes measurable once keys land.
+  evaluation harness. The *mechanism* now fully exists keyless (eval-v2): swappable
+  LLM-judge (dry-run→real, zero code change), record/replay cassettes, CI-aware
+  metrics, corpus-as-data, trajectory-level scoring, and live-session trajectory
+  ingest. What remains needs keys/providers: a larger real-model golden-set + the
+  real LLM-as-judge OUTCOME numbers (with CIs), and end-to-end smoke against
+  Docker/Qdrant/live providers/WhatsApp. Only the real-model *content* is pending,
+  not the harness.
 
 ## 🐛 Known follow-up nits (tracked, non-blocking)
 
@@ -89,6 +106,13 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0020.
 - Budget pre-call USD estimate uses input-only pricing (conservative under-count).
 - `call.py` budget step-comment numbering is off-by-one (cosmetic).
 - `effective_policy` REPLACE-not-union for a workstream's role grants (documented).
+- Eval-harness auto-seeds throwaway `eval-traj-*` trajectory rows each run
+  (isolated, not in the telemetry rollup); wants periodic cleanup if run often.
+- Trajectory-writer in-repo concurrency test is sequential-interleaved (the
+  mechanism was proven race-free out-of-band with an 8-thread load); wants a
+  threaded regression test.
+- Ingest CLI could scrub/warn on non-synthetic example files (invariant documented;
+  shipped example is synthetic).
 
 ## Context (from the PM audit, 2026-07-22)
 
