@@ -1,0 +1,36 @@
+# Judge rubrics for the swappable LLM-as-judge (harness v2).
+#
+# A rubric is the scoring contract handed to the judge (evals/judge.py). Today the
+# judge runs against the DRYRUN provider (deterministic, keyless); when a real key
+# lands the SAME rubric is sent to a real model with ZERO code change. The judge
+# asks the model to score the item against these criteria and return a JSON verdict
+# {"verdict": "pass"|"fail", "score": 0..1, "rationale": "..."}.
+#
+# pass_threshold: score >= threshold => verdict "pass".
+
+rubrics:
+  pm_decision_quality:
+    id: pm_decision_quality
+    description: >
+      Judge the DECISION QUALITY of a persisted PM reasoning trajectory
+      (trajectories/trajectory_steps): did the PM observe the goal, weigh options,
+      decide with a rationale, and reach a coherent, well-formed outcome?
+    pass_threshold: 0.5
+    criteria:
+      - "The trajectory names the goal it is deciding on."
+      - "It records at least one decision (a 'decide' or 'plan' step) with a rationale."
+      - "It considers more than one option before committing (options_considered)."
+      - "It commits to a concrete choice with a stated confidence."
+      - "The outcome is coherent with the recorded steps (no unexplained jump)."
+
+  verifier_outcome_quality:
+    id: verifier_outcome_quality
+    description: >
+      (Reference/future) Judge whether a produced artifact actually MEETS its
+      success criterion beyond the mechanical evidence check — the real-model
+      OUTCOME eval that plugs in at go-live. Wired here so the seam exists now.
+    pass_threshold: 0.6
+    criteria:
+      - "The artifact addresses the stated goal, not a different task."
+      - "It satisfies the success criterion in substance, not just by keyword."
+      - "It contains no obvious defect a human reviewer would reject."

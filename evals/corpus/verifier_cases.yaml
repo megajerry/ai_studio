@@ -1,0 +1,79 @@
+# Seeded-defect corpus for the Verifier evidence gate (ADR-0014).
+#
+# Corpus-as-data (harness v2): these labeled cases used to be hardcoded in
+# evals/verifier_eval.py. They now live here, versioned, so the set can grow to
+# hundreds of cases WITHOUT a code change — add rows, not Python. Each case is a
+# labeled (artifact, criterion, expected pass/fail) tuple; the positive class for
+# the confusion matrix is "defective" (expected_pass: false).
+#
+# Templating: the loader substitutes {good_marker} / {bad_marker} with per-run
+# UNIQUE success markers (so markers never collide across cases or runs — the same
+# guarantee the old uuid4-based Python had). `require` blocks are passed verbatim
+# to the video_audit domain checker.
+#
+# Fields per case:
+#   name          unique id (also the scratch filename stem)
+#   label         human tag: "GOOD" or "BAD:<why>"
+#   check         "marker" | "video_audit"
+#   expected_pass true = should PASS the gate (good work); false = defective
+#   content       artifact text written to the scratch dir (null = no artifact)
+#   marker        (marker check) the success marker that must be present
+#   require       (video_audit) min_duration / max_duration / require_captions
+#   claimed_ok    what the Executor ASSERTS about its own result (default true).
+#                 Deliberately true on some defects = hallucinated-success cases
+#                 the gate must FAIL on evidence, not on the claim.
+
+cases:
+  # --- marker checker ------------------------------------------------------
+  - name: marker_good
+    label: GOOD
+    check: marker
+    expected_pass: true
+    marker: "{good_marker}"
+    content: "{good_marker}\ngoal: ship the thing\ndone\n"
+
+  - name: marker_missing_hallucinated_success
+    label: "BAD:hallucinated-success (marker absent, claims ok)"
+    check: marker
+    expected_pass: false
+    claimed_ok: true
+    marker: "{bad_marker}"
+    content: "looks fine, trust me — all done!\n"   # no marker present
+
+  - name: marker_missing_honest_fail
+    label: "BAD:marker absent"
+    check: marker
+    expected_pass: false
+    claimed_ok: false
+    marker: "{bad_marker}"
+    content: "partial output, incomplete\n"
+
+  # --- video_audit domain checker -----------------------------------------
+  - name: video_good
+    label: GOOD
+    check: video_audit
+    expected_pass: true
+    require: {min_duration: 10, max_duration: 60, require_captions: true}
+    content: "title: launch teaser\nduration_seconds: 30\ncaptions: present\n"
+
+  - name: video_duration_too_short
+    label: "BAD:wrong-duration (too short)"
+    check: video_audit
+    expected_pass: false
+    require: {min_duration: 10, max_duration: 60, require_captions: true}
+    content: "title: blip\nduration_seconds: 3\ncaptions: present\n"
+
+  - name: video_duration_too_long
+    label: "BAD:wrong-duration (too long)"
+    check: video_audit
+    expected_pass: false
+    require: {min_duration: 10, max_duration: 60, require_captions: true}
+    content: "title: overlong\nduration_seconds: 120\ncaptions: present\n"
+
+  - name: video_missing_captions_hallucinated_success
+    label: "BAD:missing-captions (claims ok)"
+    check: video_audit
+    expected_pass: false
+    claimed_ok: true
+    require: {min_duration: 10, max_duration: 60, require_captions: true}
+    content: "title: no caps\nduration_seconds: 30\ncaptions: absent\n"
