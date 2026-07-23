@@ -42,6 +42,7 @@ from ..memory import add_lesson as _add_lesson
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
+from .critic import Critique
 
 #: Role event (``retro.completed``): a retro distilled + stored N lessons for a
 #: target task. Imported from the canonical :mod:`runtime.event_types`.
@@ -118,6 +119,9 @@ class RetroResult(BaseModel):
     lessons_count: int
     #: Knowledge-layer ids of the stored lessons (ids only — no text).
     lesson_ids: list[str] = []
+    #: The Critic's recommendation on the lessons, if a critic was consulted
+    #: (``proceed`` / ``revise``); ``None`` when no critic was wired (ADR-0019).
+    critic_recommendation: Optional[str] = None
 
 
 def run_retro(
@@ -127,6 +131,7 @@ def run_retro(
     *,
     model_registry: Optional[Registry] = None,
     max_lessons: int = MAX_LESSONS,
+    critic: Optional[Callable[..., Critique]] = None,
     add_lesson: Callable[..., Any] = _add_lesson,
     read: Callable[..., list] = read_events,
 ) -> RetroResult:
@@ -138,6 +143,12 @@ def run_retro(
     up to ``max_lessons`` lessons, stores each in the Knowledge layer, and emits
     ``retro.completed`` (count + task ref only — never lesson text). Never enqueues
     another task (no retro-loop). ``add_lesson``/``read`` are injectable for tests.
+
+    ``critic`` is the opt-in Critic consult (ADR-0019): when supplied (a
+    :func:`runtime.roles.critic.run_critic`-shaped callable) it challenges the
+    distilled lessons BEFORE they are stored — a single bounded, advisory consult
+    that records the recommendation and emits ``critic.reviewed`` (counts only).
+    With ``critic=None`` (default) the retro behaves exactly as before.
     """
     sink = sink or NullEventSink()
     payload = task.payload or {}
@@ -176,10 +187,41 @@ def run_retro(
         workstream=task.workstream,
     )
 
-    # 3. Distill (bounded, single-pass) and store each lesson in Knowledge memory.
+    # 3. Distill (bounded, single-pass).
     lessons = distill_lessons(
         event_types, outcome=outcome, target_task_type=target_type, max_lessons=max_lessons
     )
+
+    # 3b. Critic consult (ADR-0019, opt-in): the Critic challenges the distilled
+    #     lessons — are these the right lessons? what is missing? — BEFORE they are
+    #     stored. Bounded (a single consult, no loop) and advisory (a retro is not a
+    #     human-gated commitment); it records the recommendation and emits
+    #     `critic.reviewed` (counts only). With no critic wired this is skipped
+    #     (behavior-preserving). Facts are counts/flags only — never lesson text.
+    critic_recommendation: Optional[str] = None
+    if critic is not None:
+        has_prevention = any(
+            "prevent" in text.lower() or "first attempt" in text.lower()
+            for text in lessons
+        )
+        critique = critic(
+            "lessons",
+            {
+                "kind": "lessons",
+                "n_lessons": len(lessons),
+                "outcome": outcome,
+                "target_task_type": target_type,
+                "has_prevention_lesson": has_prevention,
+            },
+            sink=sink,
+            conn=conn,
+            task_id=task.id,
+            workstream=task.workstream,
+            subject_kind="lessons",
+        )
+        critic_recommendation = critique.recommendation
+
+    # 3c. Store each lesson in the Knowledge memory layer.
     lesson_ids: list[str] = []
     for text in lessons:
         item = add_lesson(
@@ -216,4 +258,5 @@ def run_retro(
         outcome=outcome,
         lessons_count=len(lessons),
         lesson_ids=lesson_ids,
+        critic_recommendation=critic_recommendation,
     )

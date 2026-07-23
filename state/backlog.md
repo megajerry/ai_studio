@@ -34,8 +34,13 @@ models/pricing via the policy-gated search gateway → proposes a reviewable can
 registry update + the approval envelope 🛑 provider/budget / auto+📣 in-band;
 evidence-grounded provenance; never mutates the live registry; no loop) ·
 **Event-type constants consolidated** (single `runtime/event_types.py`, pure
-refactor, zero wire-value drift) · onboarding/secrets · model shortlist + cost
-model · ADRs 0001–0018.
+refactor, zero wire-value drift) · **Critic role + PM↔Critic consensus loop**
+(ADR-0019: `runtime/roles/critic.py` — forward adversarial partner returning
+risk/downside/missed_opportunity/alternative concerns + proceed/revise/escalate;
+BOUNDED consult↔revise loop in `roles/pm.py` that decomposes on consensus or
+escalates a genuine disagreement 🛑; opt-in + behavior-preserving; distinct from the
+after-the-fact Reviewer; `critic.reviewed`/`pm.consensus` leak no bodies) ·
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0019.
 
 ## 🔄 In progress
 

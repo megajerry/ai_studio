@@ -19,18 +19,20 @@ to the dry-run provider when no key is present.
 | `roles/executor.py` | `run_executor` — DO the work: a policy-gated `filesystem` write + a `call_model` dry-run call |
 | `roles/verifier.py` | `verify` — INDEPENDENT verify→commit gate (read-only); returns pass/fail |
 | `roles/reviewer.py` | `run_review` — INDEPENDENT risk/disaster guard (read-only): reads a finished episode's trail + artifact, computes fact-based risk signals; emits `review.passed`/`review.flagged` (+ 🚨 `review.alarm` / 🛑 approval on HIGH) |
+| `roles/critic.py` | `run_critic` — FORWARD-looking adversarial partner on a **decision** (before commitment): from a proposal's structured facts it returns a `Critique` (`concerns[]` of kind risk/downside/missed_opportunity/alternative + severity, `blocking`, `recommendation ∈ proceed/revise/escalate`); emits `critic.reviewed` (counts/kinds only). Drives the PM↔Critic consensus loop in `pm.py` |
 | `roles/retro.py` | `run_retro` — distill 1-3 durable **lessons** from an episode's trail into Knowledge memory; emits `retro.completed` (count only) |
 | `roles/researcher.py` | `run_research` — mine **external** best-practice: `search()` via the policy-gated gateway (`net.fetch`) → `call_model(task_type=research)` dry-run → distill 1-3 **lessons** into Knowledge memory (+ optional `reviewed: false` candidate skill, off by default); emits `research.completed` (topic-hash + counts only); enqueues nothing (no loop) |
 | `roles/lessons.py` | `inject_lessons`/`compose_lessons`/`recall_lesson_texts` — recall + auto-inject the durable lessons into a role's prompt (`### Lessons`), the deterministic apply-the-lesson step |
 | `roles/prompt.py` | `compose_role_prompt` — the single role prompt assembler: shared base → workstream charter → per-role overlay → skills → lessons → task, each bounded/delimited (behavior-preserving default). The **vertical-customization seam** for prompts; see [`roles-customization.md`](roles-customization.md) |
 | `roles/checkers.py` | pluggable **verify-checker registry**: `Checker` protocol + `CheckerRegistry` + `ArtifactRef` + default `marker` checker + `resolve_criterion` (structured `{check, require}`, marker-string back-compat). A vertical registers a domain check (e.g. `video_audit`) with no Verifier change |
 | `worker.py` | `run_once` (claim → dispatch → heartbeat → verify→commit; triggers Retro on terminal work), `run()`/`main()` |
-| `demo.py` | `python -m runtime.demo` — four acts against a live DB (skips w/o DB): end-to-end loop, learning loop, Reviewer guard, and the **Researcher** (search gateway → distilled recallable lessons) |
+| `demo.py` | `python -m runtime.demo` — six acts against a live DB (skips w/o DB): end-to-end loop, learning loop, Reviewer guard, Researcher (search gateway → distilled lessons), workstream-config-drives-the-vertical, and the **Critic / PM↔Critic consensus** (consensus decomposes; unresolved disagreement escalates 🛑) |
 | `tests/test_roles.py` | role units + policy-gate refusals (🔴 delete/shell) — keyless, no DB |
 | `tests/test_role_seams.py` | the customization seams: prompt assembler (behavior-preserving + layering/bounded, charter/overlay flow through PM/Executor/Verifier) + verify-checker registry (default marker, custom `video_audit` dispatched by structured criterion, facts beat a false "done" claim, unknown check errors) — keyless, no DB |
 | `tests/test_worker.py` | full loop via an in-memory fake queue; verify-fail re-enqueue |
 | `tests/test_retro.py` | lesson distillation + retro trigger policy + NO retro-loop; live-DB run_retro |
 | `tests/test_reviewer.py` | pure `assess_risks` signals + `WORKER_REVIEW` trigger policy + NO review-loop; live-DB `run_review` (evidence beats a lying model, HIGH → 🚨/🛑, events leak no secrets) |
+| `tests/test_critic.py` | pure `assess_concerns`/`decide` verdict + evidence-beats-a-lying-model; PM↔Critic consensus (blocking → revise → proceed / escalate 🛑; BOUNDED, no loop); behavior-preserving with no critic; `critic.reviewed`/`pm.consensus` leak no bodies; live-DB loop |
 | `tests/test_researcher.py` | finding distillation (bounded, adaptive-lite) + research dispatch + NO research-loop; live-DB `run_research` (gateway-gated search, `net.fetch` denial, recallable lessons, events leak no bodies, drafted skill `reviewed: false` excluded by inject gate) |
 | `tests/test_lessons.py` | lesson injection: bounded/scoped, behavior-preserving with no lessons |
 
@@ -164,6 +166,55 @@ the guard only when the episode looks risky (failed / re-kicked / over budget) �
 `always` reviews every episode; `off` disables it. A `review` task dispatches to
 `run_review` and **never enqueues another task**, so it can trigger neither another
 review nor a retro — there is no review-loop (nor a review↔retro loop).
+
+## Critic — the forward adversarial partner + PM↔Critic consensus (ADR-0019)
+
+Where the Reviewer guards **completed work after the fact**, the **Critic**
+(`roles/critic.py`) is a **before-the-fact** adversarial partner on a **decision**
+the PM is about to commit to (a plan, a major choice, a set of distilled lessons).
+Its job is to find what is **wrong or missing** — not to agree.
+
+| | **Reviewer / Whistle-blower** (`reviewer.py`) | **Critic** (`critic.py`) |
+| --- | --- | --- |
+| Subject | A *finished* episode (work already done) | A *proposed* decision (not yet committed) |
+| Timing | **After** the fact | **Before** commitment |
+| Output | risk signals → `review.flagged` (+ 🚨/🛑 on HIGH) | `Critique`: `concerns[]` (risk / downside / missed_opportunity / alternative) + `blocking` + `recommendation ∈ {proceed, revise, escalate}` |
+| Effect | Raises an alarm; never blocks the queue | Drives the PM↔Critic consensus loop; unresolved → 🛑 to the stakeholder |
+| Verdict basis | FACTS it observes (trail + artifact) — a lying model changes nothing (ADR-0014) | FACTS of the proposal (`assess_concerns`) — a lying model changes nothing (ADR-0014) |
+
+**The consensus loop (`run_pm_tick`, opt-in via `critic=`).** ADR-0003's operating
+pattern, made concrete: **PM proposes → Critic critiques → PM drives to consensus
+(revise or justify) → converge, or escalate a genuine disagreement (🛑).**
+
+```
+PM produces a feasible + confident Plan
+        │  (BEFORE decompose/enqueue, if a critic is wired)
+        ▼  for round in 1..PM_CRITIC_ROUNDS (default 2):   [BOUNDED — never a loop]
+   Critic: run_critic(plan facts)  ──emits──> critic.reviewed (counts/kinds/severities/rec)
+        ├─ not blocking            → consensus → decompose + enqueue as usual
+        ├─ blocking + revise + rounds remain → PM revises the plan, re-consults
+        └─ escalate, OR last round still blocking → 🛑 pm.pushback + approval  [NO work]
+        ▼
+   ──emits──> pm.consensus (rounds, outcome)
+```
+
+- **Bounded, no loop.** At most `PM_CRITIC_ROUNDS` (env, default `2`) consults; the
+  last round, if still blocked, escalates rather than iterating. `_revise_plan`
+  addresses the Critic's *addressable* gaps (fills missing per-item criteria/markers,
+  synthesizes an aggregate criterion) but never invents work items — so a genuine
+  structural objection is NOT silently "fixed" and correctly drives escalation.
+- **Escalation is first-class.** An unresolved genuine disagreement emits
+  `pm.pushback` + raises a 🛑 human approval (the same path as an infeasible
+  requirement) and enqueues no work.
+- **Opt-in + behavior-preserving.** With `critic=None` (default) the whole block is
+  skipped — the PM plans exactly as before (existing tests unchanged). The **Retro**
+  takes the same opt-in `critic=`: a single bounded, **advisory** challenge of the
+  distilled lessons *before* they are stored (records the recommendation; a retro is
+  not a human-gated commitment).
+- **No leakage.** `critic.reviewed` carries `subject_kind` + `concern_count` +
+  kind/severity counts + `blocking` + `recommendation`; `pm.consensus` carries
+  `rounds` + `outcome` + `concern_count`. Neither carries a plan body, lesson text,
+  concern prose, or secret (invariants 5 & 6).
 
 ## The learning loop (ADR-0003)
 
@@ -324,6 +375,9 @@ verification) — it never hangs.
   `on_risk` fires only on a failed / re-kicked / over-budget episode).
 - `PM_CONFIDENCE_THRESHOLD` — the PM confidence gate threshold (default `0.6`);
   a plan scoring below it yields `pm.needs_clarification` instead of executing.
+- `PM_CRITIC_ROUNDS` — bound on the PM↔Critic consensus loop (default `2`, min `1`);
+  the loop revises + re-consults up to this many rounds, then escalates 🛑 if still
+  blocked. Only in effect when a `critic=` is wired (opt-in, ADR-0019).
 - `MODELS_DRY_RUN=1` — force keyless dry-run (the demo sets this).
 
 ## Verify
