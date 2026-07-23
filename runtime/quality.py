@@ -24,6 +24,12 @@ Metrics (each rate is ``None`` when its denominator is 0, never a divide-by-zero
   tasks, amortized over the count of merged tasks.
 - **avg latency per completed task** — summed lifecycle latency of merged tasks
   over the count of merged tasks; plus the mean per-transition latency.
+- **pm_decision_quality** — OUTCOME ATTRIBUTION for PM decisions: joins each
+  ``trajectory`` → the ``tasks`` it created → those tasks' lifecycle outcomes to
+  score first-pass-merge / rework / escalation / abandoned rates. Every rate is
+  reported with its sample size ``n``, a **Wilson 95% CI**, and an
+  ``insufficient_sample`` flag (``n < 30``) so a point estimate on a tiny sample is
+  never mistaken for a trustworthy signal. See :func:`pm_decision_quality`.
 
 NOTE (honest scope): dry-run means COST/TOKENS are the router's deterministic
 dry-run estimates and OUTCOME quality is not yet measured — these rollups measure
@@ -33,16 +39,219 @@ real models are wired at go-live. See ``docs/evaluation.md``.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 import psycopg
 
 from .tasks import model_rollup
 
+#: Below this many outcome samples a rate is statistically untrustworthy — a point
+#: estimate like "1.0" on n=3 is noise, not signal. Rates computed on fewer than
+#: this many trials are flagged ``insufficient_sample=True`` (see ``_rate_ci``).
+MIN_TRUSTWORTHY_SAMPLE = 30
+
 
 def _ratio(num: float, den: float) -> Optional[float]:
     """``num/den`` rounded, or ``None`` when the denominator is 0 (undefined)."""
     return round(num / den, 4) if den else None
+
+
+def wilson_interval(
+    successes: int, n: int, z: float = 1.96
+) -> Optional[tuple[float, float]]:
+    """Wilson score confidence interval for a binomial proportion.
+
+    Returns ``(lower, upper)`` (each clamped to ``[0, 1]``, rounded to 4dp) for the
+    ``successes``-of-``n`` proportion at confidence level ``z`` (default ``1.96`` =
+    95%), or ``None`` when ``n == 0`` (no sample → the interval is undefined). The
+    Wilson interval is used instead of the naive normal approximation precisely
+    because it stays sensible at the extremes (p near 0 or 1) and small ``n`` — e.g.
+    5/5 does NOT give ``[1.0, 1.0]`` but ``[0.566, 1.0]``, honestly reflecting that
+    a perfect-but-tiny sample is weak evidence.
+
+    Pure/deterministic — no I/O, no DB — so it is trivially unit-testable.
+    """
+    if n <= 0:
+        return None
+    if successes < 0 or successes > n:
+        raise ValueError(f"successes={successes} out of range for n={n}")
+    p = successes / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2 * n)) / denom
+    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))
+    lower = max(0.0, center - margin)
+    upper = min(1.0, center + margin)
+    return (round(lower, 4), round(upper, 4))
+
+
+def _rate_ci(successes: int, n: int) -> dict:
+    """A rate reported HONESTLY: point estimate + sample size + 95% CI + a flag.
+
+    Bundles ``rate`` (``successes/n`` or ``None`` for ``n==0``), the raw
+    ``successes``/``n``, the Wilson 95% ``ci95`` (``None`` for ``n==0``), and
+    ``insufficient_sample`` (``True`` when ``n < MIN_TRUSTWORTHY_SAMPLE``). This is
+    the anti-pattern fix: a rate never travels without its ``n`` and CI, so a "1.0"
+    on ``n=3`` can't be mistaken for a trustworthy result.
+    """
+    return {
+        "rate": _ratio(successes, n),
+        "successes": int(successes),
+        "n": int(n),
+        "ci95": wilson_interval(successes, n),
+        "insufficient_sample": n < MIN_TRUSTWORTHY_SAMPLE,
+    }
+
+
+#: The four PM decision-outcome axes, all reported over the same denominator
+#: ``n`` = terminal (merged/abandoned) tasks the decision created.
+_PM_METRICS = (
+    "first_pass_merge_rate",  # merged with no reviewer_blocked / review rework
+    "rework_rate",            # hit reviewer_blocked or bounced review → in_progress
+    "escalation_rate",        # parked 'blocked' on a 🔴 approval at some point
+    "abandoned_rate",         # reached terminal 'abandoned'
+)
+
+
+def _empty_pm_metrics() -> dict:
+    """The four outcome rates on an empty sample (all ``n=0`` → None-safe)."""
+    return {m: _rate_ci(0, 0) for m in _PM_METRICS}
+
+
+def _metrics_from_counts(row: dict) -> dict:
+    """Build the four ``_rate_ci`` metric blocks from one aggregated counts row.
+
+    ``row`` carries ``n_terminal`` (the shared denominator) plus the success counts
+    ``first_pass`` / ``rework`` / ``escalation`` / ``abandoned``.
+    """
+    n = int(row["n_terminal"])
+    return {
+        "first_pass_merge_rate": _rate_ci(int(row["first_pass"]), n),
+        "rework_rate": _rate_ci(int(row["rework"]), n),
+        "escalation_rate": _rate_ci(int(row["escalation"]), n),
+        "abandoned_rate": _rate_ci(int(row["abandoned"]), n),
+    }
+
+
+def pm_decision_quality(
+    conn: psycopg.Connection, workstream: Optional[str] = None
+) -> dict:
+    """Outcome-attribution rollup: PM decision quality, scored by what its tasks did.
+
+    Joins ``trajectories`` → the ``tasks`` each created (``tasks.trajectory_id``) →
+    those tasks' real lifecycle outcomes (derived from ``task_transitions`` + the
+    current status, never guessed). For each decision trajectory — and pooled per
+    role and overall — it reports four outcome rates, EACH with its sample size
+    ``n``, a Wilson 95% CI, and an ``insufficient_sample`` flag (``n < 30``):
+
+    - **first_pass_merge_rate** — of the tasks that reached a terminal state, the
+      fraction that reached ``merged`` WITHOUT ever hitting ``reviewer_blocked`` or
+      bouncing back to ``in_progress`` from review (clean first pass).
+    - **rework_rate** — fraction that hit ``reviewer_blocked`` or bounced back to
+      ``in_progress`` from review at least once.
+    - **escalation_rate** — fraction that was parked ``blocked`` on a 🔴 approval.
+    - **abandoned_rate** — fraction that reached terminal ``abandoned``.
+
+    The denominator ``n`` for every rate is the count of TERMINAL tasks the decision
+    created (merged + abandoned) — a task still in flight has no outcome yet and is
+    excluded from ``n`` (but counted in ``n_tasks``). ``workstream=None`` spans all
+    workstreams. Returns ``{by_trajectory, by_role, overall}``.
+    """
+    params = {"ws": workstream}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH linked AS (
+              SELECT tr.id AS trajectory_id, tr.role, tr.workstream,
+                     t.id AS task_id, t.status
+              FROM trajectories tr
+              JOIN tasks t ON t.trajectory_id = tr.id
+              WHERE (%(ws)s::text IS NULL OR tr.workstream = %(ws)s::text)
+            ),
+            flags AS (
+              SELECT
+                l.trajectory_id, l.role, l.workstream, l.task_id,
+                (l.status IN ('merged','abandoned'))            AS is_terminal,
+                (l.status = 'merged')                            AS is_merged,
+                (l.status = 'abandoned')                         AS is_abandoned,
+                -- rework: a review round-trip ever occurred (hit reviewer_blocked,
+                -- or a bounce from review back into in_progress).
+                EXISTS (
+                  SELECT 1 FROM task_transitions x WHERE x.task_id = l.task_id
+                    AND (x.to_status = 'reviewer_blocked'
+                         OR (x.from_status IN ('ready_for_review','reviewer_blocked')
+                             AND x.to_status = 'in_progress'))
+                )                                                AS had_rework,
+                -- escalation: parked 'blocked' on a 🔴 approval at some point.
+                EXISTS (
+                  SELECT 1 FROM task_transitions x WHERE x.task_id = l.task_id
+                    AND x.to_status = 'blocked'
+                )                                                AS had_escalation
+              FROM linked l
+            )
+            SELECT
+              trajectory_id, role, workstream,
+              count(*)                                             AS n_tasks,
+              count(*) FILTER (WHERE is_terminal)                  AS n_terminal,
+              count(*) FILTER (WHERE is_merged AND NOT had_rework) AS first_pass,
+              count(*) FILTER (WHERE is_terminal AND had_rework)   AS rework,
+              count(*) FILTER (WHERE is_terminal AND had_escalation) AS escalation,
+              count(*) FILTER (WHERE is_abandoned)                 AS abandoned
+            FROM flags
+            GROUP BY trajectory_id, role, workstream
+            ORDER BY trajectory_id
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+
+    by_trajectory: list[dict] = []
+    # Pooled accumulators keyed by role, plus one overall bucket.
+    role_acc: dict[str, dict] = {}
+    overall = {k: 0 for k in ("n_tasks", "n_terminal", "first_pass",
+                              "rework", "escalation", "abandoned")}
+    for r in rows:
+        by_trajectory.append({
+            "trajectory_id": str(r["trajectory_id"]),
+            "role": r["role"],
+            "workstream": r["workstream"],
+            "n_tasks": int(r["n_tasks"]),
+            "n_terminal": int(r["n_terminal"]),
+            "metrics": _metrics_from_counts(r),
+        })
+        acc = role_acc.setdefault(
+            r["role"],
+            {k: 0 for k in ("n_tasks", "n_terminal", "first_pass",
+                            "rework", "escalation", "abandoned")},
+        )
+        for k in acc:
+            acc[k] += int(r[k])
+            overall[k] += int(r[k])
+
+    by_role = {
+        role: {
+            "n_tasks": acc["n_tasks"],
+            "n_terminal": acc["n_terminal"],
+            "trajectories": sum(1 for r in rows if r["role"] == role),
+            "metrics": _metrics_from_counts(acc),
+        }
+        for role, acc in sorted(role_acc.items())
+    }
+
+    return {
+        "workstream": workstream,
+        "trajectories_scored": len(rows),
+        "by_trajectory": by_trajectory,
+        "by_role": by_role,
+        "overall": {
+            "n_tasks": overall["n_tasks"],
+            "n_terminal": overall["n_terminal"],
+            "metrics": _metrics_from_counts(overall) if rows else _empty_pm_metrics(),
+        },
+    }
 
 
 def quality_report(
@@ -158,4 +367,7 @@ def quality_report(
         },
         # Reused existing rollup (process-wide, NOT workstream-filtered → _global).
         "by_model_global": model_rollup(conn),
+        # Outcome-attribution: PM decision quality (trajectory → tasks it created →
+        # their lifecycle outcomes), every rate carrying n + Wilson 95% CI + flag.
+        "pm_decision_quality": pm_decision_quality(conn, workstream),
     }
