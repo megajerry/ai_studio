@@ -1,0 +1,48 @@
+{
+  "role": "pm",
+  "workstream": "productivity",
+  "goal": "SYNTHETIC EXAMPLE — orchestrate the off-host trajectory workstream",
+  "ttl": 604800,
+  "context_size_start": 8000,
+  "outcome_summary": "SYNTHETIC — three tracks dispatched, merged after review",
+  "started_at": "2026-07-21T09:00:00+00:00",
+  "ended_at": "2026-07-21T12:30:00+00:00",
+  "close": true,
+  "steps": [
+    {
+      "step_type": "observe",
+      "summary": "SYNTHETIC — read the trajectory backlog and current state",
+      "rationale": "Foundation (schema + guarded writer) is merged; T5 asks for an ingestion bridge and a rotation/TTL worker. No host secrets are available off-host.",
+      "context_size": 8200,
+      "created_at": "2026-07-21T09:05:00+00:00"
+    },
+    {
+      "step_type": "plan",
+      "summary": "SYNTHETIC — split the work into parallel tracks",
+      "rationale": "Ingestion, rotation worker, and wiring the Retro hook are largely independent; dispatch them concurrently to bounded executor subagents.",
+      "options_considered": ["one big task", "three parallel tracks"],
+      "choice": "three parallel tracks",
+      "confidence": 0.78,
+      "context_size": 8600,
+      "created_at": "2026-07-21T09:20:00+00:00"
+    },
+    {
+      "step_type": "decide",
+      "summary": "SYNTHETIC — measure this off-host session by ingesting its own log",
+      "rationale": "The session holds no keys, so its work is not persisted as tasks; ingest the orchestration trajectory so it becomes observable/replayable.",
+      "options_considered": ["leave unmeasured", "ingest via the guarded writer"],
+      "choice": "ingest via the guarded writer",
+      "confidence": 0.9,
+      "refs": {"adr": "0020", "task": "T5"},
+      "context_size": 9000,
+      "created_at": "2026-07-21T10:00:00+00:00"
+    },
+    {
+      "step_type": "commit",
+      "summary": "SYNTHETIC — record the plan and hand off to executors",
+      "rationale": "Tracks dispatched; each returns evidence for an independent reviewer before merge.",
+      "context_size": 9200,
+      "created_at": "2026-07-21T12:25:00+00:00"
+    }
+  ]
+}

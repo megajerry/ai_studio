@@ -42,6 +42,7 @@ from ..memory import add_lesson as _add_lesson
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
+from ..trajectory_worker import rotate_mined_trajectories
 from .critic import Critique
 
 #: Role event (``retro.completed``): a retro distilled + stored N lessons for a
@@ -122,6 +123,51 @@ class RetroResult(BaseModel):
     #: The Critic's recommendation on the lessons, if a critic was consulted
     #: (``proceed`` / ``revise``); ``None`` when no critic was wired (ADR-0019).
     critic_recommendation: Optional[str] = None
+
+
+def _target_trajectory_id(conn: Any, target_id: Any) -> Optional[str]:
+    """The reasoning-trajectory id linked to the mined task, or ``None``.
+
+    A PM ``decompose`` step stamps ``tasks.trajectory_id`` (ADR-0020); this reads
+    it back so the retro can mark the episode "mined". Best-effort and never fatal:
+    a missing task / missing link / any read error yields ``None`` (the retro then
+    behaves exactly as before). Returns the id as a string (body-free — an id only).
+    """
+    if not target_id:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT trajectory_id FROM tasks WHERE id = %s", (target_id,))
+            row = cur.fetchone()
+        if not getattr(conn, "autocommit", True):
+            conn.commit()
+    except Exception:  # pragma: no cover - degrade to "no linked trajectory"
+        return None
+    if row and row.get("trajectory_id"):
+        return str(row["trajectory_id"])
+    return None
+
+
+def rotate_ripe_trajectories(
+    conn: Any,
+    *,
+    older_than_s: float,
+    now: Optional[Any] = None,
+    distill_fn: Optional[Callable[[Optional[str]], Optional[str]]] = None,
+    limit: Optional[int] = None,
+) -> list:
+    """Learning-agent hook: distill OLD, already-MINED verbatim trajectories to lean.
+
+    The Retro (the learning agent) DECIDES when to invoke this; it delegates to the
+    guarded rotation in :mod:`runtime.trajectory_worker`, which only touches
+    ``closed`` + ``verbatim`` episodes older than ``older_than_s`` that a retro has
+    already mined (a ``retro.completed`` referencing them). Outcome-relevant fields
+    (choice/confidence/refs/outcome) are preserved; only the verbatim ``rationale``
+    body is distilled. Returns the ids actually rotated.
+    """
+    return rotate_mined_trajectories(
+        conn, older_than_s=older_than_s, now=now, distill_fn=distill_fn, limit=limit
+    )
 
 
 def run_retro(
@@ -238,17 +284,25 @@ def run_retro(
             lesson_ids.append(str(item.id))
 
     # 4. Emit retro.completed — COUNT + task ref only, NEVER the lesson text.
+    #    When the mined episode has an associated reasoning trajectory (the target
+    #    task carries a trajectory_id, ADR-0020), include its id: this body-free
+    #    id is the "mined" marker the rotation worker keys on to safely rotate the
+    #    now-mined verbatim trajectory to lean later (runtime.trajectory_worker).
+    payload = {
+        "target_task_id": str(target_id) if target_id else None,
+        "target_task_type": target_type,
+        "outcome": outcome,
+        "lessons_count": len(lessons),
+    }
+    mined_traj_id = _target_trajectory_id(conn, target_id)
+    if mined_traj_id is not None:
+        payload["trajectory_id"] = mined_traj_id
     sink.emit(
         make_event(
             workstream=task.workstream,
             type=EVENT_RETRO_COMPLETED,
             task_id=task.id,
-            payload={
-                "target_task_id": str(target_id) if target_id else None,
-                "target_task_type": target_type,
-                "outcome": outcome,
-                "lessons_count": len(lessons),
-            },
+            payload=payload,
         )
     )
 
