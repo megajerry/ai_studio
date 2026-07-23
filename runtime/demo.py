@@ -213,6 +213,81 @@ def _demonstrate_research(conn, registry, config, worker_id: str) -> bool:
                 and len(after) > before and n_tasks == 1)
 
 
+def _demonstrate_workstream_config(conn, scratch: str) -> bool:
+    """Show a vertical is CONFIG, not code: a workstreams/<name>/config.yaml drives
+    the runtime. Bootstrap seeds its memory (idempotently) + budget; the config's
+    charter/overlay flows into the role prompt; its domain checker + policy grants
+    apply; and its seeded memory is scope-isolated from another workstream."""
+    from .roles.executor import run_executor
+    from .workstream import bootstrap_workstream, resolve_workstream_config
+    from .worker import run_once
+
+    ws = f"vconfig-{uuid4().hex[:8]}"
+    other = f"vother-{uuid4().hex[:8]}"
+    base_dir = Path(tempfile.mkdtemp(prefix="ai_studio_ws_"))
+    (base_dir / ws).mkdir()
+    (base_dir / ws / "config.yaml").write_text(
+        f"name: {ws}\n"
+        "charter: Operate the demo VIDEO channel; every clip needs captions.\n"
+        "role_overlays:\n"
+        "  executor: Record duration_seconds and captions in the clip artifact.\n"
+        "budget:\n  cap_usd: 25.0\n  period: monthly\n"
+        "policy_grants:\n  executor: [fs.read, fs.write]\n"
+        "checkers: [video_audit]\n"
+        "memory_seed:\n"
+        "  - text: Never publish a clip without captions and a thumbnail.\n"
+        "object_store_bucket: ws-demo-video\n"
+    )
+    sink = DbEventSink(conn)
+    resolve = lambda name: resolve_workstream_config(name, base_dir=base_dir)  # noqa: E731
+    print(f"\n=== workstream-config demo (workstream={ws}) ===")
+
+    cfg = resolve(ws)
+    print(f"  config loaded: charter+overlay set, checkers={cfg.checker_registry().names()}, "
+          f"bucket={cfg.object_store_bucket!r}")
+
+    # 1. Bootstrap seeds memory + budget; a re-run is idempotent (no duplicates).
+    r1 = bootstrap_workstream(conn, cfg)
+    r2 = bootstrap_workstream(conn, cfg)
+    from .budget import get_budget
+
+    budget_ok = get_budget(conn, ws) is not None
+    print(f"  bootstrap: seeded {len(r1.seeds_added)} lesson(s) + budget={budget_ok}; "
+          f"re-run added {len(r2.seeds_added)} (skipped {r2.seeds_skipped}) — idempotent")
+
+    # 2. Scope isolation — the seed is recallable by THIS workstream, not another.
+    mine = recall_lessons(conn, ws, "captions thumbnail publish", k=5, include_global=False)
+    theirs = recall_lessons(conn, other, "captions thumbnail publish", k=5, include_global=False)
+    isolated = bool(mine) and not theirs
+    print(f"  scope isolation: this ws recalls {len(mine)} seed(s), other ws recalls "
+          f"{len(theirs)} — isolated={isolated}")
+
+    # 3. The config's charter+overlay flow into the ACTUAL role prompt.
+    import runtime.roles.executor as exec_mod
+
+    captured: dict = {}
+    real_call = exec_mod.call_model
+    def _capture(**kw):
+        captured["prompt"] = kw["messages"][0]["content"]
+        return real_call(**kw)
+    exec_mod.call_model = _capture
+    try:
+        task = enqueue_task(conn, workstream=ws, type="work.task",
+                            payload={"goal": "render clip", "criterion": "captioned",
+                                     "marker": f"studio-ok:{uuid4().hex[:6]}"})
+        # Claim + run the one work task through the worker with the config resolved.
+        run_once(conn, "demo-worker", sink, registry=build_registry(scratch),
+                 config=load_policy(), resolve_config=resolve, workstream=ws, max_attempts=1)
+    finally:
+        exec_mod.call_model = real_call
+    charter_in_prompt = "Operate the demo VIDEO channel" in captured.get("prompt", "")
+    overlay_in_prompt = "Record duration_seconds" in captured.get("prompt", "")
+    print(f"  role prompt driven by config: charter={charter_in_prompt} overlay={overlay_in_prompt}")
+
+    return bool(cfg and budget_ok and len(r1.seeds_added) == 1 and r2.seeds_added == []
+                and isolated and charter_in_prompt and overlay_in_prompt)
+
+
 def main() -> int:
     # Keyless by construction — dry-run every model call.
     os.environ.setdefault("MODELS_DRY_RUN", "1")
@@ -282,7 +357,11 @@ def main() -> int:
         researched = _demonstrate_research(conn, registry, config, worker_id)
         print(f"runtime.demo: {'OK — researcher mined external best-practice into recallable lessons' if researched else 'RESEARCH INCOMPLETE'}")
 
-        return 0 if (ok and learned and reviewed and researched) else 1
+        # Fifth act: demonstrate a vertical is CONFIG, not code (workstream config).
+        configured = _demonstrate_workstream_config(conn, scratch)
+        print(f"runtime.demo: {'OK — vertical defined by config drove the runtime (charter/checker/budget/policy/seed, scope-isolated)' if configured else 'WORKSTREAM-CONFIG INCOMPLETE'}")
+
+        return 0 if (ok and learned and reviewed and researched and configured) else 1
     finally:
         conn.close()
 

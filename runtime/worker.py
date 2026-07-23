@@ -54,6 +54,7 @@ from .db import connect
 from .enforce import DbEventSink, EventSink, InvokeStatus, NullEventSink, invoke
 from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
+from .roles.checkers import DEFAULT_REGISTRY, CheckerRegistry
 from .roles.executor import run_executor
 from .roles.pm import run_pm_tick
 from .roles.researcher import RESEARCH_TASK_TYPE, run_research as run_research_default
@@ -62,6 +63,7 @@ from .roles.reviewer import REVIEW_TASK_TYPE, run_review as run_review_default
 from .roles.verifier import verify as run_verify_default
 from .scheduler import PM_TICK_TYPE
 from .skills import SkillRegistry
+from .workstream import WorkstreamConfig, resolve_workstream_config
 from .tasks import (
     block_task,
     claim_task,
@@ -168,8 +170,13 @@ def _handle_pm_tick(
     worker_id: str,
     run_pm: Callable[..., Any],
     skills: Optional[SkillRegistry] = None,
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
 ) -> RunResult:
-    plan = run_pm(conn, task, sink, registry=model_registry, skills=skills, enqueue=enqueue)
+    plan = run_pm(
+        conn, task, sink, registry=model_registry, skills=skills, enqueue=enqueue,
+        charter=charter, overlay=overlay,
+    )
     heartbeat(conn, task.id, worker_id)
     complete(conn, task.id, result=plan.model_dump(), status=TaskStatus.MERGED)
     if plan.decision == "planned":
@@ -338,6 +345,10 @@ def _handle_work(
     skills: Optional[SkillRegistry] = None,
     retro_mode: str = DEFAULT_RETRO_MODE,
     review_mode: str = DEFAULT_REVIEW_MODE,
+    charter: Optional[str] = None,
+    exec_overlay: Optional[str] = None,
+    verify_overlay: Optional[str] = None,
+    checkers: CheckerRegistry = DEFAULT_REGISTRY,
 ) -> RunResult:
     """Drive one ``work.*`` task through the unified dev/review lifecycle.
 
@@ -355,7 +366,8 @@ def _handle_work(
         # Heartbeat around each phase — liveness while the role does the work.
         heartbeat(conn, task.id, worker_id)
         exec_result = run_exec(
-            conn, task, sink, registry=registry, config=config, model_registry=model_registry
+            conn, task, sink, registry=registry, config=config, model_registry=model_registry,
+            charter=charter, overlay=exec_overlay,
         )
 
         # 🔴 human-in-the-loop: the Executor's tool call PENDed on an approval. Park
@@ -380,7 +392,7 @@ def _handle_work(
         verdict = run_verify(
             conn, task, exec_result, sink,
             registry=registry, config=config, model_registry=model_registry,
-            skills=skills,
+            skills=skills, charter=charter, overlay=verify_overlay, checkers=checkers,
         )
         heartbeat(conn, task.id, worker_id)
 
@@ -657,14 +669,23 @@ def run_once(
     run_retro: Callable[..., Any] = run_retro_default,
     run_review: Callable[..., Any] = run_review_default,
     run_research: Callable[..., Any] = run_research_default,
+    resolve_config: Callable[[Optional[str]], Optional[WorkstreamConfig]] = resolve_workstream_config,
 ) -> Optional[RunResult]:
     """Claim one task and drive it to a terminal state (the single testable unit).
 
     Returns ``None`` when nothing is claimable (the caller sleeps), else a
     :class:`RunResult`. Dispatch is by ``task.type``: ``pm.tick`` plans + enqueues
     work; ``work.*`` runs Executor + Verifier and commits/fails per the verdict.
-    Every seam (claim/heartbeat/complete/enqueue + the three role handlers) is
-    injectable so the whole loop runs with no database in tests.
+    Every seam (claim/heartbeat/complete/enqueue + the role handlers +
+    ``resolve_config``) is injectable so the whole loop runs with no database in
+    tests.
+
+    The claimed task's **workstream config** (``resolve_config`` →
+    :func:`runtime.workstream.resolve_workstream_config`) makes a vertical
+    config-not-code: when present it supplies the role charter + per-role overlays,
+    the Verifier's domain checkers, and — merged over the base — this workstream's
+    policy grants + skill set. A workstream with no config file falls back to the
+    inline base behavior unchanged (behavior-preserving).
     """
     sink = sink or NullEventSink()
     resolved_retro_mode = _resolve_retro_mode(retro_mode)
@@ -673,12 +694,24 @@ def run_once(
     if task is None:
         return None
 
+    # Resolve the claimed task's workstream config (config-not-code). None when the
+    # workstream has no config file → the platform's inline base behavior is used
+    # (behavior-preserving). When present, it drives the role prompts (charter +
+    # per-role overlays), the Verifier's domain checkers, and — merged over the
+    # base — this workstream's policy grants + skill set. Budget/policy are already
+    # keyed by workstream in the DB (budgets table / effective policy).
+    wcfg = resolve_config(task.workstream)
+    eff_config = wcfg.effective_policy(config) if (wcfg and config is not None) else config
+    eff_skills = wcfg.effective_skills(skills) if wcfg else skills
+
     if task.type == PM_TICK_TYPE:
         return _handle_pm_tick(
             conn, task, sink,
             model_registry=model_registry, enqueue=enqueue,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id, run_pm=run_pm,
-            skills=skills,
+            skills=eff_skills,
+            charter=(wcfg.charter if wcfg else None),
+            overlay=(wcfg.overlay_for("pm") if wcfg else None),
         )
 
     if task.type == RETRO_TASK_TYPE:
@@ -697,7 +730,7 @@ def run_once(
         # threaded), so a research task cannot spawn another — no research-loop.
         return _handle_research(
             conn, task, sink,
-            registry=registry, config=config, model_registry=model_registry,
+            registry=registry, config=eff_config, model_registry=model_registry,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
             run_research=run_research,
         )
@@ -708,9 +741,9 @@ def run_once(
         # trigger neither another review nor a retro (no loop).
         return _handle_review(
             conn, task, sink,
-            registry=registry, config=config, model_registry=model_registry,
+            registry=registry, config=eff_config, model_registry=model_registry,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
-            run_review=run_review, skills=skills,
+            run_review=run_review, skills=eff_skills,
         )
 
     if task.type in CODE_TASK_TYPES:
@@ -719,7 +752,7 @@ def run_once(
         # `work.*` branch so `work.code` takes the loop-free coding path (§14).
         return _handle_code(
             conn, task, sink,
-            registry=registry, config=config,
+            registry=registry, config=eff_config,
             heartbeat=heartbeat, complete=complete, block=block,
             worker_id=worker_id,
         )
@@ -727,11 +760,15 @@ def run_once(
     if task.type.startswith("work."):
         return _handle_work(
             conn, task, sink,
-            registry=registry, config=config, model_registry=model_registry,
+            registry=registry, config=eff_config, model_registry=model_registry,
             heartbeat=heartbeat, transition=transition, enqueue=enqueue, block=block,
             worker_id=worker_id, max_attempts=max_attempts,
-            run_exec=run_exec, run_verify=run_verify, skills=skills,
+            run_exec=run_exec, run_verify=run_verify, skills=eff_skills,
             retro_mode=resolved_retro_mode, review_mode=resolved_review_mode,
+            charter=(wcfg.charter if wcfg else None),
+            exec_overlay=(wcfg.overlay_for("executor") if wcfg else None),
+            verify_overlay=(wcfg.overlay_for("verifier") if wcfg else None),
+            checkers=(wcfg.checker_registry() if wcfg else DEFAULT_REGISTRY),
         )
 
     # Unknown task type — fail it explicitly rather than silently dropping it.

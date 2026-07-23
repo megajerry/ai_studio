@@ -2,6 +2,37 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
+## Latest (branch `runtime/workstream-config` — complete, awaiting review/merge)
+
+**Workstream config/registration — a vertical is CONFIG, not code (ADR-0018).**
+The config/registration half of the workstream-bootstrap primitive: a rules-as-data
+`workstreams/<name>/config.yaml` (loaded/validated by `runtime/workstream/config.py`
+`WorkstreamConfig`) now DRIVES the existing seams so standing up a vertical writes
+no role code. Fields: `name`, `charter`/`objective`, `role_overlays` (per role),
+`budget` (cap_usd/cap_tokens/period), `policy_grants` (role→caps), `skills`
+(names/dir), `checkers` (built-in domain checks), `memory_seed`, `object_store_bucket`
+— **strict** (unknown field/capability/checker/period/name-mismatch → clear
+`WorkstreamConfigError`), **no secrets** (ADR-0011: names a bucket, references
+skills/checkers by name only). Minimal `runtime/worker.py` wiring resolves the
+claimed task's workstream config (`resolve_workstream_config`) and threads
+charter+per-role overlays into PM/Executor/Verifier (`compose_role_prompt`), the
+config's domain checkers into the Verifier (`checker_registry()`), and — merged
+over the base — its policy grants (`effective_policy`) + skill set
+(`effective_skills`) into every role. **Behavior-preserving**: a workstream with no
+config falls back to the inline base (existing tests unchanged). `bootstrap_workstream`
+idempotently seeds the config's `memory_seed` into Knowledge memory (dedup by exact
+text, workstream+global) and sets its budget (`set_budget` upsert). Built-in domain
+checker `video_audit` (duration+captions, evidence over claims) ships as the worked
+example; `workstreams/example/config.yaml` is a committed runnable video vertical.
+ADR-0018 ratifies vertical isolation (state→DB scoped by workstream / artifacts→one
+MinIO bucket per workstream / product→own repo / definition→this repo). Docs:
+`workstreams/README.md` (video end-to-end). No migration (reuses budgets +
+memory_items). **Out of scope (follow-up):** the cross-workstream request contract.
+Evidence: `DATABASE_URL=… pytest runtime/tests/ spokesman/tests/` = **515 passed,
+0 skips** (21 new workstream-config tests incl. live-DB seed idempotency + scope
+isolation); `python -m runtime.demo` exits 0 — **fifth act** "vertical defined by
+config drove the runtime (charter/checker/budget/policy/seed, scope-isolated)".
+
 ## Latest (branch `runtime/coding-worker` — complete, awaiting review/merge)
 
 **Coding-worker dispatch (architecture §14).** A "Need Prototype" coding task

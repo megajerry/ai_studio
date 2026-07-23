@@ -1,0 +1,82 @@
+# Example vertical — a short-form VIDEO channel (the worked example).
+#
+# A vertical is CONFIG, not code (ADR-0002 / ADR-0018). This file is the whole
+# DEFINITION of the workstream: it supplies the charter, per-role overlays, a
+# domain verify-checker, a budget, workstream-specific policy grants, a skill
+# subset, and seed lessons to the SHARED platform roles/runtime via the existing
+# seams — no PM/Executor/Verifier subclass is written.
+#
+# Rules-as-data, NO secrets (ADR-0011): this file only NAMES a bucket and
+# references skills/checkers by name. Real keys (a publishing API token) are
+# provisioned separately into the git-ignored env by onboarding; see
+# workstreams/README.md.
+#
+# The `name` MUST match this directory name ("example").
+
+name: example
+
+# The vertical's mission + operating context. Layered into EVERY role's prompt as
+# the "### Workstream charter" section, so every agent shares the same framing.
+charter: |
+  You operate the studio's short-form VIDEO channel. The product is a steady
+  cadence of tight, watchable clips. Optimize for retention and clarity:
+  - every published clip is 30-180s, has burned-in captions, and a hook in the
+    first 3 seconds;
+  - never publish without captions or a thumbnail;
+  - keep the channel's voice consistent and factual — no clickbait claims.
+
+# Per-role specializations. Each is layered as that role's "### Role overlay"
+# section (it refines, never overrides, the platform role + safety rules).
+role_overlays:
+  pm: |
+    Decompose a video idea into concrete production steps (script → render →
+    caption → thumbnail → publish). Each work item's success_criterion must be
+    independently checkable (e.g. "clip is >= 30s and has captions").
+  executor: |
+    When you produce a clip artifact, record its real facts in the artifact:
+    a `duration_seconds: <n>` line and a `captions: yes|no` line, so the
+    Verifier's video_audit can judge on evidence, not your claim.
+  verifier: |
+    Judge a clip on the audited FACTS (duration + captions), never the author's
+    "done" claim. A clip that claims success but is too short or uncaptioned FAILS.
+
+# Spend ceiling — wired into runtime/budget (seeded by bootstrap_workstream).
+budget:
+  cap_usd: 50.0
+  cap_tokens: 2000000
+  period: monthly
+
+# Workstream-specific capability grants, merged OVER the base policy. Here the
+# channel's `operator` role may spend money to PUBLISH (spend.money is 🔴, so a
+# publish still requires human approval — this only makes it reachable at all).
+policy_grants:
+  operator:
+    - fs.read
+    - fs.write
+    - net.fetch
+    - secret.use
+    - spend.money
+
+# The skills this vertical's roles draw on (a subset of the shared corpus).
+skills:
+  names:
+    - define-success-criteria
+    - rigorous-review
+
+# Domain verify-checkers to register on top of the horizontal `marker` gate.
+# `video_audit` (a built-in) audits a clip's duration + captions from the
+# artifact. A work item selects it with a structured criterion in its payload:
+#   check: {check: video_audit, require: {min_seconds: 30, captions: true}}
+checkers:
+  - video_audit
+
+# Founding lessons seeded (idempotently) into this workstream's Knowledge memory
+# on bootstrap, so its roles recall them from day one.
+memory_seed:
+  - text: "Publishing a clip requires burned-in captions AND a thumbnail — never skip either."
+  - text: "Hook viewers in the first 3 seconds; retention drops fast without one."
+  - text: "Keep clips 30-180s; longer clips lose short-form retention."
+
+# The workstream's artifact bucket NAME (ADR-0018: artifacts → object store,
+# one MinIO bucket per workstream). A name only — never credentials.
+object_store_bucket: ws-example-video
