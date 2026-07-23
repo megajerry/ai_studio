@@ -23,8 +23,13 @@ access** (ADR-0017) · **Experiment primitive** (ADR-0016; migration 0009) ·
 **Role-customization seams** (`runtime/roles/prompt.py` `compose_role_prompt`
 [base→charter→overlay→skills→lessons→task, behavior-preserving] + `roles/checkers.py`
 pluggable verify-checker registry [structured criterion, marker back-compat,
-evidence-based, e.g. `video_audit`]) · onboarding/secrets · model shortlist +
-cost model · ADRs 0001–0017.
+evidence-based, e.g. `video_audit`]) · **Workstream config/registration** (a
+vertical is config-not-code: `runtime/workstream/` `WorkstreamConfig` from
+`workstreams/<name>/config.yaml` [charter/overlays/budget/policy-grants/skills/
+checkers/memory-seed/bucket] drives the runtime seams via minimal worker wiring,
+behavior-preserving with no config, scope-isolated; `bootstrap_workstream`
+idempotently seeds memory+budget; ADR-0018 vertical isolation) · onboarding/secrets
+· model shortlist + cost model · ADRs 0001–0018.
 
 ## 🔄 In progress
 
@@ -32,21 +37,16 @@ cost model · ADRs 0001–0017.
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
-1. **Workstream-bootstrap primitive** (makes starting a vertical config-not-code) —
-   NOW just the config/registration record + coordination, since the seams are done
-   (role prompt-assembly ✅, verify-checker registry ✅): a workstream config
-   (name/objective/budget/policy grants/tool+skill set/memory-seed/DB-scope/
-   object-store bucket) that supplies the charter/overlay/checkers to the runtime,
-   + the **cross-workstream request contract** (typed `feature_request` +
-   receiving-PM intake/triage/prioritize/approve/decompose + symmetric escalation).
-   Captured by the vertical-isolation ADR.
-2. **Vertical-isolation ADR** — ratify: state→DB, artifacts→object store,
-   product→own repo, definition→platform (this repo).
-3. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
+1. **Cross-workstream request contract** — the remaining half of the
+   workstream-bootstrap primitive: a typed `feature_request` + receiving-PM
+   intake/triage/prioritize/approve/decompose + symmetric escalation. _(The
+   config/registration record ✅ — see Done: `WorkstreamConfig` + wiring +
+   ADR-0018.)_
+2. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
-4. **Adaptive orchestration intensity** — generalize scaling of review/retro/
+3. **Adaptive orchestration intensity** — generalize scaling of review/retro/
    research by recent error rate + budget/telemetry (today: on_fail/on_risk).
-5. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+4. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
    M1's `EventType` enum). Do last / alone (touches many modules).
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)
