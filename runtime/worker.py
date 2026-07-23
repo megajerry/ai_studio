@@ -31,6 +31,13 @@ Config (env): ``WORKER_ID``, ``WORKER_SCRATCH_DIR`` (tool root),
 work task triggers a learning Retro), ``WORKER_REVIEW`` (``on_risk`` (default) |
 ``always`` | ``off`` — when a terminal work task triggers the independent
 Reviewer/Whistle-blower risk guard).
+
+``WORKER_RETRO`` / ``WORKER_REVIEW`` set the *base* trigger policy. With
+``ADAPTIVE_INTENSITY=on`` (default ``off`` → behavior-preserving) the worker
+scales those bases per work episode from FACTS (:mod:`runtime.adaptive`): a
+workstream with a high recent error rate gets MORE review/retro (escalated toward
+``always``), while a clean one whose budget is tight gets less (relaxed toward
+``off``) — throttled so a near-exhausted budget never piles on extra work.
 """
 
 from __future__ import annotations
@@ -45,11 +52,14 @@ from uuid import uuid4
 import psycopg
 from pydantic import BaseModel
 
+from . import adaptive
+from .adaptive import IntensityDecision
 from .approvals import (
     STATUS_APPROVED,
     STATUS_DENIED,
     get_approval,
 )
+from .budget import remaining as budget_remaining
 from .db import connect
 from .enforce import DbEventSink, EventSink, InvokeStatus, NullEventSink, invoke
 from .models import Assignee, Task, TaskStatus, make_event
@@ -130,6 +140,7 @@ Completer = Callable[..., Optional[Task]]
 Enqueuer = Callable[..., Task]
 Blocker = Callable[..., Optional[Task]]
 Transitioner = Callable[..., Optional[Task]]
+IntensityResolver = Callable[..., IntensityDecision]
 
 
 class RunResult(BaseModel):
@@ -212,6 +223,40 @@ def _resolve_review_mode(review_mode: Optional[str]) -> str:
     if mode:
         log.warning("invalid WORKER_REVIEW=%r; using default %s", mode, DEFAULT_REVIEW_MODE)
     return DEFAULT_REVIEW_MODE
+
+
+def _resolve_intensity_default(
+    conn: Any,
+    workstream: str,
+    *,
+    base_review: str,
+    base_retro: str,
+) -> IntensityDecision:
+    """Resolve this episode's effective review/retro modes from FACTS (ADR-0003).
+
+    The worker's default intensity seam. When ``ADAPTIVE_INTENSITY`` is off
+    (default) this returns the base modes verbatim and reads NO telemetry/budget —
+    so the worker's static behavior is preserved exactly. When on, it reads the
+    workstream's remaining budget headroom (:func:`runtime.budget.remaining`) and
+    hands it, with the base modes, to :func:`runtime.adaptive.resolve_modes`, which
+    escalates on a high recent error rate and throttles on a tight budget.
+    """
+    cfg = adaptive.AdaptiveConfig.from_env()
+    if not cfg.enabled:
+        return IntensityDecision(
+            review=base_review, retro=base_retro, research=adaptive.RESEARCH_NORMAL,
+            error_rate=0.0, budget_fraction=None, activity=0, adaptive=False,
+        )
+    try:
+        headroom = budget_remaining(conn, workstream)
+    except Exception:  # budget is advisory here — never let it break the episode
+        log.warning("adaptive: budget read failed for %s; treating as uncapped", workstream)
+        headroom = None
+    return adaptive.resolve_modes(
+        conn, workstream,
+        base_review=base_review, base_retro=base_retro,
+        budget_remaining=headroom, config=cfg,
+    )
 
 
 def _episode_is_risky(task: Task, outcome: str) -> bool:
@@ -670,6 +715,7 @@ def run_once(
     run_review: Callable[..., Any] = run_review_default,
     run_research: Callable[..., Any] = run_research_default,
     resolve_config: Callable[[Optional[str]], Optional[WorkstreamConfig]] = resolve_workstream_config,
+    resolve_intensity: IntensityResolver = _resolve_intensity_default,
 ) -> Optional[RunResult]:
     """Claim one task and drive it to a terminal state (the single testable unit).
 
@@ -758,13 +804,33 @@ def run_once(
         )
 
     if task.type.startswith("work."):
+        # Adaptive orchestration intensity (ADR-0003): scale the base review/retro
+        # modes by this workstream's recent error rate + budget headroom. Off by
+        # default → the base (static) modes pass through unchanged (and no
+        # telemetry/budget is read), so behavior is preserved.
+        decision = resolve_intensity(
+            conn, task.workstream,
+            base_review=resolved_review_mode, base_retro=resolved_retro_mode,
+        )
+        if decision.adaptive and (
+            decision.review != resolved_review_mode or decision.retro != resolved_retro_mode
+        ):
+            log.info(
+                "adaptive intensity ws=%s error_rate=%.2f budget_frac=%s activity=%d: "
+                "review %s->%s retro %s->%s",
+                task.workstream, decision.error_rate,
+                ("%.2f" % decision.budget_fraction) if decision.budget_fraction is not None else "n/a",
+                decision.activity,
+                resolved_review_mode, decision.review,
+                resolved_retro_mode, decision.retro,
+            )
         return _handle_work(
             conn, task, sink,
             registry=registry, config=eff_config, model_registry=model_registry,
             heartbeat=heartbeat, transition=transition, enqueue=enqueue, block=block,
             worker_id=worker_id, max_attempts=max_attempts,
             run_exec=run_exec, run_verify=run_verify, skills=eff_skills,
-            retro_mode=resolved_retro_mode, review_mode=resolved_review_mode,
+            retro_mode=decision.retro, review_mode=decision.review,
             charter=(wcfg.charter if wcfg else None),
             exec_overlay=(wcfg.overlay_for("executor") if wcfg else None),
             verify_overlay=(wcfg.overlay_for("verifier") if wcfg else None),

@@ -28,7 +28,13 @@ vertical is config-not-code: `runtime/workstream/` `WorkstreamConfig` from
 `workstreams/<name>/config.yaml` [charter/overlays/budget/policy-grants/skills/
 checkers/memory-seed/bucket] drives the runtime seams via minimal worker wiring,
 behavior-preserving with no config, scope-isolated; `bootstrap_workstream`
-idempotently seeds memory+budget; ADR-0018 vertical isolation) · onboarding/secrets
+idempotently seeds memory+budget; ADR-0018 vertical isolation) · **Adaptive
+orchestration intensity** (`runtime/adaptive.py`: scale review/retro/research by a
+workstream's REAL recent error rate [`verify.failed`/`task.rekicked`/abandoned/
+`review.flagged` over recent WORK episodes] + budget headroom; evidence-based,
+deterministic, bounded to the existing trigger modes; minimal additive worker
+wiring via the `resolve_intensity` seam; **off by default → behavior-preserving**
+[`ADAPTIVE_INTENSITY`]; ADR-0003) · onboarding/secrets
 · model shortlist + cost model · ADRs 0001–0018.
 
 ## 🔄 In progress
@@ -44,9 +50,7 @@ idempotently seeds memory+budget; ADR-0018 vertical isolation) · onboarding/sec
    ADR-0018.)_
 2. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
-3. **Adaptive orchestration intensity** — generalize scaling of review/retro/
-   research by recent error rate + budget/telemetry (today: on_fail/on_risk).
-4. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+3. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
    M1's `EventType` enum). Do last / alone (touches many modules).
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)

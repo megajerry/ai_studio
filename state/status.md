@@ -2,7 +2,31 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
-## Latest (branch `runtime/workstream-config` — complete, awaiting review/merge)
+## Latest (branch `runtime/adaptive` — complete, awaiting review/merge)
+
+**Adaptive orchestration intensity — scale review/retro/research by FACTS (ADR-0003).**
+Generalizes the worker's lite triggers (`WORKER_REVIEW=on_risk` /
+`WORKER_RETRO=on_fail`, which scale by one episode) into a policy that scales the
+*base* modes by a workstream's **recent error rate** + **budget headroom**. New
+`runtime/adaptive.py`: `recent_error_rate` (fraction of the last N WORK episodes
+that carried `verify.failed`/`task.rekicked`/abandonment/`review.flagged`, from the
+existing `events`+`tasks` telemetry), `recent_activity` (velocity proxy),
+`budget_fraction` (normalizes `budget.remaining` → tightest-cap fraction), and pure
+deterministic deciders `review_mode`/`retro_mode`/`research_cadence`/`resolve_modes`
+bounded to the existing trigger vocab. Rule: high error rate → escalate toward
+`always` (more oversight); clean + tight budget → relax toward `off`; **budget
+throttle beats escalation** (near-exhausted → never pile on). Minimal additive
+`runtime/worker.py` wiring: a `resolve_intensity` seam resolves each `work.*`
+episode's effective modes (reads `budget.remaining` only when enabled) and threads
+them into `_handle_work`. **Off by default** (`ADAPTIVE_INTENSITY` unset/`off`) →
+base modes pass through, no telemetry/budget read → behavior-preserving (existing
+worker/retro/review tests unchanged). Bounded + loop-free (only changes *which*
+existing bounded trigger fires). No secrets/PII (counts only). Tests:
+`runtime/tests/test_adaptive.py` (pure + live-DB + hermetic worker-wiring). Docs:
+`runtime/adaptive.md`. No migration (reuses `events`/`tasks`/`budgets`). Verified
+live: full suite 534 passed (0 skips), `python -m runtime.demo` exit 0.
+
+## Previously (branch `runtime/workstream-config` — complete, awaiting review/merge)
 
 **Workstream config/registration — a vertical is CONFIG, not code (ADR-0018).**
 The config/registration half of the workstream-bootstrap primitive: a rules-as-data
