@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd TEMPLATE for the trajectory maintenance worker (ADR-0020) — TTL expiry
+  + verbatim->lean rotation of reasoning trajectories. Non-LLM singleton, wakes on
+  a cadence, does bounded maintenance. KeepAlive=true so the OS restarts it if it
+  dies. Mirrors com.aistudio.scheduler.plist.
+
+  Setup (see runtime/supervisor.md):
+    1. Replace __REPO_DIR__ with the absolute path to this repo checkout and
+       __PYTHON__ with the interpreter (e.g. the venv's bin/python).
+    2. cp this file to ~/Library/LaunchAgents/com.aistudio.trajectory-worker.plist
+    3. launchctl load  ~/Library/LaunchAgents/com.aistudio.trajectory-worker.plist
+       launchctl unload ~/Library/LaunchAgents/com.aistudio.trajectory-worker.plist  # to stop
+
+  Rotation is OFF by default in code; this template opts in via
+  TRAJECTORY_ROTATE_ENABLED=1. TTL expiry always runs.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aistudio.trajectory-worker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>-m</string>
+        <string>runtime.trajectory_worker</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>TRAJECTORY_WORKER_INTERVAL_S</key>
+        <string>3600</string>
+        <key>TRAJECTORY_ROTATE_AFTER_S</key>
+        <string>604800</string>
+        <key>TRAJECTORY_ROTATE_ENABLED</key>
+        <string>1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/state/logs/trajectory-worker.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/state/logs/trajectory-worker.err.log</string>
+</dict>
+</plist>
