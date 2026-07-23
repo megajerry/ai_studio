@@ -69,6 +69,7 @@ from .roles.executor import run_executor
 from .roles.pm import run_pm_tick
 from .roles.researcher import RESEARCH_TASK_TYPE, run_research as run_research_default
 from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
+from .roles.sourcing import SOURCING_TASK_TYPES, run_sourcing as run_sourcing_default
 from .roles.reviewer import REVIEW_TASK_TYPE, run_review as run_review_default
 from .roles.verifier import verify as run_verify_default
 from .scheduler import PM_TICK_TYPE
@@ -148,7 +149,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "work" | "code" | "retro" | "review" | "research" | "unknown"
+    #: "pm" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "unknown"
     kind: str
     #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
@@ -563,6 +564,49 @@ def _handle_research(
     )
 
 
+def _handle_sourcing(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    registry: ToolRegistry,
+    config: Optional[PolicyConfig],
+    model_registry,
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_sourcing: Callable[..., Any],
+) -> RunResult:
+    """Dispatch a ``research.models``/``sourcing`` task: research → propose (ADR-0005).
+
+    The Sourcing agent researches models/pricing via the policy-gated cached search
+    gateway, writes a reviewable candidate registry update via the policy-gated
+    filesystem tool, and applies the approval envelope (🛑 for a new provider /
+    budget-increasing change, auto-adopt + 📣 for an in-band swap). It NEVER mutates
+    the live registry and enqueues NOTHING (no ``enqueue`` seam is threaded), so a
+    sourcing task cannot spawn another — no loop.
+    """
+    heartbeat(conn, task.id, worker_id)
+    result = run_sourcing(
+        conn, task, sink,
+        model_registry=model_registry, tool_registry=registry, policy=config,
+    )
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
+    if result.decision == "approval":
+        detail = (
+            f"proposed {result.candidate_count} model(s) -> 🛑 approval "
+            f"{result.approval_id} (new providers: {result.new_providers}, "
+            f"budget+: {result.budget_increasing_ids})"
+        )
+    else:
+        detail = f"proposed {result.candidate_count} model(s) -> auto-adopted in-band 📣"
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="sourcing",
+        outcome="done", detail=detail,
+    )
+
+
 def _handle_review(
     conn: Any,
     task: Task,
@@ -714,6 +758,7 @@ def run_once(
     run_retro: Callable[..., Any] = run_retro_default,
     run_review: Callable[..., Any] = run_review_default,
     run_research: Callable[..., Any] = run_research_default,
+    run_sourcing: Callable[..., Any] = run_sourcing_default,
     resolve_config: Callable[[Optional[str]], Optional[WorkstreamConfig]] = resolve_workstream_config,
     resolve_intensity: IntensityResolver = _resolve_intensity_default,
 ) -> Optional[RunResult]:
@@ -779,6 +824,19 @@ def run_once(
             registry=registry, config=eff_config, model_registry=model_registry,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
             run_research=run_research,
+        )
+
+    if task.type in SOURCING_TASK_TYPES:
+        # The Sourcing agent researches models/pricing via the policy-gated cached
+        # search gateway and proposes a reviewable candidate registry update + the
+        # ADR-0005 approval envelope (🛑 for a new provider / budget change, auto +
+        # 📣 for an in-band swap). It never mutates the live registry and enqueues
+        # NOTHING (no enqueue seam threaded) — no sourcing-loop.
+        return _handle_sourcing(
+            conn, task, sink,
+            registry=registry, config=eff_config, model_registry=model_registry,
+            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            run_sourcing=run_sourcing,
         )
 
     if task.type == REVIEW_TASK_TYPE:

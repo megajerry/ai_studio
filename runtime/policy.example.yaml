@@ -45,6 +45,15 @@ roles:
     - fs.read
     - net.fetch
 
+  # The Sourcing agent (ADR-0005) researches models/pricing via the search gateway
+  # (net.fetch 🟢) and writes a REVIEWABLE candidate registry update via the
+  # filesystem tool (fs.write 🟡) — never the live registry. A new provider /
+  # budget-increasing change still raises a 🛑 approval; an in-band swap auto-adopts.
+  sourcing:
+    - fs.read
+    - fs.write
+    - net.fetch
+
   # Writes code + commits; cannot delete or deploy. Dispatches a coding worker
   # (opencode) via the `coding` tool — code.run is 🔴, so the dispatch still
   # requires human approval and only ever runs inside the sandbox (architecture §14).

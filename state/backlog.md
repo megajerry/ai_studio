@@ -29,6 +29,10 @@ the board, never direct calls; `runtime/crossworkstream.py` + `roles/pm.py`
 `triage_request`) · **Adaptive orchestration intensity** (ADR-0003:
 `runtime/adaptive.py` scales review/retro/research by real recent error rate +
 budget headroom; evidence-based, bounded, off by default → behavior-preserving) ·
+**Model sourcing agent** (ADR-0005: `runtime/roles/sourcing.py` researches
+models/pricing via the policy-gated search gateway → proposes a reviewable candidate
+registry update + the approval envelope 🛑 provider/budget / auto+📣 in-band;
+evidence-grounded provenance; never mutates the live registry; no loop) ·
 onboarding/secrets · model shortlist + cost model · ADRs 0001–0018.
 
 ## 🔄 In progress
@@ -37,12 +41,10 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0018.
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
-1. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
-   registry updates via the normal PR loop (ADR-0005).
-2. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+1. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
    M1's `EventType` enum). Run last / alone (touches many modules).
 
-_After these two, the **buildable** backlog is exhausted — only the
+_After this one, the **buildable** backlog is exhausted — only the
 stakeholder-boundary items below remain._
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)

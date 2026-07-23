@@ -48,6 +48,14 @@ from .researcher import (
     run_research,
 )
 from .retro import RetroResult, distill_lessons, run_retro
+from .sourcing import (
+    SOURCING_TASK_TYPES,
+    CandidateDecision,
+    SourcingResult,
+    classify_candidate,
+    run_sourcing,
+    synthesize_candidate,
+)
 from .verifier import VerifyResult, verify
 
 __all__ = [
@@ -64,6 +72,12 @@ __all__ = [
     "run_research",
     "distill_findings",
     "RESEARCH_TASK_TYPE",
+    "SourcingResult",
+    "CandidateDecision",
+    "run_sourcing",
+    "classify_candidate",
+    "synthesize_candidate",
+    "SOURCING_TASK_TYPES",
     "compose_lessons",
     "inject_lessons",
     "recall_lesson_texts",
