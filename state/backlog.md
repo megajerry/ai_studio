@@ -28,8 +28,13 @@ vertical is config-not-code: `runtime/workstream/` `WorkstreamConfig` from
 `workstreams/<name>/config.yaml` [charter/overlays/budget/policy-grants/skills/
 checkers/memory-seed/bucket] drives the runtime seams via minimal worker wiring,
 behavior-preserving with no config, scope-isolated; `bootstrap_workstream`
-idempotently seeds memory+budget; ADR-0018 vertical isolation) · onboarding/secrets
-· model shortlist + cost model · ADRs 0001–0018.
+idempotently seeds memory+budget; ADR-0018 vertical isolation) · **Cross-workstream
+request contract** (the other half of workstream-bootstrap: a typed
+`feature_request` on the receiver's task board + receiving-PM
+intake/triage/decompose/decline/clarify + symmetric 🛑 escalation; verticals
+coordinate via the board/event log, never direct calls; events leak no bodies;
+`runtime/crossworkstream.py` + `roles/pm.py` `triage_request`; `docs/cross-workstream.md`)
+· onboarding/secrets · model shortlist + cost model · ADRs 0001–0018.
 
 ## 🔄 In progress
 
@@ -37,17 +42,13 @@ idempotently seeds memory+budget; ADR-0018 vertical isolation) · onboarding/sec
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
-1. **Cross-workstream request contract** — the remaining half of the
-   workstream-bootstrap primitive: a typed `feature_request` + receiving-PM
-   intake/triage/prioritize/approve/decompose + symmetric escalation. _(The
-   config/registration record ✅ — see Done: `WorkstreamConfig` + wiring +
-   ADR-0018.)_
-2. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
+1. **Model sourcing agent** — researches models (LMArena/pricing) and proposes
    registry updates via the normal PR loop (ADR-0005).
-3. **Adaptive orchestration intensity** — generalize scaling of review/retro/
+2. **Adaptive orchestration intensity** — generalize scaling of review/retro/
    research by recent error rate + budget/telemetry (today: on_fail/on_risk).
-4. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
-   M1's `EventType` enum). Do last / alone (touches many modules).
+3. **Event-type constant consolidation** — deferred nit (many `EVENT_*` strings vs
+   M1's `EventType` enum). Do last / alone (touches many modules). _(Now also
+   includes the `request.*` wires in `runtime/crossworkstream.py`.)_
 
 ## ⛔ Boundary — needs stakeholder input (the true "exhausted" line)
 

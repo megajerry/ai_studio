@@ -2,6 +2,34 @@
 
 _Last updated: 2026-07-22 (remote session)_
 
+## Latest (branch `runtime/cross-workstream` — complete, awaiting review/merge)
+
+**Cross-workstream request contract — the second half of workstream-bootstrap.**
+Verticals now ask one another to build things via a typed request on the task
+board (never direct calls; ADR-0018 isolation + CLAUDE.md invariants 1 & 2).
+`runtime/crossworkstream.py`: a typed `FeatureRequest` (from/to workstream, title,
+problem, desired_capability, success_criteria, impact, priority, deadline?,
+context_refs?) carried as a `type="feature_request"` task on the RECEIVER's board;
+`submit_request` (→ `up_for_grabs` + `request.submitted`), `list_requests`
+(scope-respecting), and the `request.*` sub-status machine
+(submitted→under_review→accepted|declined|needs_clarification|escalated) with
+identity-only events (ids/workstreams/decision/reason — never the request bodies).
+Additive receiving-PM intake `runtime/roles/pm.py` `triage_request` evaluates
+through the receiver's OWN success lens (pushback is first-class): **accept** →
+decompose into `up_for_grabs` work items whose criteria are the requester's
+`success_criteria`, linked back to the request, + `request.accepted` (request
+merged); **decline** → `request.declined` + NO work (abandoned); **clarify** →
+`request.needs_clarification` (re-queued for the requester); **escalate** →
+`request.escalated` + a real 🛑 `request_approval`, request parked `blocked`
+(symmetric — either side may escalate). `run_pm_tick` untouched. Disjoint file set;
+no edits to `worker.py`/`tasks.py`/`model/*`. Docs: `docs/cross-workstream.md`
+(with the video→productivity `video_audit` example). Evidence:
+`DATABASE_URL=… pytest runtime/tests/ spokesman/tests/` = **525 passed, 0 skips**
+(10 new cross-workstream tests: submit→receiver-only, accept-decomposes-with-
+requester-criteria, decline-reason-no-work, clarify-requeues, escalate-real-🛑-
+approval, requester-observes-via-events, scope-respected, events-leak-no-bodies);
+`python -m runtime.demo` exits 0 (all five acts green).
+
 ## Latest (branch `runtime/workstream-config` — complete, awaiting review/merge)
 
 **Workstream config/registration — a vertical is CONFIG, not code (ADR-0018).**
