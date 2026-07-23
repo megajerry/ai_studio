@@ -295,6 +295,7 @@ def enqueue_task(
     assignee: Optional[Assignee] = None,
     budget_tokens: Optional[int] = None,
     depends_on: Optional[list[UUID]] = None,
+    trajectory_id: Optional[UUID] = None,
 ) -> Task:
     """Create an ``up_for_grabs`` task and emit ``task.created`` (ADR-0009/0015).
 
@@ -302,6 +303,13 @@ def enqueue_task(
     ``depends_on`` lists prerequisite task ids — the task becomes grabbable only
     once every prerequisite is ``merged`` (see :func:`grab_task`). Self-dependency
     is rejected (:class:`~runtime.task_state.DependencyCycle`).
+
+    ``trajectory_id`` optionally stamps the reasoning trajectory this task was born
+    from (ADR-0020): when the PM decomposes a plan it links every created task back
+    to the ``pm`` trajectory that decided it, so an outcome can later be attributed
+    to the decision (``SELECT ... FROM tasks WHERE trajectory_id = …``). The link is
+    set through this single guarded writer only — there is no ad-hoc UPDATE of the
+    column anywhere (mirrors the transition-only discipline).
     """
     deps = list(depends_on or [])
     with conn.transaction():
@@ -309,8 +317,9 @@ def enqueue_task(
             cur.execute(
                 f"""
                 INSERT INTO tasks
-                    (workstream, type, payload, priority, assignee, budget_tokens, depends_on)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (workstream, type, payload, priority, assignee, budget_tokens,
+                     depends_on, trajectory_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING {_TASK_COLUMNS}
                 """,
                 (
@@ -321,6 +330,7 @@ def enqueue_task(
                     assignee.value if assignee else None,
                     budget_tokens,
                     deps,
+                    trajectory_id,
                 ),
             )
             task = Task.model_validate(cur.fetchone())

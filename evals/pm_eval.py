@@ -91,7 +91,7 @@ def _capturing_enqueue(captured: list[dict]):
 
     def enqueue(conn: Any, *, workstream: str, type: str, payload: Optional[dict] = None,
                 priority: int = 0, assignee: Any = None, budget_tokens: Any = None,
-                depends_on: Any = None) -> Any:
+                depends_on: Any = None, trajectory_id: Any = None) -> Any:
         tid = uuid4()
         captured.append({
             "id": tid,

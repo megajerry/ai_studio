@@ -37,6 +37,7 @@ prose that could leak the subject (CLAUDE.md invariants 5 & 6).
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Optional
 from uuid import UUID
 
@@ -48,7 +49,10 @@ from ..model.call import call_model as _call_model
 from ..model.registry import Registry
 from ..models import make_event
 from ..skills import SkillRegistry
+from ..trajectory import add_step
 from .prompt import compose_role_prompt
+
+log = logging.getLogger("runtime.roles.critic")
 
 # --- Vocabulary -------------------------------------------------------------
 
@@ -146,6 +150,45 @@ def _severity_counts(concerns: list[Concern]) -> dict[str, int]:
     for c in concerns:
         counts[c.severity] = counts.get(c.severity, 0) + 1
     return counts
+
+
+def _record_consult(
+    conn: Any,
+    trajectory_id: Optional[UUID],
+    kind: str,
+    concerns: list[Concern],
+    blocking: bool,
+    recommendation: str,
+) -> None:
+    """Record this critique as a ``consult`` step on an open PM trajectory (ADR-0020).
+
+    Observe-only + DB-outage-safe (ADR-0017): with no ``conn``/``trajectory_id`` or
+    on ANY failure it logs + returns, so critiquing NEVER blocks or crashes. The
+    verdict lands in ``choice``/``refs`` and the full concern bodies (which may name
+    the subject) in the VERBATIM ``rationale`` — that lives in the local DB only, so
+    it is safe here (unlike the body-free ``critic.reviewed`` event).
+    """
+    if conn is None or trajectory_id is None:
+        return
+    rationale = "\n".join(
+        f"- [{c.severity}/{c.kind}] {c.statement}: {c.rationale}" for c in concerns
+    ) or "no concerns raised"
+    try:
+        add_step(
+            conn, trajectory_id, "consult",
+            f"critiqued the {kind} ({len(concerns)} concern(s)) → {recommendation}",
+            rationale=rationale,
+            choice=recommendation,
+            refs={
+                "blocking": blocking,
+                "recommendation": recommendation,
+                "concern_count": len(concerns),
+                "kinds": _kind_counts(concerns),
+                "severities": _severity_counts(concerns),
+            },
+        )
+    except Exception:  # pragma: no cover - defensive: recording is never load-bearing
+        log.warning("Critic trajectory consult step failed; proceeding", exc_info=True)
 
 
 # --- Fact-based assessment (pure, deterministic, DB/model-free) --------------
@@ -284,6 +327,7 @@ def run_critic(
     skills: Optional[SkillRegistry] = None,
     charter: Optional[str] = None,
     overlay: Optional[str] = None,
+    trajectory_id: Optional[UUID] = None,
     call_model: Callable[..., Any] = _call_model,
     assess: Callable[[str, dict], list[Concern]] = assess_concerns,
 ) -> Critique:
@@ -299,6 +343,11 @@ def run_critic(
     verdict is the pure ``assess`` over the facts (ADR-0014). Emits ``critic.reviewed``
     with COUNTS / kinds / severities / recommendation only. ``call_model`` / ``assess``
     are injectable for tests.
+
+    ``trajectory_id`` optionally links this critique to an open PM trajectory
+    (ADR-0020): when set, the verdict + verbatim concerns are recorded as a
+    ``consult`` step (observe-only, DB-outage-safe) so the PM↔Critic loop is
+    replayable. It changes nothing about the returned verdict.
     """
     sink = sink or NullEventSink()
     context = context or {}
@@ -332,6 +381,9 @@ def run_critic(
         subject_kind=kind, concerns=concerns,
         blocking=blocking, recommendation=recommendation,
     )
+
+    # Record the consult on the PM's trajectory (verbatim concerns; local DB only).
+    _record_consult(conn, trajectory_id, kind, concerns, blocking, recommendation)
 
     # Emit critic.reviewed — COUNTS / kinds / severities / recommendation only.
     # NEVER a concern statement, rationale, plan body, or lesson text.
