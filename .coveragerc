@@ -1,0 +1,31 @@
+# Coverage config for AI Studio (see docs/evaluation.md, `make coverage`).
+# Measures the runtime + evals + spokesman packages; excludes tests, migrations,
+# and demos (those exercise code, they are not the code under measurement).
+
+[run]
+branch = True
+source =
+    runtime
+    evals
+    spokesman
+omit =
+    */tests/*
+    */__pycache__/*
+    runtime/migrations/*
+    runtime/demo.py
+
+[report]
+# Don't count lines that are unreachable-by-design or purely defensive.
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    raise AssertionError
+show_missing = True
+skip_covered = False
+precision = 1
+
+[html]
+directory = htmlcov

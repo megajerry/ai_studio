@@ -34,7 +34,12 @@ models/pricing via the policy-gated search gateway → proposes a reviewable can
 registry update + the approval envelope 🛑 provider/budget / auto+📣 in-band;
 evidence-grounded provenance; never mutates the live registry; no loop) ·
 **Event-type constants consolidated** (single `runtime/event_types.py`, pure
-refactor, zero wire-value drift) · onboarding/secrets · model shortlist + cost
+refactor, zero wire-value drift) · **Evaluation harness v1** (empirical quality
+framework: coverage wired via `pytest-cov`/`.coveragerc`/`make coverage`;
+seeded-defect **Verifier precision/recall** = 1.0/1.0 on a labeled GOOD/BAD corpus
+incl. hallucinated-success + `video_audit` defects; **PM structural decomposition**
+eval; telemetry-driven **`quality_report`** in `runtime/quality.py`; `python -m
+evals`; `docs/evaluation.md`) · onboarding/secrets · model shortlist + cost
 model · ADRs 0001–0018.
 
 ## 🔄 In progress
@@ -58,6 +63,12 @@ model · ADRs 0001–0018.
   tunnel, to take the Spokesman channel live. See `docs/spokesman-whatsapp.md`.
 - **Real live-model end-to-end slice** — depends on the keys above; proves a real
   model producing real work + real spend enforced (unblocks after go-live).
+- **Real-model evals + real-integration smoke** — the go-live half of the
+  evaluation harness: real-model golden-set + LLM-as-judge OUTCOME evals, and
+  end-to-end smoke against Docker/Qdrant/live providers/WhatsApp. The harness
+  framework, seams, and report shape already exist (`evals/`, `runtime/quality.py`,
+  `docs/evaluation.md`); this item is the real-model/real-integration content that
+  only becomes measurable once keys land.
 
 ## 🐛 Known follow-up nits (tracked, non-blocking)
 

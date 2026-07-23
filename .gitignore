@@ -58,7 +58,13 @@ env/
 .ruff_cache/
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+
+# --- Eval harness generated reports (regenerate with `make evals`) ---
+state/eval-report.json
+state/eval-report.md
 
 # --- Node (for any dashboards / MCP servers in JS) ---
 node_modules/

@@ -1,0 +1,12 @@
+# AI Studio — dev/test dependencies (not needed at runtime).
+# Install with: pip install -r runtime/requirements-dev.txt
+#
+# The runtime deps themselves live in runtime/requirements.txt.
+
+# Test runner (integration tests skip cleanly when no DATABASE_URL is reachable).
+pytest>=8.0,<10.0
+
+# Coverage measurement for `make coverage` (see docs/evaluation.md + .coveragerc).
+# pytest-cov pulls in coverage[toml]; both are the standard, well-maintained tools.
+pytest-cov>=5.0,<8.0
+coverage[toml]>=7.0,<8.0
