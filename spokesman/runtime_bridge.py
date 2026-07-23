@@ -166,9 +166,9 @@ def classify_event(event: Event) -> Optional[NotificationItem]:
         )
 
     if etype in INFORM_EVENT_TYPES:
-        if etype == "review.flagged" and payload.get("severity") == "high":
+        if etype == EVENT_REVIEW_FLAGGED and payload.get("severity") == "high":
             return None  # already covered by the 🚨 alarm + 🛑 approval for this episode
-        if etype == "task.failed_exhausted":
+        if etype == EVENT_TASK_FAILED_EXHAUSTED:
             retries = payload.get("retries")
             text = (
                 f"Task {_short(task_id)} failed after exhausting retries"
