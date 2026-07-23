@@ -33,12 +33,8 @@ from runtime.models import Task, TaskStatus
 from runtime.roles.pm import run_pm_tick
 from runtime.task_state import DependencyCycle, assert_acyclic
 
-#: Labeled goals the PM should be able to decompose into a well-formed plan.
-DEFAULT_GOALS: list[str] = [
-    "Prove the studio operates end-to-end in dry-run.",
-    "Launch a weekly short-form video channel with captioned clips.",
-    "Stand up a lead-capture landing page and a follow-up email.",
-]
+from .corpus import load_pm_goals
+from .stats import Rate, rate
 
 
 def score_decomposition(items: list[dict]) -> dict:
@@ -127,14 +123,22 @@ class PMEvalResult:
     def passed(self) -> bool:
         return bool(self.cases) and all(c["passed"] for c in self.cases)
 
+    def pass_rate(self) -> Rate:
+        """Fraction of goals that decomposed well, as a :class:`~evals.stats.Rate`
+        (n = #goals + Wilson 95% CI + small-``n`` flag)."""
+        n_pass = sum(1 for c in self.cases if c["passed"])
+        return rate("pm_well_formed_rate", n_pass, len(self.cases))
+
     def to_dict(self) -> dict:
         return {
             "name": "pm_structural_decomposition",
             "description": (
                 "Structural quality of the (dry-run) PM's decomposition on labeled "
-                "goals: >=1 item, per-item criteria, acyclic DAG, sane deps."
+                "goals: >=1 item, per-item criteria, acyclic DAG, sane deps. "
+                "Pass rate carries n + Wilson 95% CI."
             ),
             "num_goals": len(self.cases),
+            "rates": [self.pass_rate().to_dict()],
             "cases": self.cases,
             "passed": self.passed,
         }
@@ -151,7 +155,7 @@ def run_pm_structural_eval(
     workstream lands, which is expected.
     """
     os.environ.setdefault("MODELS_DRY_RUN", "1")
-    goals = goals or DEFAULT_GOALS
+    goals = goals or load_pm_goals()
     cases: list[dict] = []
     for goal in goals:
         ws = f"eval-pm-{uuid4().hex[:8]}"

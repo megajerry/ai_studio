@@ -1,4 +1,4 @@
-"""Run the AI Studio evaluation harness and print the metrics.
+"""Run the AI Studio evaluation harness and print the metrics (v2).
 
 Usage::
 
@@ -8,28 +8,38 @@ Usage::
     python -m evals --workstream demo-xyz   # scope the telemetry rollup
 
 Keyless by construction (forces ``MODELS_DRY_RUN``). The Verifier seeded-defect
-eval + the metric arithmetic need no database; the PM structural eval and the
-telemetry rollup need a reachable Postgres (``DATABASE_URL``/``POSTGRES_*``). With
-no database those two are skipped cleanly (never hangs) and the harness still
-reports the Verifier precision/recall so at least some numbers always exist.
-Exit code is 0 when every eval that ran passed, else 1.
+eval + the metric arithmetic need no database; the PM structural eval, the
+trajectory decision-quality eval, and the telemetry rollup need a reachable Postgres
+(``DATABASE_URL``/``POSTGRES_*``). With no database those are skipped cleanly (never
+hangs) and the harness still reports the Verifier precision/recall (with n + Wilson
+95% CI) so at least some honest numbers always exist. Exit code is 0 when every eval
+that ran passed, else 1.
+
+v2: EVERY rate is printed with its sample size ``n`` and a Wilson 95% CI, and small
+samples (n<30) are flagged INSUFFICIENT — so the tiny-corpus weakness is visible.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 from . import report as report_mod
 from .pm_eval import run_pm_structural_eval
-from .verifier_eval import run_verifier_eval
+from .stats import Rate, rate
+from .trajectory_eval import run_trajectory_eval
+from .verifier_eval import VerifierEvalResult, run_verifier_eval
+
+
+def _print_rates(rates: list[Rate]) -> None:
+    for r in rates:
+        print(f"    {r.render()}")
 
 
 def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("MODELS_DRY_RUN", "1")
-    parser = argparse.ArgumentParser(prog="evals", description="AI Studio eval harness v1")
+    parser = argparse.ArgumentParser(prog="evals", description="AI Studio eval harness v2")
     parser.add_argument("--json", metavar="PATH", help="write the full report as JSON")
     parser.add_argument("--markdown", metavar="PATH", help="write a markdown summary")
     parser.add_argument("--workstream", metavar="WS", default=None,
@@ -39,20 +49,25 @@ def main(argv: list[str] | None = None) -> int:
     from runtime import db  # deferred: importing runtime shouldn't require a DB
 
     # --- Verifier seeded-defect eval (no DB required) -----------------------
-    verifier = run_verifier_eval().to_dict()
+    verifier_result: VerifierEvalResult = run_verifier_eval()
+    verifier = verifier_result.to_dict()
     vcm = verifier["confusion"]
     print("=== Verifier seeded-defect eval (dry-run) ===")
     print(f"  cases={vcm['support']} defective={vcm['positives']} "
-          f"precision={vcm['precision']} recall={vcm['recall']} "
           f"f1={vcm['f1']} accuracy={vcm['accuracy']}")
     print(f"  confusion tp={vcm['tp']} fp={vcm['fp']} fn={vcm['fn']} tn={vcm['tn']} "
           f"(positive=defective)  passed={verifier['passed']}")
+    print("  rates (each with n + Wilson 95% CI):")
+    _print_rates(verifier_result.rates())
+    print("  NOTE: tiny hand-seeded corpus -> a LOGIC/ORACLE test with WIDE CIs "
+          "(n<30), NOT a statistical quality estimate.")
     for c in verifier["cases"]:
         flag = "ok " if c["correct"] else "XX "
         print(f"    {flag}{c['name']:<44} expect_pass={c['expected_pass']!s:<5} "
               f"got={c['predicted_pass']!s:<5} :: {c['reason']}")
 
     pm = None
+    trajectory = None
     quality = None
     all_passed = verifier["passed"]
 
@@ -63,14 +78,28 @@ def main(argv: list[str] | None = None) -> int:
             migrate(conn)
 
             # --- PM structural eval (needs DB) ------------------------------
-            pm = run_pm_structural_eval(conn).to_dict()
+            pm_result = run_pm_structural_eval(conn)
+            pm = pm_result.to_dict()
             print("\n=== PM structural decomposition eval (dry-run) ===")
             print(f"  goals={pm['num_goals']} passed={pm['passed']}")
+            _print_rates([pm_result.pass_rate()])
             for c in pm["cases"]:
                 flag = "ok " if c["passed"] else "XX "
                 print(f"    {flag}{c['goal']:<50} decision={c['decision']:<8} "
                       f"items={c['num_items']} criteria={c['all_items_have_criteria']} "
                       f"acyclic={c['dag_acyclic']} deps_sane={c['deps_sane']}")
+
+            # --- Trajectory decision-quality eval via swappable judge -------
+            traj_result = run_trajectory_eval(conn)
+            trajectory = traj_result.to_dict()
+            vd = trajectory["verdict"]
+            print("\n=== PM trajectory decision-quality eval (swappable judge, dry-run) ===")
+            print(f"  trajectory={trajectory['trajectory_id']} rubric={trajectory['rubric_id']}")
+            print(f"  verdict passed={vd['passed']} score={vd['score']} "
+                  f"provider={vd['provider']} dry_run={vd['dry_run']} "
+                  f"harness_passed={trajectory['passed']}")
+            print("  NOTE: dryrun judge = MECHANISM signal only; a real model judges "
+                  "the same trajectory at go-live with no code change.")
 
             # --- Telemetry quality rollup (needs DB) ------------------------
             from runtime.quality import quality_report
@@ -81,22 +110,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  merged={t['tasks_merged']} abandoned={t['tasks_abandoned']} "
                   f"verify_passed={t['verify_passed']} verify_failed={t['verify_failed']} "
                   f"rekicks={t['rekicks']} model_calls={t['model_calls']}")
-            print(f"  success_rate={r['task_success_rate']} "
-                  f"verify_pass_rate={r['verify_pass_rate']} "
-                  f"rekick_rate={r['rekick_rate']} error_rate={r['error_rate']}")
+            print("  rates (each with n + Wilson 95% CI):")
+            _print_rates(report_mod.telemetry_rates(quality))
+            print(f"    rekick_rate={r['rekick_rate']} (per-task ratio, not a "
+                  "proportion -> no CI)")
             print(f"  avg_cost/completed=${quality['cost']['avg_cost_per_completed_task_usd']} "
                   f"avg_tokens/completed={quality['cost']['avg_tokens_per_completed_task']} "
                   f"avg_latency/completed_ms={quality['latency']['avg_latency_per_completed_task_ms']}")
 
-            all_passed = all_passed and pm["passed"]
+            all_passed = all_passed and pm["passed"] and trajectory["passed"]
         finally:
             conn.close()
     else:
-        print("\n(no reachable DATABASE_URL — PM structural eval + telemetry rollup "
-              "skipped; run against the live Postgres for those. Verifier eval above "
-              "ran without a DB.)")
+        print("\n(no reachable DATABASE_URL — PM structural, trajectory, and telemetry "
+              "evals skipped; run against the live Postgres for those. Verifier eval "
+              "above ran without a DB.)")
 
-    full = report_mod.build_report(verifier, pm, quality)
+    full = report_mod.build_report(verifier, pm, quality, trajectory)
     if args.json:
         Path(args.json).write_text(report_mod.to_json(full), encoding="utf-8")
         print(f"\nwrote JSON report -> {args.json}")

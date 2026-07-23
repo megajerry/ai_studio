@@ -1,0 +1,11 @@
+# Labeled goals for the PM structural-decomposition eval (ADR-0003 / ADR-0015).
+#
+# Corpus-as-data (harness v2): moved out of DEFAULT_GOALS in evals/pm_eval.py so
+# the goal set grows by editing data, not code. Each goal is a natural-language
+# objective the (dry-run) PM should be able to decompose into a well-formed plan
+# (>=1 work item, per-item criteria, acyclic DAG, sane deps).
+
+goals:
+  - "Prove the studio operates end-to-end in dry-run."
+  - "Launch a weekly short-form video channel with captioned clips."
+  - "Stand up a lead-capture landing page and a follow-up email."

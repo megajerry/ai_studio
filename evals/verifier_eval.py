@@ -42,7 +42,9 @@ from runtime.roles.verifier import verify
 from runtime.tools import ToolRegistry
 from runtime.tools.filesystem import FilesystemTool
 
+from .corpus import VerifierCase, load_verifier_cases
 from .metrics import Confusion, confusion_from_labels
+from .stats import Rate, rate
 
 # --- reference domain checker: video_audit (evidence over claims) ------------
 
@@ -122,82 +124,22 @@ def eval_checker_registry() -> CheckerRegistry:
     return reg
 
 
-# --- the labeled seeded-defect corpus ---------------------------------------
-
-
-@dataclass
-class VerifierCase:
-    """One labeled ``(artifact, criterion, expected pass/fail)`` case.
-
-    ``content`` is written to the scratch root as the artifact (``None`` = the
-    Executor produced no artifact). ``claimed_ok`` is what the Executor *asserts*
-    about its own result — deliberately set True on some defective cases so the eval
-    proves the gate ignores the claim and decides on evidence (ADR-0014).
-    """
-
-    name: str
-    label: str  # human tag: "GOOD" / "BAD:<why>"
-    check: str  # "marker" | "video_audit"
-    expected_pass: bool
-    content: Optional[str] = None
-    marker: Optional[str] = None
-    require: Any = None
-    claimed_ok: bool = True
+# --- the labeled seeded-defect corpus (loaded from data, harness v2) ---------
+#
+# The cases used to be hardcoded here; they now live in
+# ``evals/corpus/verifier_cases.yaml`` (:class:`evals.corpus.VerifierCase` is the
+# loaded type) so the corpus grows by editing DATA, not code. ``default_cases`` is
+# kept as the loader entrypoint the runner + tests call.
 
 
 def default_cases() -> list[VerifierCase]:
-    """The built-in labeled corpus: 2 known-GOOD + 5 deliberately-planted defects.
+    """The labeled seeded-defect corpus, loaded from the versioned data file.
 
-    The defects span both checker families and include two *hallucinated-success*
-    cases (``claimed_ok=True`` on defective work) that the gate must FAIL on
-    evidence — the recall-critical cases that prove the gate is not fooled by a
-    "done" claim.
-    """
-    m_good = f"studio-ok:{uuid4().hex[:8]}"
-    m_bad = f"studio-ok:{uuid4().hex[:8]}"
-    video_req = {"min_duration": 10, "max_duration": 60, "require_captions": True}
-    return [
-        # --- marker checker ---
-        VerifierCase(
-            name="marker_good", label="GOOD", check="marker", expected_pass=True,
-            marker=m_good, content=f"{m_good}\ngoal: ship the thing\ndone\n",
-        ),
-        VerifierCase(
-            name="marker_missing_hallucinated_success",
-            label="BAD:hallucinated-success (marker absent, claims ok)",
-            check="marker", expected_pass=False, claimed_ok=True,
-            marker=m_bad, content="looks fine, trust me — all done!\n",  # no marker
-        ),
-        VerifierCase(
-            name="marker_missing_honest_fail",
-            label="BAD:marker absent", check="marker", expected_pass=False,
-            claimed_ok=False, marker=m_bad, content="partial output, incomplete\n",
-        ),
-        # --- video_audit domain checker ---
-        VerifierCase(
-            name="video_good", label="GOOD", check="video_audit", expected_pass=True,
-            require=video_req,
-            content="title: launch teaser\nduration_seconds: 30\ncaptions: present\n",
-        ),
-        VerifierCase(
-            name="video_duration_too_short",
-            label="BAD:wrong-duration (too short)", check="video_audit",
-            expected_pass=False, require=video_req,
-            content="title: blip\nduration_seconds: 3\ncaptions: present\n",
-        ),
-        VerifierCase(
-            name="video_duration_too_long",
-            label="BAD:wrong-duration (too long)", check="video_audit",
-            expected_pass=False, require=video_req,
-            content="title: overlong\nduration_seconds: 120\ncaptions: present\n",
-        ),
-        VerifierCase(
-            name="video_missing_captions_hallucinated_success",
-            label="BAD:missing-captions (claims ok)", check="video_audit",
-            expected_pass=False, claimed_ok=True, require=video_req,
-            content="title: no caps\nduration_seconds: 30\ncaptions: absent\n",
-        ),
-    ]
+    Includes known-GOOD cases and deliberately-planted defects across both checker
+    families, with two *hallucinated-success* cases (``claimed_ok=True`` on defective
+    work) the gate must FAIL on evidence — the recall-critical cases that prove the
+    gate is not fooled by a "done" claim (ADR-0014)."""
+    return load_verifier_cases()
 
 
 # --- runner ------------------------------------------------------------------
@@ -210,14 +152,31 @@ class VerifierEvalResult:
     confusion: Confusion
     cases: list[dict] = field(default_factory=list)
 
+    def rates(self) -> list[Rate]:
+        """Precision / recall / accuracy as :class:`~evals.stats.Rate`s — each with
+        its sample size ``n`` + Wilson 95% CI + small-``n`` flag, so the tiny-corpus
+        weakness is visible in the numbers rather than hidden behind a bare ``1.0``.
+
+        - precision = tp / (tp + fp)   (n = flagged-as-defective)
+        - recall    = tp / (tp + fn)   (n = truly-defective, the positive class)
+        - accuracy  = (tp + tn) / support
+        """
+        cm = self.confusion
+        return [
+            rate("precision", cm.tp, cm.tp + cm.fp),
+            rate("recall", cm.tp, cm.tp + cm.fn),
+            rate("accuracy", cm.tp + cm.tn, cm.support),
+        ]
+
     def to_dict(self) -> dict:
         return {
             "name": "verifier_seeded_defect",
             "description": (
                 "Verifier evidence-gate precision/recall on labeled GOOD/BAD "
-                "artifacts (positive class = defective)."
+                "artifacts (positive class = defective). Rates carry n + Wilson 95% CI."
             ),
             "confusion": self.confusion.to_dict(),
+            "rates": [r.to_dict() for r in self.rates()],
             "cases": self.cases,
             "passed": (
                 self.confusion.recall == 1.0
