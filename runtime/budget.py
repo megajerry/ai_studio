@@ -38,18 +38,16 @@ from uuid import UUID
 import psycopg
 
 from .approvals import request_approval as _request_approval
+from .event_types import EVENT_BUDGET_CHECKPOINT, EVENT_BUDGET_EXCEEDED
 from .models import make_event
 from .policy import BudgetContext
 
 if TYPE_CHECKING:  # avoid importing the enforce module at runtime (no cycle)
     from .enforce import EventSink
 
-# --- Canonical wire strings -------------------------------------------------
-
-#: Emitted when a call is blocked because a workstream cap would be exceeded.
-EVENT_BUDGET_EXCEEDED = "budget.exceeded"
-#: Emitted on an under-cap check — a periodic spend/remaining checkpoint.
-EVENT_BUDGET_CHECKPOINT = "budget.checkpoint"
+# The budget wire strings (``EVENT_BUDGET_EXCEEDED`` on a blocked over-cap call,
+# ``EVENT_BUDGET_CHECKPOINT`` on an under-cap spend checkpoint) are imported from
+# the canonical :mod:`runtime.event_types`.
 
 #: The default window when a caller does not name one.
 DEFAULT_PERIOD = "monthly"

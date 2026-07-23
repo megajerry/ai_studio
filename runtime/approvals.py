@@ -35,15 +35,15 @@ from uuid import UUID
 import psycopg
 from pydantic import BaseModel, Field
 
+from .event_types import EVENT_APPROVAL_REQUESTED, EVENT_APPROVAL_RESOLVED
 from .models import make_event
 
 if TYPE_CHECKING:  # avoid a runtime import cycle (enforce imports approvals)
     from .enforce import EventSink
 
-# Canonical event types for the approval loop. Owned here; re-exported by
-# :mod:`runtime.enforce` so the enforcement path and this store agree on wires.
-EVENT_APPROVAL_REQUESTED = "approval.requested"
-EVENT_APPROVAL_RESOLVED = "approval.resolved"
+# The approval-loop event types are imported from :mod:`runtime.event_types`
+# (the canonical source) and re-exported by :mod:`runtime.enforce` so the
+# enforcement path and this store agree on the wire strings.
 
 #: Terminal + transient statuses an approval row may hold.
 STATUS_PENDING = "pending"

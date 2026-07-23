@@ -1,0 +1,121 @@
+"""Canonical event-type strings — the single source of truth for ``events.type``.
+
+Every subsystem's event-type wire string is defined here exactly once, so
+producers and consumers agree on the bytes written to the free-form
+``events.type`` column. Modules import the ``EVENT_*`` constants (and the M1
+:class:`EventType` enum) from here instead of re-declaring their own; the enum
+is also re-exported from :mod:`runtime.models` for backward-compatible imports.
+
+This module is dependency-free (stdlib only) so anything — including the
+DB-free ``runtime.adaptive`` planner — can import it without pulling in psycopg.
+Values are byte-identical to the historical per-module definitions: changing one
+here is a wire/telemetry change, not a refactor.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+# --- M1 task lifecycle (owned by runtime.tasks / runtime.supervisor) ---------
+EVENT_TASK_CREATED = "task.created"
+EVENT_TASK_CLAIMED = "task.claimed"
+EVENT_TASK_HEARTBEAT = "task.heartbeat"
+EVENT_TASK_FINISHED = "task.finished"
+# Every guarded state change (runtime.tasks.transition) emits this with the
+# from/to statuses, acting agent + type, and latency since the previous
+# transition — the append-only lifecycle telemetry (ADR-0012/0015).
+EVENT_TASK_TRANSITION = "task.transition"
+# Emitted by the non-agent supervisor (ADR-0004) when it re-kicks a task whose
+# worker went stale, or force-fails one that exhausted its retries.
+EVENT_TASK_REKICKED = "task.rekicked"
+EVENT_TASK_FAILED_EXHAUSTED = "task.failed_exhausted"
+
+# --- Worker orchestration (runtime.worker) ----------------------------------
+#: Re-enqueue of a work task after a verify fail.
+EVENT_WORK_RETRY = "work.retry"
+#: A retro was enqueued after a terminal work task.
+EVENT_RETRO_TRIGGERED = "retro.triggered"
+#: A review was enqueued after a terminal work task.
+EVENT_REVIEW_TRIGGERED = "review.triggered"
+#: A task blocked on a 🔴 approval was re-queued after a grant.
+EVENT_APPROVAL_RESUMED = "approval.resumed"
+
+# --- Approval loop (runtime.approvals, enforced by runtime.enforce) ----------
+EVENT_APPROVAL_REQUESTED = "approval.requested"
+EVENT_APPROVAL_RESOLVED = "approval.resolved"
+
+# --- Policy enforcement (runtime.enforce) -----------------------------------
+EVENT_POLICY_DECISION = "policy.decision"
+EVENT_TOOL_INVOKED = "tool.invoked"
+
+# --- Budget (runtime.budget) ------------------------------------------------
+EVENT_BUDGET_EXCEEDED = "budget.exceeded"
+EVENT_BUDGET_CHECKPOINT = "budget.checkpoint"
+
+# --- Memory (runtime.memory) ------------------------------------------------
+EVENT_MEMORY_REMEMBERED = "memory.remembered"
+EVENT_MEMORY_RECALLED = "memory.recalled"
+
+# --- Model routing + calls (runtime.model) ----------------------------------
+EVENT_MODEL_ROUTED = "model.routed"
+EVENT_MODEL_CALL = "model.call"
+
+# --- Search gateway (runtime.search) ----------------------------------------
+EVENT_SEARCH_DENIED = "search.denied"
+EVENT_SEARCH_CACHE_HIT = "search.cache_hit"
+EVENT_SEARCH_CACHE_MISS = "search.cache_miss"
+EVENT_SEARCH_PROVIDER_CALL = "search.provider_call"
+
+# --- Cross-workstream feature requests (runtime.crossworkstream) -------------
+EVENT_REQUEST_SUBMITTED = "request.submitted"
+EVENT_REQUEST_UNDER_REVIEW = "request.under_review"
+EVENT_REQUEST_ACCEPTED = "request.accepted"
+EVENT_REQUEST_DECLINED = "request.declined"
+EVENT_REQUEST_NEEDS_CLARIFICATION = "request.needs_clarification"
+EVENT_REQUEST_ESCALATED = "request.escalated"
+
+# --- Roles ------------------------------------------------------------------
+#: PM (runtime.roles.pm) — the three confidence-gate outcomes.
+EVENT_PM_PLANNED = "pm.planned"
+EVENT_PM_NEEDS_CLARIFICATION = "pm.needs_clarification"
+EVENT_PM_PUSHBACK = "pm.pushback"
+#: Executor (runtime.roles.executor).
+EVENT_EXECUTOR_ACTED = "executor.acted"
+#: Verifier (runtime.roles.verifier) — the verify→commit decision.
+EVENT_VERIFY_PASSED = "verify.passed"
+EVENT_VERIFY_FAILED = "verify.failed"
+#: Reviewer (runtime.roles.reviewer) — verdict + the 🚨 HIGH-severity alarm.
+EVENT_REVIEW_PASSED = "review.passed"
+EVENT_REVIEW_FLAGGED = "review.flagged"
+EVENT_REVIEW_ALARM = "review.alarm"
+#: Retro (runtime.roles.retro).
+EVENT_RETRO_COMPLETED = "retro.completed"
+#: Researcher (runtime.roles.researcher).
+EVENT_RESEARCH_COMPLETED = "research.completed"
+#: Sourcing (runtime.roles.sourcing).
+EVENT_SOURCING_PROPOSED = "sourcing.proposed"
+EVENT_SOURCING_AUTOADOPTED = "sourcing.autoadopted"
+
+# --- Experiments (runtime.experiment) ---------------------------------------
+EVENT_PROPOSED = "experiment.proposed"
+EVENT_STARTED = "experiment.started"
+EVENT_OBSERVED = "experiment.observation"
+EVENT_EVALUATED = "experiment.evaluated"
+
+
+class EventType(str, Enum):
+    """M1 task-lifecycle event types (ADR-0012/0015).
+
+    Kept as an enum so the typed lifecycle path (runtime.tasks) has a closed
+    vocabulary; the ``events.type`` column itself is free-form text so other
+    subsystems emit their own types via the ``EVENT_*`` constants above. Values
+    are built from those constants so each wire string is written exactly once.
+    """
+
+    TASK_CREATED = EVENT_TASK_CREATED
+    TASK_CLAIMED = EVENT_TASK_CLAIMED
+    TASK_HEARTBEAT = EVENT_TASK_HEARTBEAT
+    TASK_FINISHED = EVENT_TASK_FINISHED
+    TASK_TRANSITION = EVENT_TASK_TRANSITION
+    TASK_REKICKED = EVENT_TASK_REKICKED
+    TASK_FAILED_EXHAUSTED = EVENT_TASK_FAILED_EXHAUSTED

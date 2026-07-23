@@ -30,15 +30,15 @@ from typing import Any, Optional
 
 import psycopg
 
+from ..event_types import EVENT_MEMORY_RECALLED, EVENT_MEMORY_REMEMBERED
 from ..events import append_event
 from ..models import make_event
 from .embed import embed
 from .models import GLOBAL_WORKSTREAM, MemoryItem, MemoryLayer, Scope
 from .vector import PostgresVectorStore, VectorStore
 
-#: Canonical event types (free-form `type` column; sits alongside task.*/model.*).
-EVENT_MEMORY_REMEMBERED = "memory.remembered"
-EVENT_MEMORY_RECALLED = "memory.recalled"
+#: Memory event types (``memory.remembered`` / ``memory.recalled``) are imported
+#: from the canonical :mod:`runtime.event_types`.
 
 
 def _normalize_for_write(layer: MemoryLayer, scope: Scope) -> Scope:

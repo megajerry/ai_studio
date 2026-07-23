@@ -62,6 +62,12 @@ from .approvals import (
 from .budget import remaining as budget_remaining
 from .db import connect
 from .enforce import DbEventSink, EventSink, InvokeStatus, NullEventSink, invoke
+from .event_types import (
+    EVENT_APPROVAL_RESUMED,
+    EVENT_RETRO_TRIGGERED,
+    EVENT_REVIEW_TRIGGERED,
+    EVENT_WORK_RETRY,
+)
 from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
 from .roles.checkers import DEFAULT_REGISTRY, CheckerRegistry
@@ -89,17 +95,10 @@ from .tools import CodingTool, FilesystemTool, ShellTool, ToolRegistry
 
 log = logging.getLogger("runtime.worker")
 
-#: Event emitted when the worker re-enqueues a work task after a verify fail.
-EVENT_WORK_RETRY = "work.retry"
-
-#: Event emitted when the worker enqueues a retro after a terminal work task.
-EVENT_RETRO_TRIGGERED = "retro.triggered"
-
-#: Event emitted when the worker enqueues a review after a terminal work task.
-EVENT_REVIEW_TRIGGERED = "review.triggered"
-
-#: Event emitted when a task blocked on a 🔴 approval is re-queued after a grant.
-EVENT_APPROVAL_RESUMED = "approval.resumed"
+#: Orchestration event types (canonical definitions in runtime.event_types):
+#: ``EVENT_WORK_RETRY`` (re-enqueue after a verify fail), ``EVENT_RETRO_TRIGGERED``
+#: / ``EVENT_REVIEW_TRIGGERED`` (enqueued after a terminal work task), and
+#: ``EVENT_APPROVAL_RESUMED`` (a task blocked on a 🔴 approval re-queued after a grant).
 
 #: Coding-worker dispatch (architecture §14). A "Need Prototype" task routes to the
 #: policy-gated `coding` tool, which runs opencode INSIDE the sandbox. Kept distinct

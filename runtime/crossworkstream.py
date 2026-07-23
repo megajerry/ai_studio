@@ -42,6 +42,14 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
 from .enforce import EventSink, NullEventSink
+from .event_types import (
+    EVENT_REQUEST_ACCEPTED,
+    EVENT_REQUEST_DECLINED,
+    EVENT_REQUEST_ESCALATED,
+    EVENT_REQUEST_NEEDS_CLARIFICATION,
+    EVENT_REQUEST_SUBMITTED,
+    EVENT_REQUEST_UNDER_REVIEW,
+)
 from .models import Task, make_event
 from .tasks import enqueue_task as _enqueue_task
 
@@ -69,14 +77,9 @@ REQUEST_TERMINAL = frozenset(
     {STATUS_ACCEPTED, STATUS_DECLINED, STATUS_ESCALATED}
 )
 
-#: Canonical ``request.*`` event types. Owned here; the receiving-PM intake in
-#: :mod:`runtime.roles.pm` emits these so producer/consumer agree on the wire.
-EVENT_REQUEST_SUBMITTED = "request.submitted"
-EVENT_REQUEST_UNDER_REVIEW = "request.under_review"
-EVENT_REQUEST_ACCEPTED = "request.accepted"
-EVENT_REQUEST_DECLINED = "request.declined"
-EVENT_REQUEST_NEEDS_CLARIFICATION = "request.needs_clarification"
-EVENT_REQUEST_ESCALATED = "request.escalated"
+#: The ``request.*`` event types are imported from :mod:`runtime.event_types`
+#: (the canonical source); the receiving-PM intake in :mod:`runtime.roles.pm`
+#: emits these so producer/consumer agree on the wire.
 
 #: sub-status → the event announcing that decision.
 _STATUS_EVENT = {

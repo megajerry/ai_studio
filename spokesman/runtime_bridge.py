@@ -34,6 +34,12 @@ import psycopg
 
 from runtime.approvals import STATUS_APPROVED, STATUS_DENIED, pending_approvals
 from runtime.enforce import DbEventSink
+from runtime.event_types import (
+    EVENT_APPROVAL_REQUESTED,
+    EVENT_REVIEW_ALARM,
+    EVENT_REVIEW_FLAGGED,
+    EVENT_TASK_FAILED_EXHAUSTED,
+)
 from runtime.events import read_events
 from runtime.models import Event
 
@@ -42,11 +48,11 @@ from .classify import NotifyKind
 # --- event → ADR-0006 tier mapping ------------------------------------------
 
 #: 🚨 immediate/interrupt — the genuine few (ADR-0006).
-ALARM_EVENT_TYPES = frozenset({"review.alarm"})
+ALARM_EVENT_TYPES = frozenset({EVENT_REVIEW_ALARM})
 #: 🛑 approve (blocks) — batched into the periodic digest.
-APPROVE_EVENT_TYPES = frozenset({"approval.requested"})
+APPROVE_EVENT_TYPES = frozenset({EVENT_APPROVAL_REQUESTED})
 #: 📣 inform (non-blocking) — major mistake / recovery, written to the feed.
-INFORM_EVENT_TYPES = frozenset({"task.failed_exhausted", "review.flagged"})
+INFORM_EVENT_TYPES = frozenset({EVENT_TASK_FAILED_EXHAUSTED, EVENT_REVIEW_FLAGGED})
 
 #: How much of a free-form reason string to carry into a message (hygiene; the
 #: runtime reasons are leak-free but can be long when signals are concatenated).

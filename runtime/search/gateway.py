@@ -35,17 +35,20 @@ import psycopg
 
 from ..capabilities import Capability
 from ..enforce import DbEventSink, EventSink, NullEventSink
+from ..event_types import (
+    EVENT_SEARCH_CACHE_HIT,
+    EVENT_SEARCH_CACHE_MISS,
+    EVENT_SEARCH_DENIED,
+    EVENT_SEARCH_PROVIDER_CALL,
+)
 from ..models import make_event
 from ..policy import Decision, Effect, PolicyConfig, PolicyRequest, decide, load_policy
 from .cache import SearchCache, query_hash
 from .config import SearchConfig, load_search_config
 from .providers import DryRunSearchProvider, SearchProvider, SearchResult, get_adapter
 
-#: Canonical event types (free-form `type` column, alongside task.*/model.*/memory.*).
-EVENT_SEARCH_DENIED = "search.denied"
-EVENT_SEARCH_CACHE_HIT = "search.cache_hit"
-EVENT_SEARCH_CACHE_MISS = "search.cache_miss"
-EVENT_SEARCH_PROVIDER_CALL = "search.provider_call"
+#: The ``search.*`` event types are imported from the canonical
+#: :mod:`runtime.event_types` and re-exported from :mod:`runtime.search`.
 
 #: Force dry-run even when a provider key is present (mirrors MODELS_DRY_RUN).
 _DRY_RUN_ENV = "SEARCH_DRY_RUN"

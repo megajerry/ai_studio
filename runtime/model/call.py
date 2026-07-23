@@ -32,13 +32,14 @@ from uuid import UUID
 
 from ..enforce import EventSink, NullEventSink
 from ..models import make_event
+from ..event_types import EVENT_MODEL_CALL
 from ..policy import BudgetContext
 from .providers import Completion, DryRunProvider, Message, Provider, get_adapter
 from .registry import ModelSpec, Registry, Usage, cost_usd, load_registry
 from .router import route
 
-#: Canonical event type for one instrumented model call (ADR-0012).
-EVENT_MODEL_CALL = "model.call"
+#: The instrumented model-call event type (``model.call``, ADR-0012) is imported
+#: from the canonical :mod:`runtime.event_types`.
 
 _DRY_RUN_ENV = "MODELS_DRY_RUN"
 

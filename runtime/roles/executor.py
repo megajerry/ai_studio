@@ -27,14 +27,15 @@ from ..enforce import EventSink, InvokeStatus, NullEventSink, invoke
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
+from ..event_types import EVENT_EXECUTOR_ACTED
 from ..policy import PolicyConfig
 from ..skills import SkillRegistry
 from ..tools import ToolRegistry
 from .lessons import recall_lesson_texts
 from .prompt import compose_role_prompt
 
-#: Role event: the Executor finished producing a result for a work task.
-EVENT_EXECUTOR_ACTED = "executor.acted"
+#: Role event (``executor.acted``): the Executor finished producing a result for
+#: a work task. Imported from the canonical :mod:`runtime.event_types`.
 
 _EXEC_PROMPT = (
     "You are the studio Executor. Carry out this task and describe what you "

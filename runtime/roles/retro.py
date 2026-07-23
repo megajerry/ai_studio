@@ -37,13 +37,14 @@ from pydantic import BaseModel
 
 from ..enforce import EventSink, NullEventSink
 from ..events import read_events
+from ..event_types import EVENT_RETRO_COMPLETED, EVENT_VERIFY_FAILED, EVENT_WORK_RETRY
 from ..memory import add_lesson as _add_lesson
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
 
-#: Role event: a retro distilled + stored N lessons for a target task.
-EVENT_RETRO_COMPLETED = "retro.completed"
+#: Role event (``retro.completed``): a retro distilled + stored N lessons for a
+#: target task. Imported from the canonical :mod:`runtime.event_types`.
 
 #: The queue task type the worker enqueues to run a retro (dispatched to run_retro).
 RETRO_TASK_TYPE = "retro"
@@ -81,8 +82,8 @@ def distill_lessons(
     unit-testable. Adaptive-lite: failures/retries add a prompt-level prevention
     lesson (ADR-0003); a clean pass records what worked. Never returns empty.
     """
-    fail_count = event_types.count("verify.failed")
-    retry_count = event_types.count("work.retry")
+    fail_count = event_types.count(EVENT_VERIFY_FAILED)
+    retry_count = event_types.count(EVENT_WORK_RETRY)
     failed = outcome == "failed" or fail_count > 0
 
     lessons: list[str] = []

@@ -17,6 +17,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+# The task-lifecycle event enum lives in the canonical event-type module
+# (:mod:`runtime.event_types`, the single source of truth for ``events.type``
+# wire strings) and is re-exported here for backward-compatible imports.
+from .event_types import EventType
+
 
 # --- Enumerations -----------------------------------------------------------
 
@@ -46,24 +51,6 @@ class Assignee(str, Enum):
 
     HOST = "host"
     OFFHOST = "offhost"
-
-
-# Canonical event types emitted by the task lifecycle. Kept as constants so
-# producers/consumers agree on the wire strings (the column itself is free-form
-# text so other subsystems can emit their own event types).
-class EventType(str, Enum):
-    TASK_CREATED = "task.created"
-    TASK_CLAIMED = "task.claimed"
-    TASK_HEARTBEAT = "task.heartbeat"
-    TASK_FINISHED = "task.finished"
-    # Every guarded state change (runtime.tasks.transition) emits this with the
-    # from/to statuses, acting agent + type, and latency since the previous
-    # transition — the append-only lifecycle telemetry (ADR-0012/0015).
-    TASK_TRANSITION = "task.transition"
-    # Emitted by the non-agent supervisor (ADR-0004) when it re-kicks a task
-    # whose worker went stale, or force-fails one that exhausted its retries.
-    TASK_REKICKED = "task.rekicked"
-    TASK_FAILED_EXHAUSTED = "task.failed_exhausted"
 
 
 # --- Row models -------------------------------------------------------------
