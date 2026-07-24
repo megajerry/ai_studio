@@ -416,6 +416,81 @@ def _demonstrate_failure_analyst(conn, scratch: str) -> bool:
                 and exp.status is not ExperimentStatus.PROPOSED and effective)
 
 
+def _demonstrate_curator(conn, scratch: str) -> bool:
+    """Show the Skill Curator (ADR-0024 P2) induce → PROPOSE: a RECURRING + MATURE +
+    EFFICIENT cluster of CLOSED trajectories becomes a ``reviewed: false`` candidate
+    SKILL.md written to a review path (never the live skills/ root) + a body-free
+    ``skill.proposed`` event — while a non-qualifying (inefficient) cluster in the same
+    family proposes NOTHING. It NEVER auto-adopts / flips reviewed:true (PROPOSE-only)."""
+    from .capabilities import Capability
+    from .policy import PolicyConfig
+    from .roles.curator import run_curator
+    from .tasks import enqueue_task, transition
+    from .tools import FilesystemTool, ToolRegistry
+    from .trajectory import add_step, close_trajectory, start_trajectory
+
+    ws = f"curate-{uuid4().hex[:8]}"
+    sink = DbEventSink(conn)
+    reg = ToolRegistry()
+    reg.register(FilesystemTool(root=scratch))
+    policy = PolicyConfig(roles={"curator": frozenset(
+        {Capability.FS_READ, Capability.FS_WRITE})})
+    print(f"\n=== skill-curator demo (workstream={ws}) ===")
+
+    # 1. Seed two contrasting clusters in ONE "work" family across CLOSED trajectories:
+    #    an EFFICIENT matured procedure (short, cheap) and an INEFFICIENT one (long,
+    #    costly). Both first-pass merge; the family median falls between them.
+    eff_sig = ["observe", "plan", "commit"]
+    ineff_sig = ["observe", "plan", "revise", "decide", "commit"]
+
+    def _seed(ttype, sig, *, in_tokens, tools):
+        tid = start_trajectory(conn, "executor", ws, f"do {ttype}")
+        for st in sig:
+            add_step(conn, tid, st, f"reasoning {st}")
+        close_trajectory(conn, tid, outcome_summary="done")
+        t = enqueue_task(conn, workstream=ws, type=ttype, payload={}, trajectory_id=tid)
+        for st in (TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS, TaskStatus.READY_FOR_REVIEW,
+                   TaskStatus.APPROVED, TaskStatus.MERGED):
+            transition(conn, t.id, st)
+        append_event(conn, make_event(workstream=ws, type="model.call", task_id=t.id,
+                                      payload={"input_tokens": in_tokens, "output_tokens": 0,
+                                               "cost_usd": 0}))
+        for _ in range(tools):
+            append_event(conn, make_event(workstream=ws, type="tool.invoked",
+                                          task_id=t.id, payload={}))
+        conn.commit()
+
+    for tt in ("work.a", "work.b"):
+        for _ in range(16):
+            _seed(tt, eff_sig, in_tokens=100, tools=1)
+            _seed(tt, ineff_sig, in_tokens=500, tools=4)
+
+    # 2. The curator induces the reusable procedure → PROPOSES a reviewed:false candidate.
+    now = datetime.now(timezone.utc)
+    task = Task(id=uuid4(), workstream=ws, type="curate",
+                status=TaskStatus.IN_PROGRESS, priority=0,
+                created_at=now, updated_at=now, payload={})
+    result = run_curator(conn, task, sink, tool_registry=reg, policy=policy)
+    print(f"  examined {result.clusters_examined} cluster(s); induced "
+          f"{result.candidates_detected} candidate(s) (the inefficient cluster proposed nothing)")
+    if result.candidates_detected != 1:
+        print("  expected exactly one qualifying cluster — INCOMPLETE")
+        return False
+    cand = result.candidates[0]
+    written = Path(scratch) / cand.proposal_path
+    body = written.read_text() if written.exists() else ""
+    reviewed_false = "reviewed: false" in body and "reviewed: true" not in body
+    live_untouched = not (Path(scratch) / "skills").exists()
+    print(f"  proposed candidate: {cand.slug} (family={cand.task_family}, "
+          f"steps={cand.step_signature}, first_pass_rate={cand.first_pass_rate}, "
+          f"CI={cand.ci95})")
+    print(f"  wrote {cand.proposal_path} [{cand.proposal_status}] — reviewed:false={reviewed_false}, "
+          f"auto-adopt=NO, live skills/ untouched={live_untouched}")
+
+    return bool(cand.proposal_status == "executed" and cand.reviewed is False
+                and reviewed_false and live_untouched)
+
+
 def main() -> int:
     # Keyless by construction — dry-run every model call.
     os.environ.setdefault("MODELS_DRY_RUN", "1")
@@ -498,7 +573,12 @@ def main() -> int:
         healed = _demonstrate_failure_analyst(conn, scratch)
         print(f"runtime.demo: {'OK — failure-pattern loop closed (recurring failure → proposed durable fix → verified effective on real traffic)' if healed else 'FAILURE-ANALYST INCOMPLETE'}")
 
-        return 0 if (ok and learned and reviewed and researched and configured and critiqued and healed) else 1
+        # Eighth act: induce a candidate skill from recurring+mature+efficient closed
+        # trajectories → PROPOSE it reviewed:false (never auto-adopted; live skills/ untouched).
+        curated = _demonstrate_curator(conn, scratch)
+        print(f"runtime.demo: {'OK — skill curator induced a recurring+mature+efficient procedure → proposed a reviewed:false candidate (never auto-adopted)' if curated else 'CURATOR INCOMPLETE'}")
+
+        return 0 if (ok and learned and reviewed and researched and configured and critiqued and healed and curated) else 1
     finally:
         conn.close()
 

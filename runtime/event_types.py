@@ -172,6 +172,16 @@ EVENT_FIX_PROPOSED = "fix.proposed"
 #: applied cohort against a baseline. An unreviewed/skipped skill is NOT injected,
 #: so it emits NO ``skill.applied``.
 EVENT_SKILL_APPLIED = "skill.applied"
+#: Emitted by the Skill Curator (ADR-0024 P2) when a recurring + mature + efficient
+#: trajectory cluster is INDUCED into a ``reviewed: false`` candidate SKILL.md and
+#: PROPOSED for review. BODY-FREE: the payload carries ONLY a candidate slug + the
+#: source (``curator``) + the step-type SIGNATURE (structural step_type CODES, not
+#: bodies) + the cluster size + the first-pass-merge rate/n/Wilson CI + efficiency
+#: deltas/flags — NEVER a trajectory's goal/summary/rationale text or the drafted
+#: skill's instruction body (invariants 5 & 6, mirroring ``fix.proposed``). It is a
+#: PROPOSAL only: ``reviewed`` is always false and ``auto_adopted`` always false —
+#: adopting a candidate is a separate, human-gated step (never auto-adopt here).
+EVENT_SKILL_PROPOSED = "skill.proposed"
 
 # --- Trajectory observability (runtime.trajectory) --------------------------
 #: The reasoning-trajectory writer (ADR-0020). These are BODY-FREE: payloads carry
