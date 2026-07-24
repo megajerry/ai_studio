@@ -658,7 +658,7 @@ def burn_rate(
                 EXTRACT(EPOCH FROM (now() - min(ts))) / 60.0 AS span_min
             FROM events
             WHERE type = 'model.call' {ws_clause}
-              AND ts >= now() - make_interval(mins => %s)
+              AND ts >= now() - (interval '1 minute' * %s)
             """,
             (*params, window_min),
         )
