@@ -64,6 +64,8 @@ from ..event_types import (
     EVENT_PM_NEEDS_CLARIFICATION,
     EVENT_PM_PLANNED,
     EVENT_PM_PUSHBACK,
+    EVENT_TASK_REPLAN_ESCALATED,
+    EVENT_TASK_REPLANNED,
 )
 from ..model.call import call_model as _call_model
 from ..model.providers.dryrun import PLAN_GOAL_OPT
@@ -109,6 +111,24 @@ CONSENSUS_ESCALATED = "escalated"
 
 #: Default objective when a pulse carries no explicit goal.
 DEFAULT_OBJECTIVE = "Prove the studio operates end-to-end in dry-run."
+
+#: Work-task type dispatched to :func:`run_pm_replan` (ADR-0023, R2). A ``task.stuck``
+#: signal is turned into ONE ``replan`` task per stuck task by the queue consumer
+#: (:func:`runtime.scheduler.dispatch_replans`) — never an agent-to-agent call — and
+#: the worker routes it here.
+REPLAN_TASK_TYPE = "replan"
+
+#: Env var + default for the max replan DEPTH (ADR-0023, R2 bound). A stuck task
+#: carries its ``replan_depth`` in its payload; each re-decomposition stamps its
+#: subtasks with ``depth + 1``. Once a stuck task's depth reaches this cap the PM
+#: STOPS re-decomposing and escalates to a human 🛑 — so a subtask that itself keeps
+#: getting stuck can NEVER recurse into an infinite replan. Kept small on purpose.
+PM_MAX_REPLAN_DEPTH_ENV = "PM_MAX_REPLAN_DEPTH"
+DEFAULT_MAX_REPLAN_DEPTH = 2
+
+#: The two replan outcomes returned by :func:`run_pm_replan`.
+REPLAN_DECOMPOSED = "replanned"
+REPLAN_ESCALATED = "escalated"
 
 
 # --- Trajectory recording (ADR-0020) — observe-only, DB-outage-safe ----------
@@ -203,6 +223,26 @@ def _critic_rounds() -> int:
             PM_CRITIC_ROUNDS_ENV, raw, DEFAULT_PM_CRITIC_ROUNDS,
         )
         return DEFAULT_PM_CRITIC_ROUNDS
+
+
+def _max_replan_depth() -> int:
+    """Max replan depth (env ``PM_MAX_REPLAN_DEPTH`` or default; min 0).
+
+    0 disables re-decomposition entirely (the first stuck escalation goes straight
+    to a human 🛑); higher values allow that many rounds of re-decomposition before
+    the bound trips. Kept small so a repeatedly-stuck task cannot replan forever.
+    """
+    raw = os.environ.get(PM_MAX_REPLAN_DEPTH_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MAX_REPLAN_DEPTH
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        log.warning(
+            "invalid %s=%r; using default %s",
+            PM_MAX_REPLAN_DEPTH_ENV, raw, DEFAULT_MAX_REPLAN_DEPTH,
+        )
+        return DEFAULT_MAX_REPLAN_DEPTH
 
 
 def _compose_plan_prompt(
@@ -866,6 +906,271 @@ def run_pm_tick(
         goal=goal, decision="planned", restated_goal=plan.restated_goal,
         confidence=plan.confidence, feasible=True, reason=plan.reason,
         work_item_count=len(work_task_ids), work_task_ids=work_task_ids,
+    )
+
+
+# --- Stuck-task re-decomposition (ADR-0023, R2) -----------------------------
+#
+# The PM's response to the supervisor's ``task.stuck`` SIGNAL: a task that is too
+# big / ill-posed to finish as ONE unit is broken into SMALLER subtasks, each
+# individually more likely to herd through — NOT the same monolith re-enqueued.
+# Coordination is via the queue only (CLAUDE.md invariant 1): the supervisor emits
+# ``task.stuck`` + supersedes the attempt (R1); a queue consumer
+# (:func:`runtime.scheduler.dispatch_replans`) turns that signal into ONE ``replan``
+# task; the worker dispatches it here. The original stays ``abandoned`` (superseded).
+#
+# BOUNDED (ADR-0023): every subtask carries a ``replan_depth`` in its payload; each
+# round stamps ``depth + 1``. Once a stuck task's depth reaches ``PM_MAX_REPLAN_DEPTH``
+# the PM STOPS re-decomposing and escalates to a human 🛑 — a subtask that itself
+# keeps getting stuck can never recurse forever.
+
+
+class ReplanResult(BaseModel):
+    """What the PM decided on a ``replan`` task (ids/counts only, no bodies).
+
+    ``decision`` is ``"replanned"`` (re-decomposed into ``subtask_ids``) or
+    ``"escalated"`` (the replan-depth cap was reached → a human 🛑 approval was
+    raised, no subtasks enqueued). ``missing=True`` marks a replan whose stuck task
+    row could not be read (nothing to do).
+    """
+
+    stuck_task_id: str
+    decision: str = REPLAN_DECOMPOSED
+    goal: str = ""
+    replan_depth: int = 0
+    max_depth: int = DEFAULT_MAX_REPLAN_DEPTH
+    subtask_count: int = 0
+    subtask_ids: list[str] = Field(default_factory=list)
+    approval_id: Optional[str] = None
+    missing: bool = False
+
+
+def _stuck_trajectory_id(conn: Any, task_id: UUID) -> Optional[UUID]:
+    """Read a task's linked ``trajectory_id`` (a DB column not on the Task model).
+
+    Observe-only + degrade-safe (ADR-0017/0020): the trajectory link is used purely
+    for outcome attribution, so any failure (no conn / fake seam / DB blip) returns
+    ``None`` and the replan proceeds unlinked — it is NEVER load-bearing.
+    """
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT trajectory_id FROM tasks WHERE id = %s", (task_id,))
+            row = cur.fetchone()
+        if not getattr(conn, "autocommit", True):
+            conn.commit()
+        return row["trajectory_id"] if row else None
+    except Exception:  # pragma: no cover - defensive: attribution is never load-bearing
+        log.warning("replan: could not read trajectory_id for %s; proceeding unlinked", task_id)
+        return None
+
+
+def _replan_goal(stuck: Task) -> str:
+    """The goal to re-decompose: the stuck task's own spec (payload), else default."""
+    payload = stuck.payload or {}
+    for key in ("goal", "objective", "instructions", "title"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return DEFAULT_OBJECTIVE
+
+
+def _smaller_subtasks(goal: str, plan: Plan, stuck_task_id: UUID) -> list[WorkItem]:
+    """The SMALLER decomposition to enqueue for a stuck task (always ≥2 items).
+
+    Prefers the model's fresh decomposition of the goal (the dry-run/real plan
+    yields 2–3 parts). Defensive floor: if the plan somehow yields fewer than two
+    work items, split the goal into a deterministic 2-step sequence (draft →
+    finalize, the second depending on the first) so a stuck monolith is NEVER just
+    re-enqueued as a single item again.
+    """
+    items = [it for it in plan.work_items if it is not None]
+    if len(items) >= 2:
+        return items
+    base = goal if len(goal) <= 70 else goal[:67] + "..."
+    return [
+        WorkItem(
+            title=f"Subtask 1/2: draft — {base}",
+            type=DEFAULT_WORK_TASK_TYPE,
+            instructions=f"Produce the first, smaller half of the goal: {goal}",
+            success_criterion=(
+                f"The part-1 artifact exists and contains the marker "
+                f"'studio-ok:replan:{stuck_task_id}:1'."
+            ),
+            marker=f"studio-ok:replan:{stuck_task_id}:1",
+            depends_on=[],
+        ),
+        WorkItem(
+            title=f"Subtask 2/2: finalize — {base}",
+            type=DEFAULT_WORK_TASK_TYPE,
+            instructions=f"Complete the remaining, smaller half of the goal: {goal}",
+            success_criterion=(
+                f"The part-2 artifact exists and contains the marker "
+                f"'studio-ok:replan:{stuck_task_id}:2'."
+            ),
+            marker=f"studio-ok:replan:{stuck_task_id}:2",
+            depends_on=[1],
+        ),
+    ]
+
+
+def run_pm_replan(
+    conn: Any,
+    stuck_task_id: UUID,
+    sink: Optional[EventSink] = None,
+    *,
+    registry: Optional[Registry] = None,
+    skills: Optional[SkillRegistry] = None,
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
+    max_depth: Optional[int] = None,
+    enqueue: Callable[..., Task] = None,  # type: ignore[assignment]
+    call_model: Callable[..., Any] = _call_model,
+    request_approval: Callable[..., Any] = _request_approval,
+) -> ReplanResult:
+    """Re-decompose a superseded (stuck) task into SMALLER subtasks (ADR-0023, R2).
+
+    Reads the PRESERVED abandoned task row (``get_task``) — its ``type`` / ``payload``
+    / ``workstream`` / ``depends_on`` / ``trajectory_id`` — and, UNLESS the replan
+    depth cap is reached, obtains a fresh plan for its goal and enqueues N (≥2)
+    ``up_for_grabs`` subtasks (a dependency DAG when the plan has ordering), each
+    stamped to link back to the original (``replan_of`` / ``parent_task_id`` +
+    ``replan_depth = depth + 1``) and inheriting the original's ``trajectory_id`` when
+    present. Emits a body-free ``task.replanned`` (original id + new subtask ids +
+    count). The original stays ``abandoned``.
+
+    BOUNDED: when the stuck task's ``replan_depth`` (payload, default 0) has reached
+    ``max_depth`` (arg > ``PM_MAX_REPLAN_DEPTH`` env > default) the PM STOPS and raises
+    a 🛑 human approval (the existing approval path) + emits ``task.replan_escalated``,
+    enqueuing NO subtasks — so a repeatedly-stuck subtask can never replan forever.
+
+    ``enqueue`` / ``call_model`` / ``request_approval`` are injectable for tests
+    (defaults are the real functions). Coordination is queue-only: this is invoked
+    by the worker servicing a ``replan`` task, never called agent-to-agent.
+    """
+    if enqueue is None:  # deferred default to avoid an import cycle at module load
+        from ..tasks import enqueue_task
+        enqueue = enqueue_task
+    from ..tasks import get_task
+
+    sink = sink or NullEventSink()
+    cap = max_depth if max_depth is not None else _max_replan_depth()
+
+    stuck = get_task(conn, stuck_task_id)
+    if stuck is None:
+        log.warning("replan: stuck task %s not found; nothing to re-decompose", stuck_task_id)
+        return ReplanResult(stuck_task_id=str(stuck_task_id), missing=True, max_depth=cap)
+
+    payload = stuck.payload or {}
+    goal = _replan_goal(stuck)
+    depth = int(payload.get("replan_depth", 0) or 0)
+
+    # --- Bound: depth cap reached → escalate to a human 🛑, do NOT re-decompose --
+    if depth >= cap:
+        reason = (
+            f"task repeatedly stuck: replan depth {depth} reached the cap {cap}; "
+            "a human must replan / rescope it (no further auto re-decomposition)"
+        )
+        approval = request_approval(
+            conn,
+            task_id=stuck_task_id,
+            role="pm",
+            tool="pm.replan",
+            capabilities=[],
+            tier=PUSHBACK_TIER,
+            reason=reason,
+            sink=sink,
+            workstream=stuck.workstream,
+        )
+        approval_id = str(approval.id) if approval is not None else None
+        sink.emit(
+            make_event(
+                workstream=stuck.workstream,
+                type=EVENT_TASK_REPLAN_ESCALATED,
+                task_id=stuck_task_id,
+                payload={"replan_depth": depth, "max_depth": cap, "approval_id": approval_id},
+            )
+        )
+        log.warning(
+            "replan of %s escalated to human 🛑 (depth %d >= cap %d)",
+            stuck_task_id, depth, cap,
+        )
+        return ReplanResult(
+            stuck_task_id=str(stuck_task_id), decision=REPLAN_ESCALATED, goal=goal,
+            replan_depth=depth, max_depth=cap, approval_id=approval_id,
+        )
+
+    # --- Re-decompose into SMALLER subtasks ---------------------------------
+    # Reuse the PM's plan seam: obtain a fresh plan for the goal, then enqueue its
+    # work items (guaranteed ≥2) as a DAG linked back to the original.
+    plan = _obtain_plan(
+        conn, stuck, goal, sink,
+        registry=registry, skills=skills, call_model=call_model,
+        charter=charter, overlay=overlay,
+    )
+    items = _smaller_subtasks(goal, plan, stuck_task_id)
+    n = len(items)
+
+    edges: dict[int, list[int]] = {}
+    for i, item in enumerate(items, start=1):
+        edges[i] = sorted({d for d in item.depends_on if 1 <= d <= n and d != i})
+    assert_acyclic(edges)  # DependencyCycle on a cyclic / self-referential plan
+    order = _topo_order(edges)  # prerequisites first, so their ids exist on enqueue
+
+    # Inherit the original's trajectory for outcome attribution (ADR-0020) when set.
+    traj_id = _stuck_trajectory_id(conn, stuck_task_id)
+    traj_link = {"trajectory_id": traj_id} if traj_id else {}
+    id_by_index: dict[int, str] = {}
+    for i in order:
+        item = items[i - 1]
+        marker = (item.marker or "").strip() or f"studio-ok:replan:{stuck_task_id}:{i}"
+        wtype = item.type if item.type.startswith("work.") else DEFAULT_WORK_TASK_TYPE
+        criterion = item.success_criterion or f"The artifact contains the marker {marker!r}."
+        work = enqueue(
+            conn,
+            workstream=stuck.workstream,
+            type=wtype,
+            payload={
+                "goal": item.instructions or goal,
+                "criterion": criterion,
+                "marker": marker,
+                "title": item.title,
+                "item_index": i,
+                "item_count": n,
+                "attempt": 1,
+                # Link back to the superseded original + bound the replan recursion.
+                "replan_of": str(stuck_task_id),
+                "parent_task_id": str(stuck_task_id),
+                "replan_depth": depth + 1,
+            },
+            priority=stuck.priority,
+            depends_on=[UUID(id_by_index[d]) for d in edges[i]],
+            **traj_link,
+        )
+        id_by_index[i] = str(work.id)
+    subtask_ids = [id_by_index[i] for i in range(1, n + 1)]
+
+    sink.emit(
+        make_event(
+            workstream=stuck.workstream,
+            type=EVENT_TASK_REPLANNED,
+            task_id=stuck_task_id,
+            payload={
+                "subtask_ids": subtask_ids,
+                "subtask_count": n,
+                "replan_depth": depth + 1,
+            },
+        )
+    )
+    log.info(
+        "replanned stuck task %s into %d smaller subtask(s) at depth %d: %s",
+        stuck_task_id, n, depth + 1, subtask_ids,
+    )
+    return ReplanResult(
+        stuck_task_id=str(stuck_task_id), decision=REPLAN_DECOMPOSED, goal=goal,
+        replan_depth=depth + 1, max_depth=cap,
+        subtask_count=n, subtask_ids=subtask_ids,
     )
 
 

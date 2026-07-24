@@ -51,6 +51,7 @@ def read_events(
     *,
     task_id: Optional[UUID] = None,
     workstream: Optional[str] = None,
+    type: Optional[str] = None,
     since: Optional[datetime] = None,
     since_seq: Optional[int] = None,
     limit: Optional[int] = None,
@@ -60,10 +61,12 @@ def read_events(
     Ordering is by ``seq`` (a monotonic identity assigned at insert), not ``ts``:
     ``ts`` defaults to the transaction start time, so events appended within one
     transaction share a timestamp and cannot be ordered by it. Filters compose
-    (AND). ``since`` is exclusive on ``ts`` (a time-window filter); ``seq`` still
-    dictates order. ``since_seq`` is exclusive on ``seq`` — the monotonic cursor a
-    consumer (e.g. the Spokesman notifier) persists to read only *new* events and
-    never re-process one it already saw.
+    (AND). ``type`` selects a single event-type wire string (e.g. a consumer
+    scanning only ``task.stuck``). ``since`` is exclusive on ``ts`` (a time-window
+    filter); ``seq`` still dictates order. ``since_seq`` is exclusive on ``seq`` —
+    the monotonic cursor a consumer (e.g. the Spokesman notifier, or the PM replan
+    dispatcher) persists to read only *new* events and never re-process one it
+    already saw.
     """
     clauses: list[str] = []
     params: list[object] = []
@@ -73,6 +76,9 @@ def read_events(
     if workstream is not None:
         clauses.append("workstream = %s")
         params.append(workstream)
+    if type is not None:
+        clauses.append("type = %s")
+        params.append(type)
     if since is not None:
         clauses.append("ts > %s")
         params.append(since)

@@ -40,6 +40,15 @@ EVENT_TASK_NUDGE = "task.nudge"
 #: retries) and supersedes the attempt for PM re-decomposition (R2 consumes this).
 #: BODY-FREE: carries only ids/status + a stall reason CODE + counts — never body text.
 EVENT_TASK_STUCK = "task.stuck"
+#: The PM's response to a ``task.stuck`` signal (ADR-0023, R2): it re-decomposed the
+#: superseded (abandoned) task into N SMALLER subtasks. BODY-FREE: carries only the
+#: original task id + the new subtask ids + count + replan depth — never body text.
+EVENT_TASK_REPLANNED = "task.replanned"
+#: The bounded-replan backstop (ADR-0023, R2): a task that stayed stuck past the max
+#: replan depth is escalated to a human 🛑 instead of re-decomposing again (no
+#: infinite replan). BODY-FREE: carries only the original task id + depth/cap +
+#: approval id — never body text.
+EVENT_TASK_REPLAN_ESCALATED = "task.replan_escalated"
 
 # --- Model-call failure telemetry (runtime.model.call, ADR-0023) ------------
 #: A provider raised (other than the handled ProviderFallback) during a model

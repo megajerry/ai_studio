@@ -376,6 +376,25 @@ def enqueue_task(
     return task
 
 
+# --- Read one task ----------------------------------------------------------
+
+
+def get_task(conn: psycopg.Connection, task_id: UUID) -> Optional[Task]:
+    """Read one task row by id (any status), or ``None`` if it does not exist.
+
+    A plain, side-effect-free read used where a caller needs the FULL preserved
+    row of a task it did not just transition — e.g. the PM reading the spec of a
+    superseded (``abandoned``) stuck task to re-decompose it (ADR-0023, R2). Does
+    not open a lingering transaction on a non-autocommit connection.
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT {_TASK_COLUMNS} FROM tasks WHERE id = %s", (task_id,))
+        row = cur.fetchone()
+    if not conn.autocommit:
+        conn.commit()
+    return Task.model_validate(row) if row is not None else None
+
+
 # --- Grab / claim -----------------------------------------------------------
 
 
