@@ -146,6 +146,34 @@ def _build_filter(filter: Optional[dict], alias: str = "t") -> tuple[list[str], 
     return clauses, params
 
 
+#: Trust states that quarantine an identity from claiming any work (ADR-0021).
+#: A ``revoked`` identity (permanently, after a fabrication) or a ``quarantined``
+#: one is fenced out of the task queue as well as the human-relay path — untrusted
+#: output must not re-enter the studio under a new task.
+_QUARANTINE_TRUST_STATES: frozenset[str] = frozenset({"revoked", "quarantined"})
+
+
+def _identity_quarantined(cur: psycopg.Cursor, identity: Optional[str]) -> bool:
+    """True iff ``identity`` is quarantined/revoked in the trust ledger.
+
+    A plain, side-effect-free READ of ``identity_trust`` (it does NOT auto-create a
+    row, unlike :func:`runtime.trust.get_trust`), so it is behavior-preserving for
+    every identity with no ledger row — first contact is trusted by default and
+    claims normally. Only an identity that has EARNED a ``revoked``/``quarantined``
+    state is fenced out. Takes the CALLER's open cursor so the read runs inside the
+    grab's own transaction (never opening a stray one that would poison the enclosing
+    ``with conn.transaction()``). Kept as a direct query (no import of
+    ``runtime.trust``) so the grab path takes on no new module dependency.
+    """
+    if not identity:
+        return False
+    cur.execute(
+        "SELECT trust_state FROM identity_trust WHERE identity = %s", (identity,)
+    )
+    row = cur.fetchone()
+    return row is not None and row["trust_state"] in _QUARANTINE_TRUST_STATES
+
+
 def _emit(conn: psycopg.Connection, task: Task, event_type: EventType, **payload) -> None:
     append_event(
         conn,
@@ -388,6 +416,13 @@ def grab_task(
 
     with conn.transaction():
         with conn.cursor() as cur:
+            # Quarantine gate (ADR-0021): a revoked/quarantined identity is fenced
+            # out of the queue — its untrusted output must not re-enter the studio
+            # as new work. Behavior-preserving for trusted/unknown identities (no
+            # ledger row = trusted by default). Runs inside THIS transaction so it
+            # never opens a stray one.
+            if _identity_quarantined(cur, worker_id):
+                return None
             cur.execute(
                 f"""
                 SELECT t.id FROM tasks t

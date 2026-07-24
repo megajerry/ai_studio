@@ -118,6 +118,10 @@ EVENT_TRAJECTORY_EXPIRED = "trajectory.expired"
 #: A factual claim the Spokesman gate verified / rejected against its evidence.
 EVENT_COMMS_CLAIM_VERIFIED = "comms.claim_verified"
 EVENT_COMMS_CLAIM_REJECTED = "comms.claim_rejected"
+#: A factual claim the Spokesman gate could NOT resolve against source of truth
+#: (missing proof — NOT a fabrication). The gate withholds it and asks the
+#: originating identity for proof. Body-free: carries ONLY claim_id + identity.
+EVENT_COMMS_PROOF_REQUESTED = "comms.proof_requested"
 #: The worst offense — a fabrication (false info relayed as fact) was detected;
 #: 🚨 escalated (ADR-0006) and paired with the trust penalty below.
 EVENT_COMMS_FABRICATION_DETECTED = "comms.fabrication_detected"

@@ -38,6 +38,7 @@ from .event_types import (
     EVENT_COMMS_CLAIM_REJECTED,
     EVENT_COMMS_CLAIM_VERIFIED,
     EVENT_COMMS_FABRICATION_DETECTED,
+    EVENT_COMMS_PROOF_REQUESTED,
     EVENT_TRUST_CAPABILITY_REVOKED,
     EVENT_TRUST_STRIKE,
 )
@@ -310,6 +311,29 @@ def set_claim_verification(
     return claim
 
 
+def record_proof_request(
+    conn: psycopg.Connection,
+    identity: str,
+    *,
+    claim_id: Union[UUID, str],
+) -> None:
+    """Emit a BODY-FREE ``comms.proof_requested`` back to the originating identity.
+
+    Used by the Spokesman gate when a factual claim is UNVERIFIABLE (its evidence
+    could not be resolved against source of truth — missing proof, NOT a
+    fabrication). The claim is withheld (never relayed as fact) and the originator
+    is asked to supply resolvable evidence. Like every ``comms.*`` event this is
+    body-free: it carries ONLY the ``claim_id`` + ``identity`` — never the claim
+    ``statement`` text (invariants 5 & 6). Centralized here so the trust module
+    stays the single guarded writer of the ``comms.*`` event stream.
+    """
+    if not identity or not identity.strip():
+        raise ValueError("identity must be non-empty")
+    cid = str(claim_id) if claim_id is not None else None
+    with conn.transaction():
+        _emit(conn, type=EVENT_COMMS_PROOF_REQUESTED, identity=identity, claim_id=cid)
+
+
 # --- zero-tolerance strikes -------------------------------------------------
 
 
@@ -411,5 +435,6 @@ __all__ = [
     "record_claim_from",
     "get_claim",
     "set_claim_verification",
+    "record_proof_request",
     "record_strike",
 ]

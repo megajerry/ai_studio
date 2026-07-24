@@ -30,10 +30,13 @@ from typing import Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from .classify import Notifier
+from runtime.grounding import Claim
+
+from .classify import Notifier, NotifyKind
 from .config import Settings, get_settings
+from .grounding_gate import relay_claims
 from .runtime_bridge import (
     load_cursor,
     poll_notifications,
@@ -67,8 +70,33 @@ def _default_connect() -> object:
 
 
 class NotifyRequest(BaseModel):
+    """A structured, GROUNDED notify request (ADR-0021 S2).
+
+    Replaces the old free-text ``{kind, text}`` — the fabrication hole where any
+    caller could relay arbitrary prose verbatim. A request now carries the
+    ``originating_identity`` (who is accountable) and a list of typed
+    :class:`~runtime.grounding.Claim`s, each with its own evidence. A non-judgment
+    claim with empty evidence is rejected by :class:`Claim`'s own validator (→ 422)
+    before it ever reaches the gate; the gate then verifies each claim's evidence
+    against source of truth and relays only what it can confirm.
+    """
+
     kind: str = Field(..., description="approve | inform | alarm")
-    text: str = Field(..., min_length=1)
+    originating_identity: str = Field(..., min_length=1)
+    claims: list[Claim] = Field(..., min_length=1)
+    message_ref: str | None = None
+
+    @field_validator("kind")
+    @classmethod
+    def _known_kind(cls, v: str) -> str:
+        try:
+            NotifyKind(v.strip().lower())
+        except ValueError as exc:
+            raise ValueError(
+                f"unknown notify kind {v!r}; expected one of "
+                f"{[k.value for k in NotifyKind]}"
+            ) from exc
+        return v.strip().lower()
 
 
 def run_notifier_pass(
@@ -272,7 +300,28 @@ def create_app(
 
     @app.post("/notify", dependencies=[Depends(require_api_token)])
     def notify(req: NotifyRequest) -> dict:
-        return notifier.notify(req.kind, req.text)
+        """Verify-or-refuse grounding gate for a studio→human message (ADR-0021).
+
+        The request's claims are recorded for provenance and independently verified
+        against source of truth; only VERIFIED facts + labelled judgments are
+        relayed (see :func:`spokesman.grounding_gate.relay_claims`). Fails CLOSED
+        on a DB outage: if the runtime cannot be reached to verify, nothing is
+        relayed (a 200 with ``blocked=True``, never a crash — ADR-0017).
+        """
+        try:
+            conn = connect()
+        except Exception:  # noqa: BLE001 - DB unreachable ⇒ fail closed, don't crash
+            logger.warning("/notify: runtime DB unreachable — relaying nothing (fail closed)")
+            return {"blocked": True, "relayed": [], "claims": [], "escalated": False,
+                    "reason": "runtime unreachable (fail closed)"}
+        try:
+            return relay_claims(
+                conn, notifier, kind=req.kind,
+                originating_identity=req.originating_identity,
+                claims=req.claims, message_ref=req.message_ref,
+            )
+        finally:
+            _close(conn)
 
     @app.post("/digest/flush", dependencies=[Depends(require_api_token)])
     def flush_digest() -> dict:
