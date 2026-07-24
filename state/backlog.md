@@ -91,16 +91,20 @@ inference only via the agent-harness CLI `cursor-agent -p --output-format json` 
 HTTP endpoint; hard timeout + auto-fallback to Opus for the hang bug; **`agentic` task-type
 only**, opt-in via `CURSOR_API_KEY`, never on cheap/classify/embed tiers; `code.run` stays
 🔴; Ultra $200/mo in cost model; `cursor-agent` also a swappable coding worker) ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0022.
+**Self-healing recovery ladder** (ADR-0023; migration 0014) — replaces the supervisor's
+binary re-kick/abandon with a graduated, progress-aware ladder: **nudge+grace** (cheap;
+transient stalls recover without discarding progress) → **progress-aware re-kick** →
+**early `task.stuck` escalation** (bails at a no-progress threshold *before* exhausting
+retries, so no reset-forever loop) → **PM re-decomposition** (`run_pm_replan`: stuck
+monolith → smaller DAG subtasks, bounded replan depth → 🛑) → abandon backstop; plus
+**failure-reason capture** (`model.call.failed` error class) → **failure-pattern detector**
+(`roles/failure_analyst.py`: fires only at n≥floor AND Wilson-lower-bound>threshold →
+proposes a reviewable durable fix, never auto-applies) → **verify-as-experiment** on real
+post-fix traffic; all body-free events, supervisor stays non-LLM ·
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0023.
 
 ## 🔄 In progress
 
-- **Self-healing recovery ladder (ADR-0023)** — R1 (nudge+grace → re-kick →
-  no-progress `task.stuck` escalation → abandon; progress detector; `model.call.failed`
-  reason capture) **MERGED**. In flight: R2 = PM consumes `task.stuck` → re-decompose the
-  stuck task into smaller DAG subtasks (bounded replan depth → 🛑); R3 = failure-pattern
-  detector → propose durable fix (reviewable candidate) → verify on real traffic
-  (experiment primitive).
 - **Skill induction + dual-source learning** — prior-art research DONE (grounded brief;
   closest analogues: Voyager, AWM, Anthropic Agent Skills, DreamCoder/DSPi/LATM verify-
   before-admit). **Design decisions locked (2026-07-24):** learning is **dual-source —
@@ -114,8 +118,8 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0022.
   Wilson-lower-bound gain at n≥30, behind its own ADR); **skill-trees DEFERRED** (adopt
   intra-skill progressive disclosure now). Build phased: P0 `skill.applied` attribution →
   P1 validate efficacy metric on existing skills → P2 Curator induction → P3 dual-source
-  convergence → P4 keep/tune/retire → P5 (deferred) hierarchy. ADR to be written with P0/P1.
-  **Queued behind R3** (both touch `runtime/quality.py`).
+  convergence → P4 keep/tune/retire → P5 (deferred) hierarchy. **P0/P1 building now**
+  (ADR-0024 authored with them).
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
