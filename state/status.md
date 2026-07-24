@@ -7,7 +7,7 @@ _Updated: 2026-07-23. Pointers: **what's left** → [`backlog.md`](backlog.md);
 
 - **Platform complete & operating end-to-end (keyless, on a live Postgres).**
   Buildable backlog exhausted — only stakeholder-boundary items remain (below).
-- Verified: **675 tests pass, 0 skips** on a real Postgres; `python -m runtime.demo`
+- Verified: **721 tests pass, 0 skips** on a real Postgres; `python -m runtime.demo`
   runs 6 green acts (operate · learn · reviewer-guard · research · config-drives-vertical · critic-consensus).
 
 ## Capabilities (one line each; details in git log / docs)
@@ -18,6 +18,7 @@ _Updated: 2026-07-23. Pointers: **what's left** → [`backlog.md`](backlog.md);
 - **Trajectory observability (ADR-0020):** PM+Critic reasoning persisted as first-class trajectories (`runtime/trajectory.py`, migration 0011) — ordered decision steps w/ verbatim rationale, tasks stamped w/ `trajectory_id`; **outcome attribution** (trajectory→tasks→outcomes) + **CI-aware PM decision-quality metrics** (Wilson intervals, insufficient-sample flag); live-session ingest bridge makes off-host/uninstrumented agents measurable; learning-agent verbatim→lean rotation + TTL worker.
 - **Verticals are config-not-code:** `workstreams/<name>/config.yaml` drives charter/overlays/budget/policy/checkers/memory via the role seams (`docs/task-lifecycle.md`, `workstreams/README.md`); cross-workstream request contract; ADR-0018 isolation.
 - **Doctrine:** evidence-over-claims validators (ADR-0014); every merge gated by an independent review agent.
+- **Spokesman grounding & accountability (ADR-0021):** everything told to the human must be grounded — the Spokesman is a **verify-or-refuse gate** (`spokesman/grounding_gate.py`) checking each claim's evidence against source of truth (verified→relay / unverifiable→withhold+request-proof / contradicted→fabrication); **zero-tolerance** trust ledger (`runtime/trust.py`) revokes a fabricator's human-relay permanently + quarantines it + cascades to the verifier chain; fabrication-rate telemetry (Wilson CI). Adversarially reviewed (26+ attacks caught).
 - **Evaluation harness v2 (statistically honest):** corpus-as-data (`evals/corpus/*.yaml`); **every rate carries `n` + Wilson 95% CI + `INSUFFICIENT(n<30)`** (a 1.0 on n=5 reads `[0.566,1.0] INSUFFICIENT`, not "trustworthy"); **swappable LLM-judge** (dry-run→real, zero code change, replay-cassette proven); **record/replay** VCR; **trajectory-level eval**; telemetry `quality_report`; `python -m evals`; [`docs/evaluation.md`](../docs/evaluation.md) corrects the v1 tiny-n overclaim + keeps the now-vs-go-live boundary.
 
 ## Boundary — needs stakeholder input (see [`backlog.md`](backlog.md))

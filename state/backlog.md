@@ -65,7 +65,17 @@ ingests an off-host/uninstrumented agent's trajectory via the guarded writer so 
 running session is measurable) · **learning-agent rotation/TTL worker**
 (`runtime/trajectory_worker.py` + launchd plist: TTL expiry + opt-in verbatim→lean
 rotation of Retro-mined trajectories) ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0020.
+**Spokesman grounding & accountability** (ADR-0021; migration 0012): everything
+told to the human must be grounded — `Claim`/`EvidenceRef` contract
+(`runtime/grounding.py`); the Spokesman `/notify` is now a **verify-or-refuse gate**
+(`spokesman/grounding_gate.py`) that structurally verifies each claim's evidence
+against source of truth → VERIFIED relayed / UNVERIFIABLE withheld + `comms.proof_requested`
+/ contradicted = **fabrication**; **zero-tolerance penalty** (`runtime/trust.py`
+ledger): one fabrication → permanent human-relay revocation + quarantine from
+`grab_task` + strike + 🚨 escalation + verifier-chain cascade; body-free `comms.*`/`trust.*`
+events; `COMMS_HUMAN_RELAY` capability; **fabrication-rate telemetry** (`quality.py`,
+n + Wilson CI) + measurability eval. Adversarially reviewed (26+ attacks, all caught) ·
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0021.
 
 ## 🔄 In progress
 
@@ -113,6 +123,14 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0020.
   threaded regression test.
 - Ingest CLI could scrub/warn on non-synthetic example files (invariant documented;
   shipped example is synthetic).
+- **Grounding gate false-positive fabrication risk**: a MALFORMED `expected` spec
+  (e.g. `task` ref given `db_row`'s `col=val` syntax) reads as a *contradiction* →
+  fabrication → permanent zero-tolerance revocation. The gate can't distinguish "you
+  lied" from "you mis-formatted the evidence spec." Fix: validate/normalize `expected`
+  per `EvidenceKind` and treat unparseable/ill-formed specs as UNVERIFIABLE (bounce
+  for reformatting), reserving REJECTED-fabrication for a well-formed `expected` that
+  genuinely contradicts source of truth. Higher priority than a nit given the maximal
+  penalty. (ADR-0021 follow-up.)
 
 ## Context (from the PM audit, 2026-07-22)
 
