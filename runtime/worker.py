@@ -72,6 +72,10 @@ from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
 from .roles.checkers import DEFAULT_REGISTRY, CheckerRegistry
 from .roles.executor import run_executor
+from .roles.failure_analyst import (
+    FAILURE_ANALYST_TASK_TYPES,
+    run_failure_analysis as run_failure_analysis_default,
+)
 from .roles.pm import REPLAN_TASK_TYPE, run_pm_replan, run_pm_tick
 from .roles.researcher import RESEARCH_TASK_TYPE, run_research as run_research_default
 from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
@@ -148,7 +152,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "unknown"
+    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "unknown"
     kind: str
     #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
@@ -671,6 +675,51 @@ def _handle_sourcing(
     )
 
 
+def _handle_failure_analysis(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    registry: ToolRegistry,
+    config: Optional[PolicyConfig],
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_failure_analysis: Callable[..., Any],
+) -> RunResult:
+    """Dispatch an ``analyze.failures``/``failure_analysis`` task: detect recurring
+    failure → propose a durable fix + frame it as an experiment (ADR-0023 R3).
+
+    Mirrors :func:`_handle_sourcing`: the Failure-pattern analyst reads the append-only
+    event log (via ``failure_report``), writes a reviewable durable-fix candidate via
+    the policy-gated filesystem tool, emits body-free ``failure.pattern_detected`` /
+    ``fix.proposed`` events, and registers an ``experiment.proposed`` framing the bet.
+    It NEVER applies a fix, NEVER starts the experiment, and enqueues NOTHING (no
+    ``enqueue`` seam is threaded here) — so a failure-analysis task cannot spawn
+    another (no loop). ``done`` on a quiet workstream means nothing was detected.
+    """
+    heartbeat(conn, task.id, worker_id)
+    result = run_failure_analysis(
+        conn, task, sink,
+        tool_registry=registry, policy=config,
+    )
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
+    if result.patterns_detected:
+        experiments = [p.experiment_id for p in result.proposals if p.experiment_id]
+        detail = (
+            f"detected {result.patterns_detected} recurring pattern(s) -> proposed "
+            f"{len(experiments)} experiment(s) {experiments} (proposal writes: "
+            f"{[p.proposal_status for p in result.proposals]}); NO fix applied"
+        )
+    else:
+        detail = "no recurring failure pattern detected (nothing proposed)"
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="failure_analysis",
+        outcome="done", detail=detail,
+    )
+
+
 def _handle_review(
     conn: Any,
     task: Task,
@@ -824,6 +873,7 @@ def run_once(
     run_review: Callable[..., Any] = run_review_default,
     run_research: Callable[..., Any] = run_research_default,
     run_sourcing: Callable[..., Any] = run_sourcing_default,
+    run_failure_analysis: Callable[..., Any] = run_failure_analysis_default,
     resolve_config: Callable[[Optional[str]], Optional[WorkstreamConfig]] = resolve_workstream_config,
     resolve_intensity: IntensityResolver = _resolve_intensity_default,
 ) -> Optional[RunResult]:
@@ -915,6 +965,20 @@ def run_once(
             registry=registry, config=eff_config, model_registry=model_registry,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
             run_sourcing=run_sourcing,
+        )
+
+    if task.type in FAILURE_ANALYST_TASK_TYPES:
+        # The Failure-pattern analyst reads the append-only event log, recognizes a
+        # RECURRING failure, writes a reviewable durable-fix candidate via the
+        # policy-gated filesystem tool + registers an experiment.proposed framing the
+        # bet, and emits failure.pattern_detected / fix.proposed. It NEVER applies a
+        # fix, NEVER starts the experiment, and enqueues NOTHING (no enqueue seam
+        # threaded) — so a failure-analysis task cannot spawn another (no loop).
+        return _handle_failure_analysis(
+            conn, task, sink,
+            registry=registry, config=eff_config,
+            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            run_failure_analysis=run_failure_analysis,
         )
 
     if task.type == REVIEW_TASK_TYPE:
