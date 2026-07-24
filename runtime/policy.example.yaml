@@ -72,6 +72,16 @@ roles:
     - fs.read
     - fs.write
 
+  # The Skill-lifecycle role (ADR-0024 P4) reads the P1 efficacy report + verdict and
+  # writes a REVIEWABLE deprecation/revision proposal via the filesystem tool
+  # (fs.write 🟡) to a confined review path — NEVER the live skills/ root. It PROPOSES
+  # a keep/tune/retire action for an underperforming LIVE skill; it NEVER auto-retires
+  # / edits / removes a live skill and enqueues nothing. Least privilege: read + write
+  # (no net, no shell), mirroring curator / failure_analyst.
+  skill_lifecycle:
+    - fs.read
+    - fs.write
+
   # Writes code + commits; cannot delete or deploy. Dispatches a coding worker
   # (opencode) via the `coding` tool — code.run is 🔴, so the dispatch still
   # requires human approval and only ever runs inside the sandbox (architecture §14).

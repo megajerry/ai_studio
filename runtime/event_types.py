@@ -182,6 +182,18 @@ EVENT_SKILL_APPLIED = "skill.applied"
 #: PROPOSAL only: ``reviewed`` is always false and ``auto_adopted`` always false —
 #: adopting a candidate is a separate, human-gated step (never auto-adopt here).
 EVENT_SKILL_PROPOSED = "skill.proposed"
+#: Emitted by the Skill-lifecycle role (ADR-0024 P4) when a LIVE (``reviewed:true``)
+#: skill's efficacy verdict is ``retire`` / ``revise`` and a REVIEWABLE
+#: deprecation / revision proposal was written to a review path for a human to act
+#: on. BODY-FREE: the payload carries ONLY the skill NAME + the verdict + the
+#: driving task_type family + the first-pass-merge rate/delta + n + Wilson CI +
+#: efficiency deltas + thresholds — NEVER a skill's instruction body/resources or
+#: any prompt/secret text (invariants 5 & 6, mirroring ``skill.proposed`` /
+#: ``fix.proposed``). It is a PROPOSAL only: ``auto_retired`` is always false and the
+#: live skill file is NEVER removed or edited here — deprecating/revising a live skill
+#: is a separate, human-gated step (never auto-retire).
+EVENT_SKILL_DEPRECATION_PROPOSED = "skill.deprecation_proposed"
+EVENT_SKILL_REVISION_PROPOSED = "skill.revision_proposed"
 
 # --- Trajectory observability (runtime.trajectory) --------------------------
 #: The reasoning-trajectory writer (ADR-0020). These are BODY-FREE: payloads carry

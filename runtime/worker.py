@@ -83,6 +83,10 @@ from .roles.failure_analyst import (
 from .roles.pm import REPLAN_TASK_TYPE, run_pm_replan, run_pm_tick
 from .roles.researcher import RESEARCH_TASK_TYPE, run_research as run_research_default
 from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
+from .roles.skill_lifecycle import (
+    SKILL_LIFECYCLE_TASK_TYPES,
+    run_skill_lifecycle as run_skill_lifecycle_default,
+)
 from .roles.sourcing import SOURCING_TASK_TYPES, run_sourcing as run_sourcing_default
 from .roles.reviewer import REVIEW_TASK_TYPE, run_review as run_review_default
 from .roles.verifier import verify as run_verify_default
@@ -156,7 +160,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "curator" | "unknown"
+    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "curator" | "skill_lifecycle" | "unknown"
     kind: str
     #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
@@ -773,6 +777,57 @@ def _handle_curator(
     )
 
 
+def _handle_skill_lifecycle(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    registry: ToolRegistry,
+    config: Optional[PolicyConfig],
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_skill_lifecycle: Callable[..., Any],
+    skills: Optional[SkillRegistry] = None,
+) -> RunResult:
+    """Dispatch a ``skill_lifecycle``/``tune.skills`` task: judge LIVE skills' efficacy
+    → propose a human-gated deprecation/revision for underperformers (ADR-0024 P4).
+
+    Mirrors :func:`_handle_curator`: the Skill-lifecycle role reads the P1 efficacy
+    report + verdict (over the append-only event log + task_transitions), and for each
+    LIVE (``reviewed:true``) skill whose applied cohort shows no benefit / a confident
+    degradation vs baseline (judged at n ≥ floor with the Wilson CI) writes a
+    REVIEWABLE proposal via the policy-gated filesystem tool + emits a body-free
+    ``skill.deprecation_proposed`` / ``skill.revision_proposed`` event. It NEVER
+    auto-retires / edits / removes a live skill file and enqueues NOTHING (no
+    ``enqueue`` seam is threaded here) — so a lifecycle task cannot spawn another (no
+    loop). ``done`` with nothing proposed means every live skill is keeping/insufficient.
+    """
+    heartbeat(conn, task.id, worker_id)
+    result = run_skill_lifecycle(
+        conn, task, sink,
+        tool_registry=registry, policy=config, skills=skills,
+    )
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
+    if result.proposals_made:
+        actions = [f"{p.skill}:{p.action}" for p in result.proposals]
+        detail = (
+            f"judged {result.skills_judged} live skill(s) -> proposed "
+            f"{result.proposals_made} action(s) {actions} "
+            f"(writes: {[p.proposal_status for p in result.proposals]}); NO auto-retire"
+        )
+    else:
+        detail = (
+            f"judged {result.skills_judged} live skill(s); none underperforming "
+            f"(verdicts {result.verdicts}); nothing proposed"
+        )
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="skill_lifecycle",
+        outcome="done", detail=detail,
+    )
+
+
 def _handle_review(
     conn: Any,
     task: Task,
@@ -928,6 +983,7 @@ def run_once(
     run_sourcing: Callable[..., Any] = run_sourcing_default,
     run_failure_analysis: Callable[..., Any] = run_failure_analysis_default,
     run_curator: Callable[..., Any] = run_curator_default,
+    run_skill_lifecycle: Callable[..., Any] = run_skill_lifecycle_default,
     resolve_config: Callable[[Optional[str]], Optional[WorkstreamConfig]] = resolve_workstream_config,
     resolve_intensity: IntensityResolver = _resolve_intensity_default,
 ) -> Optional[RunResult]:
@@ -1048,6 +1104,22 @@ def run_once(
             registry=registry, config=eff_config,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
             run_curator=run_curator,
+        )
+
+    if task.type in SKILL_LIFECYCLE_TASK_TYPES:
+        # The Skill-lifecycle role (ADR-0024 P4) reads the P1 efficacy report + verdict
+        # and, for a LIVE (reviewed:true) skill that isn't helping (no benefit / a
+        # confident degradation vs baseline, judged at n >= floor with the Wilson CI),
+        # writes a REVIEWABLE deprecation/revision proposal via the policy-gated
+        # filesystem tool + emits body-free skill.deprecation_proposed /
+        # skill.revision_proposed. It NEVER auto-retires / edits / removes a live skill
+        # and enqueues NOTHING (no enqueue seam threaded) — so a lifecycle task cannot
+        # spawn another (no loop). eff_skills tells it which skills are LIVE.
+        return _handle_skill_lifecycle(
+            conn, task, sink,
+            registry=registry, config=eff_config,
+            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            run_skill_lifecycle=run_skill_lifecycle, skills=eff_skills,
         )
 
     if task.type == REVIEW_TASK_TYPE:
