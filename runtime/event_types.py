@@ -110,6 +110,22 @@ EVENT_TRAJECTORY_CLOSED = "trajectory.closed"
 EVENT_TRAJECTORY_COMPACTED = "trajectory.compacted"
 EVENT_TRAJECTORY_EXPIRED = "trajectory.expired"
 
+# --- Spokesman grounding + trust ledger (runtime.trust) ---------------------
+#: Human-facing comms grounding + accountability (ADR-0021). These are BODY-FREE:
+#: payloads carry ONLY ids / identity / status / kind / strikes counts — NEVER the
+#: claim `statement` text (that lives in the local `comms_claims` table only;
+#: invariants 5 & 6, mirroring the trajectory.* discipline above).
+#: A factual claim the Spokesman gate verified / rejected against its evidence.
+EVENT_COMMS_CLAIM_VERIFIED = "comms.claim_verified"
+EVENT_COMMS_CLAIM_REJECTED = "comms.claim_rejected"
+#: The worst offense — a fabrication (false info relayed as fact) was detected;
+#: 🚨 escalated (ADR-0006) and paired with the trust penalty below.
+EVENT_COMMS_FABRICATION_DETECTED = "comms.fabrication_detected"
+#: Trust-ledger penalty telemetry (zero-tolerance): a strike was recorded, and the
+#: identity's human-facing-relay capability was permanently revoked.
+EVENT_TRUST_STRIKE = "trust.strike"
+EVENT_TRUST_CAPABILITY_REVOKED = "trust.capability_revoked"
+
 # --- Experiments (runtime.experiment) ---------------------------------------
 EVENT_PROPOSED = "experiment.proposed"
 EVENT_STARTED = "experiment.started"

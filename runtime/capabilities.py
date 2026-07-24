@@ -38,6 +38,9 @@ class Capability(str, Enum):
     SECRET_USE = "secret.use"
     SPEND_MONEY = "spend.money"
     DEPLOY = "deploy"
+    # Relay a message to the HUMAN (the Spokesman send path). Gated additionally by
+    # the trust ledger (ADR-0021): a revoked identity is denied regardless of grant.
+    COMMS_HUMAN_RELAY = "comms.human_relay"
 
 
 class ActionTier(str, Enum):
@@ -72,6 +75,9 @@ DEFAULT_CAPABILITY_TIER: dict[Capability, ActionTier] = {
     Capability.FS_WRITE: ActionTier.YELLOW,
     Capability.GIT_WRITE: ActionTier.YELLOW,
     Capability.SECRET_USE: ActionTier.YELLOW,
+    # Speaking to the human is auto-allowed-but-logged at the tier level; the real
+    # control is the trust-ledger relay gate (ADR-0021), applied on top of policy.
+    Capability.COMMS_HUMAN_RELAY: ActionTier.YELLOW,
     # 🔴 Red — irreversible / costly / escapes the sandbox; human approval.
     Capability.FS_DELETE: ActionTier.RED,
     Capability.SHELL_EXEC: ActionTier.RED,
