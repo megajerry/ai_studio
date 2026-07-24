@@ -80,19 +80,22 @@ graduated budget zones (warn→throttle→**reserve**→hard) in `runtime/budget
 a reserve buffer spendable only on `wind_down`/`escalation` (so a workstream keeps
 tokens to react/escalate before breach), two-level org+allocation ceiling,
 burn-rate projection; body-free `budget.warn/throttle/reserve` events; additive
-(NULL fracs = old hard cap) · onboarding/secrets · model shortlist + cost model ·
-ADRs 0001–0022.
+(NULL fracs = old hard cap); **optional Capacity Steward role** (C2,
+`runtime/roles/capacity_steward.py`, config-not-code, OFF by default — flags/recommends,
+never enforces or raises ceilings) + **budget-aware role charters** (compact→wind-down→
+escalate before breach) + **`purpose` threading** (`call_model(purpose=…)` → reserve zone
+permits wind_down/escalation); **capacity telemetry** (C3, `quality.py` `capacity_report`:
+per-workstream zone/burn/projected-breach + studio roll-up w/ Wilson-CI at-risk rate) + eval ·
+**Cursor coding substrate + guarded router adapter** (`runtime/model/providers/cursor_cli.py`:
+inference only via the agent-harness CLI `cursor-agent -p --output-format json` — NO raw
+HTTP endpoint; hard timeout + auto-fallback to Opus for the hang bug; **`agentic` task-type
+only**, opt-in via `CURSOR_API_KEY`, never on cheap/classify/embed tiers; `code.run` stays
+🔴; Ultra $200/mo in cost model; `cursor-agent` also a swappable coding worker) ·
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0022.
 
 ## 🔄 In progress
 
-- **Capacity governance C2/C3** — optional Capacity Steward role (config-driven) +
-  proactive budget self-management in role charters + `purpose`-tagging of calls +
-  capacity/burn telemetry + eval. (Foundation C1 merged.)
-- **Cursor integration** — cursor-agent as a coding-worker substrate + a *guarded*
-  router provider adapter (CLI `cursor-agent -p --output-format json`, hard timeout +
-  fallback for the known hang bug, not on cheap/classify tiers) + `CURSOR_API_KEY`
-  onboarding + Ultra plan in the cost model. (Cursor has NO raw HTTP inference
-  endpoint — verified; inference only via the agent harness.)
+- _(nothing in flight)_
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
@@ -151,6 +154,13 @@ ADRs 0001–0022.
   own workstream or reset the DB per run. Surfaced 2026-07-23.
 - `burn_rate` per-minute rate can inflate when seeded `model.call` events share a
   near-zero timestamp span (guard only covers <2 calls); non-blocking, `calls_to_exhaustion` unaffected. (ADR-0022 polish.)
+- Budget pre-spend check runs against the *routed* spec; a Cursor→Opus runtime
+  fallback call serves on metered Opus but isn't pre-gated for that one call (cost
+  is accounted post-hoc, so spend catches up next call). Minor edge on the rare
+  hang-fallback path. (Cursor/ADR-0022 awareness.)
+- `test_quality_capacity_db.py` / some capacity tests seed prefixed rows with no
+  teardown (rely on unique-prefix isolation) → orphan rows accumulate in the shared
+  DB across runs. Add a fixture `finally` deleting `LIKE '<pfx>%'`. (Test-hygiene.)
 
 ## Context (from the PM audit, 2026-07-22)
 
