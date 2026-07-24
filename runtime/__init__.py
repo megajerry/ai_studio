@@ -61,16 +61,19 @@ from .tasks import (
     claim_task,
     complete_task,
     enqueue_task,
+    escalate_stuck_task,
     find_stale_tasks,
     grab_task,
     heartbeat,
     list_for_review,
     model_rollup,
+    nudge_task,
     ready_tasks,
     rekick_task,
     start_task,
     task_cost,
     task_lifecycle,
+    task_made_progress,
     transition,
     waiting_tasks,
 )
@@ -109,6 +112,9 @@ __all__ = [
     "read_events",
     "ready_tasks",
     "rekick_task",  # M3a supervisor re-kick primitive (loop lives in runtime.supervisor)
+    "nudge_task",  # ADR-0023 recovery-ladder nudge rung
+    "escalate_stuck_task",  # ADR-0023 recovery-ladder stuck escalation (task.stuck)
+    "task_made_progress",  # ADR-0023 progress detector
     "start_task",
     "task_cost",
     "task_lifecycle",

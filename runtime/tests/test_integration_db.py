@@ -250,18 +250,22 @@ def test_rekick_guarded_to_in_progress(conn, ws):
 
 
 def test_sweep_rekicks_then_force_fails_at_max(conn, ws):
+    # Isolate the classic re-kick → force-abandon backstop rungs (ADR-0023): the
+    # nudge rung is disabled (nudge_grace_s=0) and the no-progress stuck escalation
+    # is lifted out of the way (stuck_threshold high) so this exercises ONLY the
+    # max_retries backstop. (Nudge + stuck get their own dedicated tests.)
     t = enqueue_task(conn, workstream=ws, type="t")
     claim_task(conn, worker_id="w1", workstream=ws)
 
     # First stale sweep re-kicks (retries 0 -> 1).
     _backdate_heartbeat(conn, t.id)
-    res1 = sweep(conn, threshold_s=60, max_retries=1)
+    res1 = sweep(conn, threshold_s=60, max_retries=1, nudge_grace_s=0, stuck_threshold=99)
     assert t.id in res1.rekicked
 
     # Re-claim, go stale again; now retries (1) >= max (1) → force-failed.
     claim_task(conn, worker_id="w2", workstream=ws)
     _backdate_heartbeat(conn, t.id)
-    res2 = sweep(conn, threshold_s=60, max_retries=1)
+    res2 = sweep(conn, threshold_s=60, max_retries=1, nudge_grace_s=0, stuck_threshold=99)
     assert t.id in res2.failed
 
     with conn.cursor() as cur:
@@ -296,7 +300,10 @@ def test_sweep_does_not_clobber_self_completed_task(conn, ws):
     assert done is not None and done.status is TaskStatus.MERGED
 
     # Feed the pre-completion snapshot to the sweep (models the race precisely).
-    res = sweep(conn, threshold_s=60, max_retries=5, find_stale=lambda c, s: [stale_snapshot])
+    # nudge/stuck disabled so the force-abandon rung is reached and its scan→write
+    # guard (not a nudge) is what skips the self-completed task.
+    res = sweep(conn, threshold_s=60, max_retries=5, nudge_grace_s=0, stuck_threshold=99,
+                find_stale=lambda c, s: [stale_snapshot])
     assert stale_snapshot.id not in res.failed  # skipped, not clobbered
 
     # The row is still `done` with its result untouched.

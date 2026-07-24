@@ -33,7 +33,7 @@ from uuid import UUID
 from ..budget import PURPOSE_NORMAL
 from ..enforce import EventSink, NullEventSink
 from ..models import make_event
-from ..event_types import EVENT_MODEL_CALL
+from ..event_types import EVENT_MODEL_CALL, EVENT_MODEL_CALL_FAILED
 from ..policy import BudgetContext
 from .providers import (
     Completion,
@@ -54,6 +54,45 @@ _DRY_RUN_ENV = "MODELS_DRY_RUN"
 
 def _dry_run_forced() -> bool:
     return os.environ.get(_DRY_RUN_ENV, "").strip() in {"1", "true", "yes", "on"}
+
+
+def _emit_call_failed(
+    sink: EventSink,
+    exc: BaseException,
+    spec: ModelSpec,
+    provider: Provider,
+    role: str,
+    task_type: str,
+    task_id: Optional[UUID],
+    workstream: str,
+    trace_id: Optional[str],
+    span_id: Optional[str],
+) -> None:
+    """Emit a BODY-FREE ``model.call.failed`` for a provider death (ADR-0023).
+
+    Carries ONLY the error CLASS name + model/provider/role/task_id so an API-error
+    death becomes attributable telemetry (R3 consumes it) — NEVER the exception
+    message, prompt, response, or any secret text (invariants 5 & 6). We use
+    ``type(exc).__name__`` and deliberately NOT ``str(exc)``, which can echo request
+    bodies or keys.
+    """
+    sink.emit(
+        make_event(
+            workstream=workstream,
+            type=EVENT_MODEL_CALL_FAILED,
+            task_id=task_id,
+            trace_id=trace_id,
+            span_id=span_id,
+            payload={
+                "error_type": type(exc).__name__,
+                "model": spec.id,
+                "provider": provider.name,
+                "role": role,
+                "task_type": task_type,
+                "task_id": str(task_id) if task_id else None,
+            },
+        )
+    )
 
 
 def select_provider(spec: ModelSpec, *, force_dry_run: bool = False) -> Provider:
@@ -164,7 +203,19 @@ def call_model(
             raise
         spec = fallback
         provider = select_provider(spec, force_dry_run=force_dry_run)
-        completion = provider.complete(spec.id, messages, **opts)
+        try:
+            completion = provider.complete(spec.id, messages, **opts)
+        except Exception as exc:
+            # The metered fallback also died — attributable telemetry, then re-raise.
+            _emit_call_failed(sink, exc, spec, provider, role, task_type, task_id,
+                              workstream, trace_id, span_id)
+            raise
+    except Exception as exc:
+        # A provider death that is NOT the recoverable ProviderFallback signal: emit
+        # body-free failure telemetry (R3) before re-raising. Success path unchanged.
+        _emit_call_failed(sink, exc, spec, provider, role, task_type, task_id,
+                          workstream, trace_id, span_id)
+        raise
     latency_ms = int((time.monotonic() - start) * 1000)
 
     # 4. cost = tokens × registry price (single source of cost truth).

@@ -111,6 +111,21 @@ class Task(BaseModel):
     # Times the supervisor has re-kicked this task after a stale heartbeat
     # (ADR-0004). Force-failed once it reaches the configured max.
     retries: int = 0
+    # --- Graduated recovery ladder bookkeeping (ADR-0023) -------------------
+    # Watermark of the last observed NET progress for the current attempt; the
+    # progress detector counts model.call events + trajectory_steps newer than
+    # this. None = no baseline yet (any signal counts as progress).
+    last_progress_at: Optional[datetime] = None
+    # Consecutive re-kicks that observed NO net progress; reset to 0 the moment
+    # progress is seen. Crossing SUPERVISOR_STUCK_THRESHOLD escalates (task.stuck)
+    # instead of re-kicking — bailing to PM re-decomposition before max_retries.
+    no_progress_rekicks: int = 0
+    # Last recorded stall/escalation reason CODE (e.g. "no_progress"); a short
+    # attributable label, never body text.
+    stall_reason: Optional[str] = None
+    # When a nudge was issued for the CURRENT stall episode (deferring the re-kick
+    # for a grace window). None = no open nudge episode.
+    nudged_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 

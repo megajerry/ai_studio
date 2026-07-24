@@ -29,6 +29,24 @@ EVENT_TASK_TRANSITION = "task.transition"
 # worker went stale, or force-fails one that exhausted its retries.
 EVENT_TASK_REKICKED = "task.rekicked"
 EVENT_TASK_FAILED_EXHAUSTED = "task.failed_exhausted"
+# --- Graduated recovery ladder (runtime.supervisor, ADR-0023) ---------------
+#: The cheapest recovery rung: on the FIRST detection of a stall the supervisor
+#: emits this and defers the re-kick for a short grace window so a transient stall
+#: can recover with its in-flight progress preserved (no reset). BODY-FREE:
+#: carries only ids/status + the grace window seconds (invariants 5 & 6).
+EVENT_TASK_NUDGE = "task.nudge"
+#: The progress-aware escalation SIGNAL: re-kicks have made NO net progress up to
+#: the stuck threshold, so the supervisor STOPS re-kicking (before exhausting
+#: retries) and supersedes the attempt for PM re-decomposition (R2 consumes this).
+#: BODY-FREE: carries only ids/status + a stall reason CODE + counts — never body text.
+EVENT_TASK_STUCK = "task.stuck"
+
+# --- Model-call failure telemetry (runtime.model.call, ADR-0023) ------------
+#: A provider raised (other than the handled ProviderFallback) during a model
+#: call, so an API-error death becomes attributable telemetry (R3 consumes this).
+#: BODY-FREE: carries ONLY the error CLASS/type name + model/provider/role/task_id
+#: — NEVER prompt/response/secret text (invariants 5 & 6).
+EVENT_MODEL_CALL_FAILED = "model.call.failed"
 
 # --- Worker orchestration (runtime.worker) ----------------------------------
 #: Re-enqueue of a work task after a verify fail.
@@ -176,3 +194,5 @@ class EventType(str, Enum):
     TASK_TRANSITION = EVENT_TASK_TRANSITION
     TASK_REKICKED = EVENT_TASK_REKICKED
     TASK_FAILED_EXHAUSTED = EVENT_TASK_FAILED_EXHAUSTED
+    TASK_NUDGE = EVENT_TASK_NUDGE
+    TASK_STUCK = EVENT_TASK_STUCK

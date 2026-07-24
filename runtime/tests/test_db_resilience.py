@@ -190,7 +190,7 @@ def test_supervised_sweep_rekicks_after_grace_elapses():
     stale = [_task(), _task()]
     kicked: list = []
     res = supervised_sweep(
-        object(), g, threshold_s=60, max_retries=5,
+        object(), g, threshold_s=60, max_retries=5, nudge_grace_s=0,
         find_stale=lambda c, t: stale,
         rekick=lambda c, task: (kicked.append(task.id) or task),
     )
