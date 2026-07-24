@@ -20,6 +20,11 @@ import pytest
 from runtime.enforce import MemoryEventSink
 from runtime.models import Task, TaskStatus, make_event
 from runtime.policy import load_policy
+from runtime.roles.curator import (
+    CURATOR_TASK_TYPES,
+    CurationResult,
+    ProposedSkill,
+)
 from runtime.roles.failure_analyst import (
     FAILURE_ANALYST_TASK_TYPES,
     FailureAnalysisResult,
@@ -299,6 +304,80 @@ def test_failure_analysis_task_dispatches_via_seam_and_enqueues_nothing(tmp_path
     assert q.tasks[task.id].status is TaskStatus.MERGED
     assert task.id in q.heartbeats                  # heartbeated like the other roles
     assert len(q.tasks) == before                   # no follow-on task enqueued (no loop)
+
+
+# ===========================================================================
+# Curator dispatch — mirrors the failure-analyst dispatch wiring (fake queue,
+# no DB). A curate/skill_curation task routes to run_curator via the injectable
+# seam, commits MERGED, heartbeats, and enqueues NOTHING (no loop).
+# ===========================================================================
+
+
+@pytest.mark.parametrize("task_type", list(CURATOR_TASK_TYPES))
+def test_curator_task_dispatches_via_seam_and_enqueues_nothing(tmp_path, task_type):
+    """A `curate`/`skill_curation` task is handled by run_curator (the injectable
+    seam), returns kind="curator"/outcome="done", heartbeats, reaches MERGED, and
+    NEVER enqueues a follow-on task (no loop)."""
+    sink = MemoryEventSink()
+    q = FakeQueue(sink)
+    reg = _registry(tmp_path)
+    called = {}
+
+    task = q.enqueue(None, workstream="test", type=task_type, payload={})
+    before = len(q.tasks)
+
+    def fake_run_curator(conn, t, s, **kw):
+        # A curation task must never receive an `enqueue` seam (no loop), and is
+        # handed the tool registry + policy to write its reviewable candidate.
+        assert "enqueue" not in kw
+        assert "tool_registry" in kw and "policy" in kw
+        called["task_id"] = t.id
+        return CurationResult(
+            workstream=t.workstream,
+            clusters_examined=3,
+            candidates_detected=1,
+            candidates=[ProposedSkill(
+                slug="work-abcd1234", task_family="work",
+                step_signature=["observe", "plan", "commit"],
+                task_types=["work.a", "work.b"],
+                n_tasks=32, n_terminal=32, first_pass_rate=1.0,
+                ci95=(0.893, 1.0), insufficient_sample=False,
+                efficiency_axes_below=3, proposal_status="executed",
+                proposal_path="candidates/skills/work-abcd1234/SKILL.md",
+            )],
+            min_cluster_size=5, maturity_floor=0.7, min_sample=30,
+        )
+
+    r = run_once(None, "w1", sink, registry=reg, config=load_policy(),
+                 run_curator=fake_run_curator, **_seams(q))
+
+    assert called["task_id"] == task.id            # the seam was actually invoked
+    assert r is not None
+    assert r.kind == "curator" and r.outcome == "done"
+    assert "work-abcd1234" in r.detail             # surfaces the proposed candidate slug
+    assert q.tasks[task.id].status is TaskStatus.MERGED
+    assert task.id in q.heartbeats                 # heartbeated like the other roles
+    assert len(q.tasks) == before                  # no follow-on task enqueued (no loop)
+
+
+def test_curator_quiet_workstream_reports_none_detected(tmp_path):
+    """A workstream with no qualifying cluster still commits MERGED with a
+    `nothing proposed` detail — nothing induced, no loop."""
+    sink = MemoryEventSink()
+    q = FakeQueue(sink)
+    reg = _registry(tmp_path)
+    task = q.enqueue(None, workstream="test", type=CURATOR_TASK_TYPES[0], payload={})
+
+    def fake_quiet(conn, t, s, **kw):
+        return CurationResult(workstream=t.workstream, clusters_examined=2,
+                              candidates_detected=0, candidates=[],
+                              min_cluster_size=5, maturity_floor=0.7, min_sample=30)
+
+    r = run_once(None, "w1", sink, registry=reg, config=load_policy(),
+                 run_curator=fake_quiet, **_seams(q))
+    assert r.kind == "curator" and r.outcome == "done"
+    assert "nothing proposed" in r.detail
+    assert q.tasks[task.id].status is TaskStatus.MERGED
 
 
 def test_failure_analysis_quiet_workstream_reports_none_detected(tmp_path):
