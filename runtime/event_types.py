@@ -62,6 +62,19 @@ EVENT_BUDGET_WARN = "budget.warn"
 EVENT_BUDGET_THROTTLE = "budget.throttle"
 EVENT_BUDGET_RESERVE = "budget.reserve"
 
+# --- Capacity Steward (runtime.roles.capacity_steward, ADR-0022 C2) ----------
+#: The optional Capacity Steward's reviewable recommendation telemetry — the
+#: BEHAVIORAL layer on top of the deterministic budget engine (C1). BODY-FREE:
+#: payloads carry ONLY ids / workstream / period / zone / amounts + a recommended
+#: ACTION enum — never prompts, args, or secrets (invariants 5 & 6). The Steward
+#: MONITORS burn + FLAGS a projected breach EARLY + RECOMMENDS an action; it NEVER
+#: enforces (the engine does, via `budget.enforce`) and NEVER raises a ceiling
+#: (that stays a 🛑 PM/stakeholder decision, ADR-0006). ``capacity.flagged`` = a
+#: workstream is projected to breach before its period ends; ``capacity.recommendation``
+#: = the steward's suggested action (compact/pivot/reallocate/escalate).
+EVENT_CAPACITY_FLAGGED = "capacity.flagged"
+EVENT_CAPACITY_RECOMMENDATION = "capacity.recommendation"
+
 # --- Memory (runtime.memory) ------------------------------------------------
 EVENT_MEMORY_REMEMBERED = "memory.remembered"
 EVENT_MEMORY_RECALLED = "memory.recalled"

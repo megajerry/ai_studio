@@ -229,6 +229,7 @@ def _compose_plan_prompt(
         role_overlay=overlay,
         skills=selected,
         lessons=lessons,
+        budget_aware=True,
     )
 
 

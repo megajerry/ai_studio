@@ -25,6 +25,10 @@ Fields (all optional except ``name``):
   ``verifier`` / …), each layered as that role's ``### Role overlay`` section.
 - ``budget`` — a ``cap_usd`` / ``cap_tokens`` / ``period`` ceiling wired into
   :mod:`runtime.budget` (seeded by :func:`runtime.workstream.bootstrap`).
+- ``capacity_steward`` — opt-in (``enabled: true``) for the OPTIONAL dedicated
+  Capacity Steward role (ADR-0022 C2). OFF by default (PM is the accountable
+  steward); enabling it activates a monitor that FLAGS budget breaches early +
+  RECOMMENDS actions (:func:`runtime.roles.capacity_steward.capacity_steward_enabled`).
 - ``policy_grants`` — role→capabilities for THIS workstream, merged over the base
   policy (:meth:`effective_policy`) so a vertical can grant e.g. its ``operator``
   a publish 🔴 tool without editing the shared policy file.
@@ -102,6 +106,25 @@ class BudgetSpec(BaseModel):
         return v
 
 
+class CapacityStewardSpec(BaseModel):
+    """Opt-in config for the OPTIONAL dedicated Capacity Steward role (ADR-0022 C2).
+
+    OFF by default: PM is the accountable steward (every role is already
+    budget-aware). A vertical at scale sets ``enabled: true`` to activate a dedicated
+    monitor that FLAGS projected budget breaches early + RECOMMENDS actions (reviewable
+    events only — it never enforces or raises a ceiling). ``window_min`` tunes the
+    burn-rate look-back; ``horizon_min`` overrides the period-end projection horizon
+    (``None`` → derive it from the budget period). Config-not-code — no code change to
+    turn the role on/off for a workstream.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    window_min: Optional[float] = None
+    horizon_min: Optional[float] = None
+
+
 class SkillsSpec(BaseModel):
     """The skills this workstream's roles draw on.
 
@@ -155,6 +178,7 @@ class WorkstreamConfig(BaseModel):
     objective: str = ""
     role_overlays: dict[str, str] = Field(default_factory=dict)
     budget: Optional[BudgetSpec] = None
+    capacity_steward: Optional[CapacityStewardSpec] = None
     policy_grants: dict[str, list[str]] = Field(default_factory=dict)
     skills: Optional[SkillsSpec] = None
     checkers: list[str] = Field(default_factory=list)

@@ -88,6 +88,7 @@ def _compose_verify_prompt(
         workstream_charter=charter,
         role_overlay=overlay,
         skills=selected,
+        budget_aware=True,
     )
 
 

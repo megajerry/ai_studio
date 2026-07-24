@@ -46,6 +46,17 @@ budget:
   cap_tokens: 2000000
   period: monthly
 
+# OPTIONAL dedicated Capacity Steward (ADR-0022 C2). OFF by default: the PM is the
+# accountable steward and every role is already budget-aware. A vertical at scale
+# turns on a dedicated monitor that FLAGS projected budget breaches early and
+# RECOMMENDS actions (compact/reallocate/pivot/escalate) as reviewable events — it
+# never enforces (the engine does) and never raises a ceiling (that stays 🛑 PM/
+# stakeholder). Enable it by uncommenting (config-not-code):
+# capacity_steward:
+#   enabled: true
+#   # window_min: 60      # burn-rate look-back (optional)
+#   # horizon_min: 1440   # override period-end projection horizon (optional)
+
 # Workstream-specific capability grants, merged OVER the base policy. Here the
 # channel's `operator` role may spend money to PUBLISH (spend.money is 🔴, so a
 # publish still requires human approval — this only makes it reachable at all).

@@ -102,6 +102,7 @@ def run_executor(
         role_overlay=overlay,
         skills=selected,
         lessons=lessons,
+        budget_aware=True,
     )
     completion = call_model(
         role="executor",
