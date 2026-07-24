@@ -118,8 +118,10 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0023.
   Wilson-lower-bound gain at n≥30, behind its own ADR); **skill-trees DEFERRED** (adopt
   intra-skill progressive disclosure now). Build phased: P0 `skill.applied` attribution →
   P1 validate efficacy metric on existing skills → P2 Curator induction → P3 dual-source
-  convergence → P4 keep/tune/retire → P5 (deferred) hierarchy. **P0/P1 building now**
-  (ADR-0024 authored with them).
+  convergence → P4 keep/tune/retire → P5 (deferred) hierarchy. **P0+P1 MERGED** (ADR-0024;
+  `skill.applied` attribution + `quality.skill_efficacy_report`, measure-first, no induction
+  yet). **P2 (Curator) is the next phase — checkpoint before building** (its induction value
+  is go-live-gated on real traffic).
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
