@@ -95,7 +95,19 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0022.
 
 ## 🔄 In progress
 
-- _(nothing in flight)_
+- **Self-healing recovery ladder (ADR-0023)** — R1 (nudge+grace → re-kick →
+  no-progress `task.stuck` escalation → abandon; progress detector; `model.call.failed`
+  reason capture) in review; R2 = PM consumes `task.stuck` → re-decompose the stuck
+  task into smaller DAG subtasks; R3 = failure-pattern → propose durable fix →
+  verify on real traffic (experiment primitive).
+- **Skill induction + dual-source learning (design, research-first)** — PM-led prior-art
+  study underway before designing. Direction (to become an ADR when the design lands):
+  the learning loop should be **dual-source — Retro (internal episodes) + Research
+  (external prior art)**, not Retro alone; and **skills** should capture *matured,
+  efficient procedures* (crystallized from recurring trajectory patterns, proposed for
+  review per ADR-0008, never auto-adopted), with an **efficacy feedback loop** measuring
+  a skill's effect on iterations / #agents / search-tool calls / input tokens per outcome
+  → keep/tune/retire. Possibly hierarchical (skill trees) if prior art supports it.
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
