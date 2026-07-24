@@ -71,6 +71,10 @@ from .event_types import (
 from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
 from .roles.checkers import DEFAULT_REGISTRY, CheckerRegistry
+from .roles.curator import (
+    CURATOR_TASK_TYPES,
+    run_curator as run_curator_default,
+)
 from .roles.executor import run_executor
 from .roles.failure_analyst import (
     FAILURE_ANALYST_TASK_TYPES,
@@ -152,7 +156,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "unknown"
+    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "curator" | "unknown"
     kind: str
     #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
@@ -720,6 +724,55 @@ def _handle_failure_analysis(
     )
 
 
+def _handle_curator(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    registry: ToolRegistry,
+    config: Optional[PolicyConfig],
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_curator: Callable[..., Any],
+) -> RunResult:
+    """Dispatch a ``curate``/``skill_curation`` task: induce a candidate skill →
+    propose it for review (ADR-0024 P2).
+
+    Mirrors :func:`_handle_failure_analysis`: the Skill Curator reads CLOSED
+    trajectories + the append-only event log, clusters them by step-type signature +
+    task_type family, and for each recurring + mature + efficient cluster writes a
+    ``reviewed: false`` candidate ``SKILL.md`` via the policy-gated filesystem tool +
+    emits a body-free ``skill.proposed`` event. It NEVER auto-adopts / flips
+    ``reviewed: true``, NEVER touches the live ``skills/`` root, and enqueues NOTHING
+    (no ``enqueue`` seam is threaded here) — so a curation task cannot spawn another
+    (no loop). ``done`` with nothing proposed means no cluster qualified.
+    """
+    heartbeat(conn, task.id, worker_id)
+    result = run_curator(
+        conn, task, sink,
+        tool_registry=registry, policy=config,
+    )
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
+    if result.candidates_detected:
+        slugs = [c.slug for c in result.candidates]
+        detail = (
+            f"induced {result.candidates_detected} candidate skill(s) {slugs} from "
+            f"{result.clusters_examined} cluster(s) -> proposed reviewed:false "
+            f"(writes: {[c.proposal_status for c in result.candidates]}); NO auto-adopt"
+        )
+    else:
+        detail = (
+            f"examined {result.clusters_examined} cluster(s); none recurring+mature+"
+            "efficient (nothing proposed)"
+        )
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="curator",
+        outcome="done", detail=detail,
+    )
+
+
 def _handle_review(
     conn: Any,
     task: Task,
@@ -874,6 +927,7 @@ def run_once(
     run_research: Callable[..., Any] = run_research_default,
     run_sourcing: Callable[..., Any] = run_sourcing_default,
     run_failure_analysis: Callable[..., Any] = run_failure_analysis_default,
+    run_curator: Callable[..., Any] = run_curator_default,
     resolve_config: Callable[[Optional[str]], Optional[WorkstreamConfig]] = resolve_workstream_config,
     resolve_intensity: IntensityResolver = _resolve_intensity_default,
 ) -> Optional[RunResult]:
@@ -979,6 +1033,21 @@ def run_once(
             registry=registry, config=eff_config,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
             run_failure_analysis=run_failure_analysis,
+        )
+
+    if task.type in CURATOR_TASK_TYPES:
+        # The Skill Curator (ADR-0024 P2) reads CLOSED trajectories + the event log,
+        # clusters them by step-type signature + task_type family, and for each
+        # recurring + mature + efficient cluster writes a reviewed:false candidate
+        # SKILL.md via the policy-gated filesystem tool + emits body-free
+        # skill.proposed. It NEVER auto-adopts / flips reviewed:true, NEVER touches the
+        # live skills/ root, and enqueues NOTHING (no enqueue seam threaded) — so a
+        # curation task cannot spawn another (no loop).
+        return _handle_curator(
+            conn, task, sink,
+            registry=registry, config=eff_config,
+            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            run_curator=run_curator,
         )
 
     if task.type == REVIEW_TASK_TYPE:

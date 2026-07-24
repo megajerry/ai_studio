@@ -62,6 +62,16 @@ roles:
     - fs.read
     - fs.write
 
+  # The Skill Curator (ADR-0024 P2) reads closed trajectories + the event log and
+  # writes a REVIEWABLE reviewed:false candidate SKILL.md via the filesystem tool
+  # (fs.write 🟡) to a confined review path — NEVER the live skills/ root. It INDUCES
+  # a candidate from a recurring + mature + efficient cluster and PROPOSES it; it
+  # NEVER auto-adopts / flips reviewed:true and enqueues nothing. Least privilege:
+  # read + write (no net, no shell), mirroring failure_analyst.
+  curator:
+    - fs.read
+    - fs.write
+
   # Writes code + commits; cannot delete or deploy. Dispatches a coding worker
   # (opencode) via the `coding` tool — code.run is 🔴, so the dispatch still
   # requires human approval and only ever runs inside the sandbox (architecture §14).
