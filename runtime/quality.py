@@ -36,6 +36,13 @@ Metrics (each rate is ``None`` when its denominator is 0, never a divide-by-zero
   → n + Wilson CI + flag), plus revoked/quarantined identity counts and total
   strikes — "is the grounding doctrine measurably working?". See
   :func:`grounding_report`.
+- **capacity_global** — CAPACITY telemetry over the merged budget engine
+  (``runtime.budget``, ADR-0022): for every budgeted ``(workstream, period)`` its
+  current ``zone`` (ok→warn→throttle→reserve→over), spent-vs-cap, reserve headroom,
+  recent burn rate, and a burn-projected exhaustion (``projected_breach``), plus a
+  studio-wide roll-up (counts of allocations in each zone, an ``at_risk_rate`` via
+  ``_rate_ci`` → n + Wilson CI + flag, and org-ceiling utilization). Read-only and
+  None-safe on no budgets. See :func:`capacity_report`.
 
 NOTE (honest scope): dry-run means COST/TOKENS are the router's deterministic
 dry-run estimates and OUTCOME quality is not yet measured — these rollups measure
@@ -50,7 +57,23 @@ from typing import Any, Optional
 
 import psycopg
 
+from .budget import (
+    DEFAULT_BURN_WINDOW_MIN,
+    ORG_WORKSTREAM,
+    ZONE_OK,
+    ZONE_OVER,
+    ZONE_RESERVE,
+    ZONE_THROTTLE,
+    ZONE_WARN,
+)
+from .budget import list_budgets as _list_budgets
+from .budget import project_exhaustion as _project_exhaustion
+from .budget import status as _budget_status
 from .tasks import model_rollup
+
+#: Capacity zones in escalation order — the roll-up counts every budgeted
+#: ``(workstream, period)`` allocation that currently sits in each.
+CAPACITY_ZONES = (ZONE_OK, ZONE_WARN, ZONE_THROTTLE, ZONE_RESERVE, ZONE_OVER)
 
 #: Below this many outcome samples a rate is statistically untrustworthy — a point
 #: estimate like "1.0" on n=3 is noise, not signal. Rates computed on fewer than
@@ -379,6 +402,167 @@ def grounding_report(
     }
 
 
+def _utilization(spent: float, cap: Optional[float]) -> Optional[float]:
+    """``spent/cap`` (a continuous utilization ratio, NOT a binomial proportion → no
+    Wilson CI), or ``None`` when uncapped / a zero cap (undefined)."""
+    if cap is None or cap <= 0:
+        return None
+    return round(spent / cap, 6)
+
+
+def _capacity_entry(
+    conn: psycopg.Connection, budget: Any, *, window_min: float
+) -> dict:
+    """Current capacity telemetry for ONE ``(workstream, period)`` allocation.
+
+    Reads the merged budget engine (:func:`runtime.budget.status` /
+    :func:`~runtime.budget.project_exhaustion`) at the current accrued spend (no
+    pending estimate, so this is the ledger's *current* zone). ``projected_breach``
+    is True when the recent burn rate projects the cap being reached — a finite
+    positive ``calls_to_exhaustion`` — or the allocation is already ``over``. Numbers
+    only (leak-free)."""
+    st = _budget_status(conn, budget)  # est=0 → current standing, not a pending call
+    frac = st.fraction()
+    proj = _project_exhaustion(conn, budget.workstream, period=budget.period,
+                               window_min=window_min)
+    minutes_to_exh = None if proj is None else proj.minutes_to_exhaustion
+    calls_to_exh = None if proj is None else proj.calls_to_exhaustion
+    # Projected breach: at the observed burn the cap is finite-time reachable
+    # (positive calls-to-exhaustion), or we are already over the hard cap. A
+    # workstream with no recent burn projects None → not a breach.
+    projected_breach = st.zone == ZONE_OVER or (
+        calls_to_exh is not None and calls_to_exh > 0
+    )
+    burn = None if proj is None else {
+        "window_min": proj.burn.window_min,
+        "span_min": proj.burn.span_min,
+        "calls": proj.burn.calls,
+        "usd": round(proj.burn.usd, 6),
+        "tokens": proj.burn.tokens,
+        "usd_per_min": round(proj.burn.usd_per_min, 6),
+        "tokens_per_min": round(proj.burn.tokens_per_min, 6),
+        "usd_per_call": round(proj.burn.usd_per_call, 6),
+        "tokens_per_call": round(proj.burn.tokens_per_call, 6),
+    }
+    return {
+        "workstream": st.workstream,
+        "period": st.period,
+        "zone": st.zone,
+        "cap_usd": st.cap_usd,
+        "cap_tokens": st.cap_tokens,
+        "spent_usd": round(st.spent_usd, 6),
+        "spent_tokens": st.spent_tokens,
+        "spent_frac": None if frac is None else round(frac, 6),
+        "remaining_usd": (None if st.remaining_usd is None
+                          else round(st.remaining_usd, 6)),
+        "remaining_tokens": st.remaining_tokens,
+        "reserve_headroom_usd": (None if st.reserve_headroom_usd is None
+                                 else round(st.reserve_headroom_usd, 6)),
+        "reserve_headroom_tokens": st.reserve_headroom_tokens,
+        "burn": burn,
+        "projection": {
+            "minutes_to_exhaustion": minutes_to_exh,
+            "calls_to_exhaustion": calls_to_exh,
+            "projected_breach": projected_breach,
+        },
+    }
+
+
+def capacity_report(
+    conn: psycopg.Connection,
+    *,
+    workstream_prefix: Optional[str] = None,
+    window_min: float = DEFAULT_BURN_WINDOW_MIN,
+) -> dict:
+    """Capacity telemetry over the merged budget engine (ADR-0022). Read-only.
+
+    For every budgeted ``(workstream, period)`` allocation that has a cap (tracking-
+    only rows with no cap are skipped — nothing to gate/project) it reports the
+    current :attr:`~runtime.budget.BudgetStatus.zone`, spent-vs-cap, spent fraction,
+    remaining + reserve headroom, the recent :func:`~runtime.budget.burn_rate`, and a
+    burn-projected exhaustion (:func:`~runtime.budget.project_exhaustion`) with a
+    ``projected_breach`` flag. The :data:`~runtime.budget.ORG_WORKSTREAM` sentinel is
+    reported separately as the studio-wide ``org_ceiling`` (its spend is the org-wide
+    total), NOT as a workstream.
+
+    The ``rollup`` gives counts of allocations in each zone, the number projected to
+    breach, and ``at_risk_rate`` — the fraction of allocations NOT in the ``ok`` zone.
+    That IS a binomial proportion over ``n`` = budgeted allocations, so it carries n +
+    Wilson 95% CI + ``insufficient_sample`` via :func:`_rate_ci` (unlike the spent /
+    utilization *ratios*, which are continuous and reported bare, mirroring
+    ``rekick_rate``). None-safe: no budgets → empty lists, zero counts, ``at_risk_rate``
+    over n=0 (rate ``None``), and ``org_ceiling`` ``None``.
+
+    ``workstream_prefix`` optionally restricts the budgeted workstreams to those
+    ``LIKE '<prefix>%'`` (mirroring :func:`grounding_report`'s ``identity_prefix``) —
+    used by the eval/tests to assert an exact known shape on a throwaway
+    ``eval-capacity-*`` namespace. When a prefix is set the global ``org_ceiling``
+    sentinel is omitted (``None``), since it is not prefix-scopable.
+    """
+    # Distinct budgeted workstreams (the org sentinel is handled separately).
+    pfx = f"{workstream_prefix}%" if workstream_prefix else None
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT workstream FROM budgets "
+            "WHERE workstream <> %(org)s "
+            "  AND (%(pfx)s::text IS NULL OR workstream LIKE %(pfx)s) "
+            "ORDER BY workstream",
+            {"org": ORG_WORKSTREAM, "pfx": pfx},
+        )
+        workstreams = [r["workstream"] for r in cur.fetchall()]
+    if not conn.autocommit:
+        conn.commit()
+
+    entries: list[dict] = []
+    for ws in workstreams:
+        for b in _list_budgets(conn, ws):
+            if b.cap_usd is None and b.cap_tokens is None:
+                continue  # tracking-only row: no ceiling to gate/project against
+            entries.append(_capacity_entry(conn, b, window_min=window_min))
+
+    zone_counts = {z: 0 for z in CAPACITY_ZONES}
+    projected_breaches = 0
+    for e in entries:
+        zone_counts[e["zone"]] = zone_counts.get(e["zone"], 0) + 1
+        if e["projection"]["projected_breach"]:
+            projected_breaches += 1
+    n = len(entries)
+    at_risk = n - zone_counts[ZONE_OK]
+
+    # Org/key ceiling (the __org__ sentinel): utilization = org-wide spend / cap.
+    # It is the studio-wide sentinel, not prefix-scopable, so it is omitted when a
+    # workstream_prefix restricts the report to a throwaway namespace.
+    org_ceiling: list[dict] = []
+    for b in ([] if workstream_prefix else _list_budgets(conn, ORG_WORKSTREAM)):
+        if b.cap_usd is None and b.cap_tokens is None:
+            continue
+        st = _budget_status(conn, b)  # for ORG this sums org-wide spend
+        org_ceiling.append({
+            "period": st.period,
+            "zone": st.zone,
+            "cap_usd": st.cap_usd,
+            "cap_tokens": st.cap_tokens,
+            "spent_usd": round(st.spent_usd, 6),
+            "spent_tokens": st.spent_tokens,
+            "utilization_usd": _utilization(st.spent_usd, st.cap_usd),
+            "utilization_tokens": _utilization(float(st.spent_tokens), st.cap_tokens),
+        })
+
+    return {
+        "workstreams_budgeted": len(workstreams),
+        "allocations_scored": n,
+        "by_workstream": entries,
+        "org_ceiling": org_ceiling or None,
+        "rollup": {
+            "zone_counts": zone_counts,
+            "projected_breaches": projected_breaches,
+            # Fraction of budgeted allocations NOT in the healthy 'ok' zone — a
+            # proper proportion over n allocations → n + Wilson CI + flag.
+            "at_risk_rate": _rate_ci(at_risk, n),
+        },
+    }
+
+
 def quality_report(
     conn: psycopg.Connection, workstream: Optional[str] = None
 ) -> dict:
@@ -388,9 +572,11 @@ def quality_report(
     ``totals`` (raw counts), ``rates`` (the derived quality ratios), ``cost`` and
     ``latency`` (per-completed-task efficiency), ``by_model_global`` (the reused
     :func:`runtime.tasks.model_rollup`, which is process-wide, not ws-filtered — so
-    it is labeled ``_global``), and ``grounding_global`` (the identity-scoped
-    :func:`grounding_report` — also global, not ws-filtered). Reads only the
-    append-only event log + ``task_transitions`` (+ the S1 comms/trust ledger).
+    it is labeled ``_global``), ``grounding_global`` (the identity-scoped
+    :func:`grounding_report` — also global, not ws-filtered), and
+    ``capacity_global`` (the :func:`capacity_report` over the budget engine — spans
+    all budgeted workstreams, so also global). Reads only the append-only event log +
+    ``task_transitions`` (+ the S1 comms/trust ledger + the ``budgets`` table).
     """
     params = {"ws": workstream}
     with conn.cursor() as cur:
@@ -500,4 +686,8 @@ def quality_report(
         # trust are identity-scoped (not workstream-scoped), so this is GLOBAL like
         # by_model_global — hence the _global suffix. Rates carry n + Wilson CI + flag.
         "grounding_global": grounding_report(conn),
+        # Capacity telemetry over the merged budget engine (ADR-0022): per-budgeted-
+        # workstream zone/spend/headroom/burn/projection + a studio-wide roll-up.
+        # Spans ALL budgeted workstreams (not ws-filtered) → _global, None-safe.
+        "capacity_global": capacity_report(conn),
     }
