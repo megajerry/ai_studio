@@ -24,7 +24,13 @@ See ``runtime/skills.md`` and ``skills/README.md``.
 
 from __future__ import annotations
 
-from .inject import Composition, compose, compose_prompt, filter_injectable
+from .inject import (
+    Composition,
+    compose,
+    compose_prompt,
+    emit_skill_applied,
+    filter_injectable,
+)
 from .loader import load_skill, parse_skill
 from .models import Skill, SkillError
 from .registry import DEFAULT_SELECT_LIMIT, SkillRegistry, default_root
@@ -39,6 +45,7 @@ __all__ = [
     "DEFAULT_SELECT_LIMIT",
     "compose",
     "compose_prompt",
+    "emit_skill_applied",
     "filter_injectable",
     "Composition",
 ]

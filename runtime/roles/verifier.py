@@ -41,7 +41,7 @@ from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
 from ..policy import PolicyConfig
-from ..skills import SkillRegistry
+from ..skills import SkillRegistry, emit_skill_applied
 from ..tools import ToolRegistry
 from .checkers import DEFAULT_REGISTRY, ArtifactRef, CheckerRegistry, resolve_criterion
 from .executor import ExecutorResult
@@ -143,6 +143,11 @@ def verify(
     # Model judgement (dry-run, keyless) — logged for traceability. The prompt is
     # the Verifier persona + charter/overlay + the relevant reviewed skill(s).
     prompt = _compose_verify_prompt(criterion, skills, charter=charter, overlay=overlay)
+    # P0 attribution (ADR-0024): body-free skill.applied for the injected skill(s).
+    emit_skill_applied(
+        sink, task_id=task.id, role="verifier", workstream=task.workstream,
+        skills=skills.select(_VERIFY_SKILL_QUERY) if skills is not None else None,
+    )
     call_model(
         role="verifier",
         task_type="verify",

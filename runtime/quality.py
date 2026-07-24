@@ -43,6 +43,13 @@ Metrics (each rate is ``None`` when its denominator is 0, never a divide-by-zero
   studio-wide roll-up (counts of allocations in each zone, an ``at_risk_rate`` via
   ``_rate_ci`` → n + Wilson CI + flag, and org-ceiling utilization). Read-only and
   None-safe on no budgets. See :func:`capacity_report`.
+- **skill_efficacy** — SKILL-EFFICACY telemetry (ADR-0024 P1): for each skill the
+  ``skill.applied`` attribution event (P0) shows was injected, an applied-cohort vs
+  baseline comparison on exploration proxies (trajectory iterations, input tokens,
+  tool+search calls → mean + n + flag via :func:`_mean_stat`) and outcome proxies
+  (first-pass-merge / verify-pass → n + Wilson CI + flag), pooled within a task_type
+  FAMILY so a solo studio reaches ``n``. Read-only MEASUREMENT only — no induction or
+  adoption (P2+). None-safe on no applied skills. See :func:`skill_efficacy_report`.
 
 NOTE (honest scope): dry-run means COST/TOKENS are the router's deterministic
 dry-run estimates and OUTCOME quality is not yet measured — these rollups measure
@@ -705,6 +712,265 @@ def failure_report(
     }
 
 
+def _mean_stat(values: list) -> dict:
+    """A COUNT metric reported honestly: mean + sample size + a small-sample flag.
+
+    The count analogue of :func:`_rate_ci` for a non-binomial efficiency metric
+    (trajectory iterations, input tokens, tool+search calls). ``None`` values are
+    dropped (a task with no trajectory contributes no iteration sample), so ``n`` is
+    the number of tasks that actually carried the metric. ``mean`` is ``None`` when
+    ``n == 0`` (never a divide-by-zero) and ``insufficient_sample`` is ``True`` below
+    :data:`MIN_TRUSTWORTHY_SAMPLE` — so a mean on ``n=2`` can't pose as a trustworthy
+    efficiency signal, exactly as a rate can't. No Wilson CI: a mean of unbounded
+    counts is not a binomial proportion.
+    """
+    vals = [v for v in values if v is not None]
+    n = len(vals)
+    return {
+        "mean": round(sum(vals) / n, 4) if n else None,
+        "n": n,
+        "insufficient_sample": n < MIN_TRUSTWORTHY_SAMPLE,
+    }
+
+
+#: How ``skill_efficacy_report`` POOLS similar task_types to reach a usable sample
+#: (locked design, ADR-0024): a solo studio will not hit n≥30 per (skill, exact
+#: task_type) quickly, so comparable task_types are pooled into a FAMILY = the
+#: leading ``.``-delimited segment of ``tasks.type`` (``work.a`` / ``work.b`` /
+#: ``work.demo`` → ``work``; ``pm.tick`` → ``pm``; ``review`` → ``review``). The
+#: applied-vs-baseline A/B is drawn WITHIN one family so the cohorts are genuinely
+#: comparable — pooling is legitimate ONLY because usage is per-skill attributed
+#: (the ``skill.applied`` event, P0). This is a documented, deterministic grouping,
+#: not a heuristic cluster.
+SKILL_POOL_METHOD = (
+    "task_type family = leading '.'-delimited segment of tasks.type; the "
+    "applied-vs-baseline comparison is drawn within one family (comparable work)"
+)
+
+
+def _cohort_metrics(tasks: list[dict]) -> dict:
+    """Efficiency metrics for ONE cohort (a list of per-task metric rows).
+
+    Every metric travels with its sample size + a small-sample flag (counts via
+    :func:`_mean_stat`, rates via :func:`_rate_ci` → n + Wilson CI). Efficacy =
+    *reduced* trial-and-error, so the count metrics (lower is better) are the
+    exploration proxies and the two rates are the outcome-quality proxies.
+    """
+    n = len(tasks)
+    terminal = [t for t in tasks if t["is_terminal"]]
+    has_verify = [t for t in tasks if t["has_verify"]]
+    first_pass = sum(1 for t in terminal if t["first_pass"])
+    verified = sum(1 for t in has_verify if t["verified"])
+    return {
+        "n_tasks": n,
+        # Exploration proxies — LOWER is better (less trial-and-error).
+        "iterations": _mean_stat([t["n_steps"] for t in tasks]),
+        "input_tokens": _mean_stat([t["input_tokens"] for t in tasks]),
+        "tool_search_calls": _mean_stat([t["tool_search_calls"] for t in tasks]),
+        # Outcome-quality proxies — HIGHER is better (each carries n + Wilson CI).
+        "first_pass_merge_rate": _rate_ci(first_pass, len(terminal)),
+        "verify_pass_rate": _rate_ci(verified, len(has_verify)),
+    }
+
+
+def _mean_delta(applied: dict, baseline: dict, key: str) -> Optional[float]:
+    """``applied.mean - baseline.mean`` for a count metric, or ``None`` if either is
+    undefined. NEGATIVE = the applied cohort explored LESS (the efficacy signal)."""
+    a, b = applied[key]["mean"], baseline[key]["mean"]
+    return None if a is None or b is None else round(a - b, 4)
+
+
+def _rate_delta(applied: dict, baseline: dict, key: str) -> Optional[float]:
+    """``applied.rate - baseline.rate`` for a rate metric, or ``None`` if undefined.
+    POSITIVE = the applied cohort had the better outcome rate."""
+    a, b = applied[key]["rate"], baseline[key]["rate"]
+    return None if a is None or b is None else round(a - b, 4)
+
+
+def skill_efficacy_report(
+    conn: psycopg.Connection, workstream: Optional[str] = None
+) -> dict:
+    """Skill-efficacy telemetry: does an APPLIED skill reduce trial-and-error? (ADR-0024 P1)
+
+    Read-only measurement — NOT induction/adoption (P2+). For each skill that was
+    actually injected (the ``skill.applied`` attribution event, P0), it compares an
+    **applied cohort** against a **baseline cohort** of comparable tasks that did NOT
+    get that skill, on the efficiency metrics the studio uses as exploration /
+    outcome-quality proxies (all derived from the immutable event log +
+    ``task_transitions`` + ``trajectory_steps`` — no new capture, replayable):
+
+    - **iterations** — trajectory steps per task (``trajectory_steps`` via
+      ``tasks.trajectory_id``); fewer = less trial-and-error. Count → mean + n + flag.
+    - **input_tokens** — summed ``model.call`` input tokens per task; fewer = cheaper
+      to reach the outcome. Count → mean + n + flag.
+    - **tool_search_calls** — ``tool.invoked`` + ``search.provider_call`` per task;
+      fewer = less flailing. Count → mean + n + flag.
+    - **first_pass_merge_rate** — merged with no ``reviewer_blocked`` / review
+      round-trip, over terminal tasks. Rate → n + Wilson 95% CI + flag.
+    - **verify_pass_rate** — tasks whose verify gate passed (≥1 ``verify.passed`` and
+      no ``verify.failed``), over tasks that were verified. Rate → n + Wilson CI + flag.
+
+    Cohorts are compared WITHIN a pooled task_type FAMILY (see
+    :data:`SKILL_POOL_METHOD`) so a solo studio reaches usable ``n``; pooling is
+    legitimate because usage is per-skill attributed. EVERY metric carries its sample
+    size and an ``insufficient_sample`` flag (``n < MIN_TRUSTWORTHY_SAMPLE``) — a
+    perfect-but-tiny cohort (e.g. a 1.0 on n=3) is flagged, never presented as a
+    trustworthy gain. ``workstream=None`` spans all workstreams. None-safe on no data
+    (``by_skill=[]``). Returns ``{workstream, pooling, skills_measured, by_skill}``.
+    """
+    params = {"ws": workstream}
+    with conn.cursor() as cur:
+        # Per-task efficiency metrics over the scoped tasks (LEFT JOINs so a task
+        # missing a signal is None/0, never dropped). One row per task.
+        cur.execute(
+            """
+            WITH scope AS (
+              SELECT t.id AS task_id,
+                     split_part(t.type, '.', 1) AS task_family,
+                     t.type AS task_type,
+                     t.status,
+                     t.trajectory_id
+              FROM tasks t
+              WHERE (%(ws)s::text IS NULL OR t.workstream = %(ws)s::text)
+            ),
+            steps AS (
+              SELECT trajectory_id, count(*) AS n_steps
+              FROM trajectory_steps GROUP BY trajectory_id
+            ),
+            model AS (
+              SELECT task_id,
+                     COALESCE(sum((payload->>'input_tokens')::bigint), 0) AS input_tokens
+              FROM events
+              WHERE type='model.call' AND task_id IS NOT NULL
+                AND (%(ws)s::text IS NULL OR workstream = %(ws)s::text)
+              GROUP BY task_id
+            ),
+            toolsearch AS (
+              SELECT task_id, count(*) AS n_calls
+              FROM events
+              WHERE type IN ('tool.invoked','search.provider_call') AND task_id IS NOT NULL
+                AND (%(ws)s::text IS NULL OR workstream = %(ws)s::text)
+              GROUP BY task_id
+            ),
+            rework AS (
+              SELECT task_id, bool_or(
+                  to_status='reviewer_blocked'
+                  OR (from_status IN ('ready_for_review','reviewer_blocked')
+                      AND to_status='in_progress')
+              ) AS had_rework
+              FROM task_transitions GROUP BY task_id
+            ),
+            verify AS (
+              SELECT task_id,
+                     count(*) FILTER (WHERE type='verify.passed') AS vp,
+                     count(*) FILTER (WHERE type='verify.failed') AS vf
+              FROM events
+              WHERE type IN ('verify.passed','verify.failed') AND task_id IS NOT NULL
+                AND (%(ws)s::text IS NULL OR workstream = %(ws)s::text)
+              GROUP BY task_id
+            )
+            SELECT s.task_id, s.task_family, s.task_type, s.status,
+                   st.n_steps,
+                   COALESCE(m.input_tokens, 0)   AS input_tokens,
+                   COALESCE(ts.n_calls, 0)       AS tool_search_calls,
+                   COALESCE(rw.had_rework, false) AS had_rework,
+                   COALESCE(v.vp, 0)             AS vp,
+                   COALESCE(v.vf, 0)             AS vf
+            FROM scope s
+            LEFT JOIN steps st      ON st.trajectory_id = s.trajectory_id
+            LEFT JOIN model m       ON m.task_id = s.task_id
+            LEFT JOIN toolsearch ts ON ts.task_id = s.task_id
+            LEFT JOIN rework rw     ON rw.task_id = s.task_id
+            LEFT JOIN verify v      ON v.task_id = s.task_id
+            """,
+            params,
+        )
+        task_rows = cur.fetchall()
+
+        # Which skills were APPLIED to which tasks (P0 attribution). One row per
+        # (task, skill) — a task can have several skills injected.
+        cur.execute(
+            """
+            SELECT e.task_id,
+                   jsonb_array_elements_text(e.payload->'skills') AS skill
+            FROM events e
+            WHERE e.type='skill.applied' AND e.task_id IS NOT NULL
+              AND (%(ws)s::text IS NULL OR e.workstream = %(ws)s::text)
+            """,
+            params,
+        )
+        applied_rows = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+
+    # Build per-task metric dicts keyed by task_id (family retained for pooling).
+    tasks: dict[str, dict] = {}
+    for r in task_rows:
+        vp, vf = int(r["vp"]), int(r["vf"])
+        status = r["status"]
+        tasks[str(r["task_id"])] = {
+            "task_family": r["task_family"],
+            "task_type": r["task_type"],
+            "n_steps": None if r["n_steps"] is None else int(r["n_steps"]),
+            "input_tokens": int(r["input_tokens"]),
+            "tool_search_calls": int(r["tool_search_calls"]),
+            "is_terminal": status in ("merged", "abandoned"),
+            "first_pass": status == "merged" and not bool(r["had_rework"]),
+            "has_verify": (vp + vf) > 0,
+            "verified": vp > 0 and vf == 0,
+        }
+
+    # skill -> set of task_ids it was applied to.
+    applied: dict[str, set[str]] = {}
+    for r in applied_rows:
+        tid = str(r["task_id"])
+        if tid in tasks:  # only attribute to tasks in scope
+            applied.setdefault(r["skill"], set()).add(tid)
+
+    by_skill: list[dict] = []
+    for skill in sorted(applied):
+        applied_ids = applied[skill]
+        # Families this skill actually landed in (only pool where it was applied).
+        families = sorted({tasks[tid]["task_family"] for tid in applied_ids})
+        by_family: list[dict] = []
+        for fam in families:
+            fam_tasks = [t for tid, t in tasks.items() if t["task_family"] == fam]
+            applied_cohort = [t for tid, t in tasks.items()
+                              if t["task_family"] == fam and tid in applied_ids]
+            baseline_cohort = [t for tid, t in tasks.items()
+                               if t["task_family"] == fam and tid not in applied_ids]
+            a = _cohort_metrics(applied_cohort)
+            b = _cohort_metrics(baseline_cohort)
+            by_family.append({
+                "task_family": fam,
+                "task_types_pooled": sorted({t["task_type"] for t in fam_tasks}),
+                "applied": a,
+                "baseline": b,
+                # applied - baseline. Counts: NEGATIVE = less exploration (better).
+                # Rates: POSITIVE = better outcome. None when either side undefined.
+                "delta": {
+                    "iterations_mean": _mean_delta(a, b, "iterations"),
+                    "input_tokens_mean": _mean_delta(a, b, "input_tokens"),
+                    "tool_search_calls_mean": _mean_delta(a, b, "tool_search_calls"),
+                    "first_pass_merge_rate": _rate_delta(a, b, "first_pass_merge_rate"),
+                    "verify_pass_rate": _rate_delta(a, b, "verify_pass_rate"),
+                },
+            })
+        by_skill.append({
+            "skill": skill,
+            "applied_task_count": len(applied_ids),
+            "by_task_family": by_family,
+        })
+
+    return {
+        "workstream": workstream,
+        "pooling": {"method": SKILL_POOL_METHOD,
+                    "min_trustworthy_sample": MIN_TRUSTWORTHY_SAMPLE},
+        "skills_measured": len(by_skill),
+        "by_skill": by_skill,
+    }
+
+
 def quality_report(
     conn: psycopg.Connection, workstream: Optional[str] = None
 ) -> dict:
@@ -836,4 +1102,11 @@ def quality_report(
         # by stall_reason + failure rates, each proportion carrying n + Wilson CI + flag.
         # Workstream-scoped like the counts above; None-safe on empty.
         "failure": failure_report(conn, workstream),
+        # Skill-efficacy telemetry (ADR-0024 P1): per applied skill, an applied-vs-
+        # baseline comparison on exploration (iterations / input tokens / tool+search)
+        # + outcome (first-pass-merge / verify-pass), pooled within a task_type family
+        # to reach n. Workstream-scoped like the counts above; every metric carries
+        # n + CI/mean + insufficient_sample; None-safe on empty. MEASURES only — no
+        # induction/adoption (P2+).
+        "skill_efficacy": skill_efficacy_report(conn, workstream),
     }
