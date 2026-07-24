@@ -140,8 +140,10 @@ def test_supervisor_rekicks_real_stall_then_force_fails(conn, ws):
         assert claimed_a is not None and claimed_a.id == t.id
 
         # Its heartbeat is stale → the supervisor re-kicks it (retries 0 -> 1).
+        # nudge/stuck rungs disabled to isolate the classic re-kick→abandon backstop
+        # (ADR-0023); a no-progress task would otherwise escalate to task.stuck first.
         _backdate_heartbeat(conn, t.id)
-        res1 = sweep(conn, threshold_s=60, max_retries=2)
+        res1 = sweep(conn, threshold_s=60, max_retries=2, nudge_grace_s=0, stuck_threshold=99)
         assert t.id in res1.rekicked
 
         # Back to queued and re-claimable by a DIFFERENT worker (B).
@@ -157,7 +159,7 @@ def test_supervisor_rekicks_real_stall_then_force_fails(conn, ws):
 
         # B also stalls; retries (1) still < max (2) → second re-kick (-> 2).
         _backdate_heartbeat(conn, t.id)
-        res2 = sweep(conn, threshold_s=60, max_retries=2)
+        res2 = sweep(conn, threshold_s=60, max_retries=2, nudge_grace_s=0, stuck_threshold=99)
         assert t.id in res2.rekicked
 
         # Re-claim; now stale with retries (2) >= max (2) → force-failed.
@@ -165,7 +167,7 @@ def test_supervisor_rekicks_real_stall_then_force_fails(conn, ws):
         claimed_c = claim_task(conn_b, worker_id="B2", workstream=ws)
         assert claimed_c is not None and claimed_c.id == t.id
         _backdate_heartbeat(conn, t.id)
-        res3 = sweep(conn, threshold_s=60, max_retries=2)
+        res3 = sweep(conn, threshold_s=60, max_retries=2, nudge_grace_s=0, stuck_threshold=99)
         assert t.id in res3.failed
 
         _fresh(conn)
@@ -193,7 +195,8 @@ def test_supervisor_does_not_clobber_task_completed_before_sweep(conn, ws):
     # ...but the worker finishes first.
     assert complete_task(conn, t.id, status=TaskStatus.MERGED, result={"ok": 1}) is not None
 
-    res = sweep(conn, threshold_s=60, max_retries=2, find_stale=lambda c, s: [snapshot])
+    res = sweep(conn, threshold_s=60, max_retries=2, nudge_grace_s=0, stuck_threshold=99,
+                find_stale=lambda c, s: [snapshot])
     assert t.id not in res.failed
 
     _fresh(conn)

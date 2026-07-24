@@ -22,6 +22,7 @@ from uuid import UUID
 import psycopg
 from psycopg.types.json import Jsonb
 
+from .event_types import EVENT_MODEL_CALL
 from .events import append_event
 from .models import Assignee, EventType, Task, TaskStatus, make_event
 from .task_state import (
@@ -34,7 +35,8 @@ from .task_state import (
 _TASK_COLUMNS = (
     "id, workstream, type, status, priority, assignee, payload, result, "
     "heartbeat_at, claimed_by, agent_type, claimed_at, depends_on, "
-    "budget_tokens, spent_tokens, retries, created_at, updated_at"
+    "budget_tokens, spent_tokens, retries, last_progress_at, "
+    "no_progress_rekicks, stall_reason, nudged_at, created_at, updated_at"
 )
 
 #: Columns a ``grab_task`` ``sort`` may order by. The ORDER BY is assembled ONLY
@@ -204,6 +206,7 @@ def transition(
     set_claimed_at: bool = False,
     set_heartbeat: bool = False,
     increment_retries: bool = False,
+    set_last_progress: bool = False,
     sink: Any = None,
     force: bool = False,
 ) -> Optional[Task]:
@@ -218,8 +221,9 @@ def transition(
     previous transition) and emits a ``task.transition`` event carrying only
     ids/statuses/agent/latency — never secret text. The optional column setters
     (``result``, ``spent_tokens``, ``claimed_by``/``clear_claim``,
-    ``set_claimed_at``, ``set_heartbeat``, ``increment_retries``) let one guarded
-    write also carry the bookkeeping a given transition needs.
+    ``set_claimed_at``, ``set_heartbeat``, ``increment_retries``,
+    ``set_last_progress``) let one guarded write also carry the bookkeeping a given
+    transition needs.
     """
     to_val = to.value if isinstance(to, TaskStatus) else str(to)
     exp_val = (
@@ -265,6 +269,10 @@ def transition(
                 sets.append("heartbeat_at = NULL")
             if increment_retries:
                 sets.append("retries = retries + 1")
+            if set_last_progress:
+                # Baseline the progress watermark (ADR-0023): work is (re)starting,
+                # so net progress is measured from now forward.
+                sets.append("last_progress_at = now()")
 
             params.extend([task_id, current])
             cur.execute(
@@ -449,11 +457,16 @@ def start_task(
     conn: psycopg.Connection, task_id: UUID, worker_id: str,
     *, agent_type: Optional[str] = None,
 ) -> Optional[Task]:
-    """Move a ``claimed`` task to ``in_progress`` (work begins); refresh heartbeat."""
+    """Move a ``claimed`` task to ``in_progress`` (work begins); refresh heartbeat.
+
+    Also baselines the progress watermark (``last_progress_at = now``, ADR-0023):
+    work is starting, so the supervisor measures NET progress for this attempt from
+    here forward (model.call events + trajectory_steps newer than the watermark).
+    """
     return transition(
         conn, task_id, TaskStatus.IN_PROGRESS,
         agent_id=worker_id, agent_type=agent_type,
-        expected_from=TaskStatus.CLAIMED, set_heartbeat=True,
+        expected_from=TaskStatus.CLAIMED, set_heartbeat=True, set_last_progress=True,
     )
 
 
@@ -495,13 +508,20 @@ def heartbeat(
     Only the worker holding the claim may heartbeat, and only while the task is
     actively held (``claimed`` or ``in_progress``). Emits **no** event: heartbeats
     are high-frequency liveness with zero replay value (ADR-0013).
+
+    A heartbeat also CLEARS any open nudge episode (``nudged_at = NULL``, ADR-0023):
+    the worker is alive again, so the cheap "nudge + grace" rung has done its job —
+    the deferred re-kick is cancelled and its in-flight progress preserved. A
+    heartbeat is deliberately NOT counted as progress itself (it is bare liveness; a
+    task can heartbeat while making zero forward progress — the exact failure the
+    progress detector must catch), so ``last_progress_at`` is left untouched here.
     """
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 UPDATE tasks
-                SET heartbeat_at = now(), updated_at = now()
+                SET heartbeat_at = now(), updated_at = now(), nudged_at = NULL
                 WHERE id = %s AND claimed_by = %s
                   AND status IN ('claimed', 'in_progress')
                 RETURNING {_TASK_COLUMNS}
@@ -899,7 +919,86 @@ def find_stale_tasks(
     return [Task.model_validate(r) for r in rows]
 
 
-def rekick_task(conn: psycopg.Connection, task_id: UUID) -> Optional[Task]:
+def task_made_progress(conn: psycopg.Connection, task_id: UUID) -> bool:
+    """True iff a task made NET progress since its ``last_progress_at`` watermark.
+
+    The deterministic progress signal for the graduated recovery ladder (ADR-0023).
+    "Progress" = a real forward-work signal produced by THIS attempt, newer than the
+    watermark set at :func:`start_task` (or advanced at the previous re-kick):
+
+    - a ``model.call`` event for this task (an LLM actually ran — this is also the
+      source of ``spent_tokens`` increments, so it subsumes a token-spend check), or
+    - a ``trajectory_steps`` row for the task's linked reasoning trajectory (ADR-0020
+      — a reasoning step was recorded).
+
+    A bare heartbeat is deliberately NOT progress: a task can heartbeat while making
+    zero forward progress, which is exactly the endless-reset failure this guards.
+    When ``last_progress_at`` is NULL (no baseline) ANY such signal counts. Read-only.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_progress_at, trajectory_id FROM tasks WHERE id = %s",
+            (task_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return False
+        since = row["last_progress_at"]
+        trajectory_id = row["trajectory_id"]
+
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE task_id = %s AND type = %s "
+            "AND (%s::timestamptz IS NULL OR ts > %s)) AS hit",
+            (task_id, EVENT_MODEL_CALL, since, since),
+        )
+        made = bool(cur.fetchone()["hit"])
+        if not made and trajectory_id is not None:
+            cur.execute(
+                "SELECT EXISTS(SELECT 1 FROM trajectory_steps WHERE trajectory_id = %s "
+                "AND (%s::timestamptz IS NULL OR created_at > %s)) AS hit",
+                (trajectory_id, since, since),
+            )
+            made = bool(cur.fetchone()["hit"])
+    if not conn.autocommit:
+        conn.commit()
+    return made
+
+
+def nudge_task(
+    conn: psycopg.Connection, task_id: UUID, *, grace_s: float
+) -> Optional[Task]:
+    """Issue a NUDGE for a stalled held task — the cheapest recovery rung (ADR-0023).
+
+    Marks ``nudged_at = now`` (opening the current stall episode) WITHOUT changing
+    status or clearing the claim, so the worker keeps its in-flight progress; the
+    supervisor then defers the re-kick for ``grace_s`` so a transient stall can
+    recover (a heartbeat clears ``nudged_at``; see :func:`heartbeat`). Guarded to a
+    still-held (``claimed``/``in_progress``) task with NO open nudge episode — a
+    task that recovered/changed state or is already nudged is left untouched
+    (``None``). Emits a body-free ``task.nudge`` (status + grace only).
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE tasks SET nudged_at = now(), updated_at = now()
+                WHERE id = %s AND status IN ('claimed', 'in_progress')
+                  AND nudged_at IS NULL
+                RETURNING {_TASK_COLUMNS}
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            task = Task.model_validate(row)
+        _emit(conn, task, EventType.TASK_NUDGE, grace_s=float(grace_s))
+    return task
+
+
+def rekick_task(
+    conn: psycopg.Connection, task_id: UUID, *, made_progress: Optional[bool] = None
+) -> Optional[Task]:
     """Re-queue a stale held task (→ ``up_for_grabs``) for a fresh worker; ``task.rekicked``.
 
     The non-agent supervisor's core recovery (ADR-0004): a task whose worker went
@@ -907,6 +1006,15 @@ def rekick_task(conn: psycopg.Connection, task_id: UUID) -> Optional[Task]:
     ``retries`` incremented. Handles both ``claimed`` and ``in_progress`` (the
     latter via the documented in_progress→up_for_grabs recovery edge). Guarded to
     those two states — a task that changed state is left untouched (``None``).
+
+    Progress-aware (ADR-0023): pass ``made_progress`` (measured by
+    :func:`task_made_progress` for the attempt just ending) to maintain the
+    ``no_progress_rekicks`` counter atomically with the re-kick — reset to 0 when
+    progress was seen, incremented when NOT. Either way the nudge episode is closed
+    (``nudged_at = NULL``) and the progress watermark advanced (``last_progress_at =
+    now``) so the NEXT attempt is measured from here. ``made_progress=None`` (the
+    default, for callers with no signal) leaves the counter/watermark untouched,
+    preserving the pre-ADR-0023 behavior.
     """
     with conn.transaction():
         task = transition(
@@ -915,5 +1023,80 @@ def rekick_task(conn: psycopg.Connection, task_id: UUID) -> Optional[Task]:
         )
         if task is None or task.status is not TaskStatus.UP_FOR_GRABS:
             return None
-        _emit(conn, task, EventType.TASK_REKICKED, retries=task.retries)
+        no_progress_rekicks = task.no_progress_rekicks
+        if made_progress is not None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE tasks SET
+                        no_progress_rekicks = CASE WHEN %s THEN 0
+                                                   ELSE no_progress_rekicks + 1 END,
+                        nudged_at = NULL,
+                        last_progress_at = now(),
+                        updated_at = now()
+                    WHERE id = %s
+                    RETURNING no_progress_rekicks
+                    """,
+                    (made_progress, task_id),
+                )
+                no_progress_rekicks = int(cur.fetchone()["no_progress_rekicks"])
+        _emit(
+            conn, task, EventType.TASK_REKICKED, retries=task.retries,
+            made_progress=made_progress, no_progress_rekicks=no_progress_rekicks,
+        )
     return task
+
+
+def escalate_stuck_task(
+    conn: psycopg.Connection,
+    task_id: UUID,
+    *,
+    stall_reason: str = "no_progress",
+    no_progress_rekicks: int = 0,
+    retries: int = 0,
+) -> Optional[Task]:
+    """Escalate a stuck task to the PM and supersede the attempt (ADR-0023, R1 signal).
+
+    The progress-aware bail-out: re-kicks made NO net progress up to the stuck
+    threshold, so instead of resetting forever the supervisor STOPS, records the
+    ``stall_reason`` code, emits a body-free ``task.stuck`` SIGNAL (reason + counts —
+    the input R2's PM consumes to re-decompose into smaller subtasks), and supersedes
+    the attempt via ``complete_task(ABANDONED, result={"reason":
+    "stuck_needs_replan", ...})``. This module emits ONLY the signal + supersede — it
+    does NOT enqueue the PM task (that is R2).
+
+    Guarded like :func:`runtime.supervisor._default_fail_exhausted`: the abandon is
+    NOT forced, so a task that self-completed in the scan→write window is left
+    untouched and this returns ``None`` (the sweep logs a skip). ``stall_reason`` is
+    a short CODE, never body text. Runs the reason-write, the abandon, and the event
+    in one transaction so they commit atomically.
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET stall_reason = %s, updated_at = now() "
+                "WHERE id = %s AND status = 'in_progress'",
+                (stall_reason, task_id),
+            )
+            if cur.rowcount == 0:
+                return None  # no longer in_progress (self-completed in the window)
+        superseded = complete_task(
+            conn,
+            task_id,
+            status=TaskStatus.ABANDONED,
+            result={
+                "reason": "stuck_needs_replan",
+                "stall_reason": stall_reason,
+                "no_progress_rekicks": no_progress_rekicks,
+                "retries": retries,
+            },
+        )
+        if superseded is None:
+            return None
+        _emit(
+            conn, superseded, EventType.TASK_STUCK,
+            stall_reason=stall_reason,
+            no_progress_rekicks=no_progress_rekicks,
+            retries=retries,
+        )
+    return superseded

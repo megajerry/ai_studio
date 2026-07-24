@@ -164,6 +164,46 @@ def test_provider_fallback_reraises_when_no_fallback_left(monkeypatch):
         call_model("builder", "agentic", MESSAGES, quality="high", registry=reg)
 
 
+def test_model_call_failed_emitted_body_free_on_provider_error(monkeypatch):
+    # A provider death that is NOT ProviderFallback emits a body-free
+    # model.call.failed (error CLASS + model/provider/role/task_id) and re-raises
+    # (ADR-0023). The success path is untouched — no model.call event on a failure.
+    from uuid import uuid4
+
+    reg = load_registry()
+    sink = MemoryEventSink()
+
+    class _Boom:
+        name = "boomprovider"
+
+        def complete(self, model_id, messages, **opts):
+            # An error whose MESSAGE leaks prompt + a secret — must NOT reach the event.
+            raise RuntimeError("leak sk-secret-123 " + messages[0]["content"])
+
+    monkeypatch.setattr(
+        call_mod, "select_provider", lambda spec, *, force_dry_run=False: _Boom()
+    )
+
+    tid = uuid4()
+    with pytest.raises(RuntimeError):
+        call_model("pm", "plan", MESSAGES, quality="high", registry=reg, sink=sink,
+                   task_id=tid)
+
+    failed = [e for e in sink.events if e.type == "model.call.failed"]
+    assert len(failed) == 1
+    p = failed[0].payload
+    assert p["error_type"] == "RuntimeError"  # the CLASS, not the message
+    for key in ("model", "provider", "role", "task_type", "task_id"):
+        assert key in p
+    assert p["role"] == "pm" and p["provider"] == "boomprovider"
+    assert p["task_id"] == str(tid)
+    # Body-free: neither the prompt text nor the secret in the exception message leak.
+    blob = str(p)
+    assert "summarize this" not in blob and "sk-secret-123" not in blob
+    # Success path unchanged: a failure emits NO model.call event.
+    assert [e for e in sink.events if e.type == EVENT_MODEL_CALL] == []
+
+
 def test_call_without_conn_skips_db_accounting():
     # task_id given but conn None -> no DB touch, no error (keyless/DB-less).
     from uuid import uuid4
