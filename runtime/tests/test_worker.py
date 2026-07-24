@@ -20,6 +20,11 @@ import pytest
 from runtime.enforce import MemoryEventSink
 from runtime.models import Task, TaskStatus, make_event
 from runtime.policy import load_policy
+from runtime.roles.failure_analyst import (
+    FAILURE_ANALYST_TASK_TYPES,
+    FailureAnalysisResult,
+    ProposedFix,
+)
 from runtime.roles.verifier import VerifyResult
 from runtime.scheduler import PM_TICK_TYPE
 from runtime.task_state import assert_transition
@@ -243,3 +248,73 @@ def test_run_once_returns_none_when_queue_empty(tmp_path):
     q = FakeQueue(sink)
     reg = _registry(tmp_path)
     assert run_once(None, "w1", sink, registry=reg, config=load_policy(), **_seams(q)) is None
+
+
+# ===========================================================================
+# Failure-analyst dispatch — mirrors the sourcing dispatch wiring (fake queue,
+# no DB). A failure-analysis task routes to run_failure_analysis via the
+# injectable seam, commits MERGED, heartbeats, and enqueues NOTHING (no loop).
+# ===========================================================================
+
+
+@pytest.mark.parametrize("task_type", list(FAILURE_ANALYST_TASK_TYPES))
+def test_failure_analysis_task_dispatches_via_seam_and_enqueues_nothing(tmp_path, task_type):
+    """A `failure_analysis`/`analyze.failures` task is handled by run_failure_analysis
+    (the injectable seam), returns kind="failure_analysis"/outcome="done", heartbeats,
+    reaches MERGED, and NEVER enqueues a follow-on task (no loop)."""
+    sink = MemoryEventSink()
+    q = FakeQueue(sink)
+    reg = _registry(tmp_path)
+    called = {}
+
+    task = q.enqueue(None, workstream="test", type=task_type, payload={})
+    before = len(q.tasks)
+
+    def fake_run_failure_analysis(conn, t, s, **kw):
+        # A failure-analysis task must never receive an `enqueue` seam (no loop),
+        # and is handed the tool registry + policy to write its reviewable proposal.
+        assert "enqueue" not in kw
+        assert "tool_registry" in kw and "policy" in kw
+        called["task_id"] = t.id
+        return FailureAnalysisResult(
+            workstream=t.workstream,
+            patterns_detected=1,
+            proposals=[ProposedFix(
+                pattern_id="model_call_error:RateLimitError",
+                kind="model_call_error", key="RateLimitError",
+                rate=0.5, n=40, ci95=(0.35, 0.65), proposal_status="executed",
+                proposal_path="proposals/fixes/x.md", experiment_id="exp-1",
+                metric_name="failure_rate:model_call_error:RateLimitError", target=0.2,
+            )],
+            threshold=0.2, min_sample=30,
+        )
+
+    r = run_once(None, "w1", sink, registry=reg, config=load_policy(),
+                 run_failure_analysis=fake_run_failure_analysis, **_seams(q))
+
+    assert called["task_id"] == task.id            # the seam was actually invoked
+    assert r is not None
+    assert r.kind == "failure_analysis" and r.outcome == "done"
+    assert "exp-1" in r.detail                      # surfaces the experiment framing
+    assert q.tasks[task.id].status is TaskStatus.MERGED
+    assert task.id in q.heartbeats                  # heartbeated like the other roles
+    assert len(q.tasks) == before                   # no follow-on task enqueued (no loop)
+
+
+def test_failure_analysis_quiet_workstream_reports_none_detected(tmp_path):
+    """A quiet workstream (no recurring pattern) still commits MERGED with a
+    `nothing detected` detail — nothing proposed, no loop."""
+    sink = MemoryEventSink()
+    q = FakeQueue(sink)
+    reg = _registry(tmp_path)
+    task = q.enqueue(None, workstream="test", type=FAILURE_ANALYST_TASK_TYPES[0], payload={})
+
+    def fake_quiet(conn, t, s, **kw):
+        return FailureAnalysisResult(workstream=t.workstream, patterns_detected=0,
+                                     proposals=[], threshold=0.2, min_sample=30)
+
+    r = run_once(None, "w1", sink, registry=reg, config=load_policy(),
+                 run_failure_analysis=fake_quiet, **_seams(q))
+    assert r.kind == "failure_analysis" and r.outcome == "done"
+    assert "no recurring failure pattern detected" in r.detail
+    assert q.tasks[task.id].status is TaskStatus.MERGED
