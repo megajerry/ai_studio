@@ -48,6 +48,7 @@ def build_report(
     pm: Optional[dict],
     quality: Optional[dict],
     trajectory: Optional[dict] = None,
+    grounding: Optional[dict] = None,
 ) -> dict:
     """Combine the eval outputs into one report dict (+ generated-at stamp).
 
@@ -66,6 +67,7 @@ def build_report(
         "verifier_seeded_defect": verifier,
         "pm_structural_decomposition": pm,
         "pm_trajectory_decision_quality": trajectory,
+        "grounding_fabrication_telemetry": grounding,
         "telemetry_quality_report": quality,
     }
 
@@ -154,6 +156,32 @@ def render_markdown(report: dict) -> str:
             "go-live with no code change."
         )
         lines.append(f"- passed: {tr.get('passed')}")
+        lines.append("")
+
+    g = report.get("grounding_fabrication_telemetry")
+    if g:
+        gv = g.get("verification", {})
+        gc = g.get("counts", {})
+        lines.append("## Grounding/fabrication telemetry (S1 ledger)")
+        lines.append("")
+        lines.append(
+            f"- claims: verified={gv.get('verified')} rejected={gv.get('rejected')} "
+            f"unverifiable={gv.get('unverifiable')} pending={gv.get('pending')} "
+            f"| checked={gv.get('checked')}"
+        )
+        lines.append(
+            f"- identities: revoked={gc.get('revoked_identities')} "
+            f"quarantined={gc.get('quarantined_identities')} "
+            f"total_strikes={gc.get('total_strikes')}"
+        )
+        for r in g.get("rates", []):
+            lines.append(_rate_line(r))
+        lines.append(
+            "- NOTE: measures the LEDGER/TELEMETRY mechanism (recorded fabrications "
+            "counted + rated correctly); end-to-end fabrication-catch quality lands "
+            "with the Spokesman gate + real models."
+        )
+        lines.append(f"- passed: {g.get('passed')}")
         lines.append("")
 
     q = report.get("telemetry_quality_report")
