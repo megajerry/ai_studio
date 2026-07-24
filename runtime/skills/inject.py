@@ -15,8 +15,11 @@ in a bounded, clearly-delimited ``### Skills`` section. Two invariants (ADR-0008
 from __future__ import annotations
 
 import logging
-from typing import NamedTuple
+from typing import Any, NamedTuple, Optional
+from uuid import UUID
 
+from ..event_types import EVENT_SKILL_APPLIED
+from ..models import make_event
 from .models import Skill
 
 logger = logging.getLogger("runtime.skills")
@@ -110,3 +113,45 @@ def compose_prompt(
     (and logged) unless ``allow_unreviewed=True``. See :func:`compose`.
     """
     return compose(base_prompt, skills, allow_unreviewed=allow_unreviewed).prompt
+
+
+def emit_skill_applied(
+    sink: Any,
+    *,
+    task_id: Optional[UUID],
+    role: str,
+    workstream: str,
+    skills: Optional[list[Skill]],
+    allow_unreviewed: bool = False,
+) -> list[str]:
+    """Emit ONE body-free ``skill.applied`` event for the skills actually injected.
+
+    The P0 attribution hook (ADR-0024): a role calls this alongside its prompt
+    composition, passing the SAME ``skills`` list it composed with. The injected
+    subset is computed by the single injection gate (:func:`filter_injectable`, the
+    same ``allow_unreviewed`` the prompt used), so this event names EXACTLY the
+    skills that reached the prompt — reviewed ones by default, and an
+    unreviewed/skipped skill is never attributed.
+
+    BODY-FREE (invariants 5 & 6): the payload carries ONLY the injected skill
+    ``skills`` NAME list + the acting ``role``; the ``task_id``/``workstream`` live
+    on the envelope. It NEVER carries a skill's instruction body. When nothing was
+    injected (no registry, no relevant skill, or every match unreviewed) it is a
+    no-op — nothing was applied, so there is nothing to attribute. Returns the list
+    of injected skill names (``[]`` when none) for the caller/tests.
+    """
+    if not skills:
+        return []
+    included, _skipped = filter_injectable(skills, allow_unreviewed=allow_unreviewed)
+    names = [s.name for s in included]
+    if not names:
+        return []
+    sink.emit(
+        make_event(
+            workstream=workstream,
+            type=EVENT_SKILL_APPLIED,
+            task_id=task_id,
+            payload={"skills": names, "role": role},
+        )
+    )
+    return names

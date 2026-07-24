@@ -29,7 +29,7 @@ from ..model.registry import Registry
 from ..models import Task, make_event
 from ..event_types import EVENT_EXECUTOR_ACTED
 from ..policy import PolicyConfig
-from ..skills import SkillRegistry
+from ..skills import SkillRegistry, emit_skill_applied
 from ..tools import ToolRegistry
 from .lessons import recall_lesson_texts
 from .prompt import compose_role_prompt
@@ -104,6 +104,9 @@ def run_executor(
         lessons=lessons,
         budget_aware=True,
     )
+    # P0 attribution (ADR-0024): body-free skill.applied for the injected skill(s).
+    emit_skill_applied(sink, task_id=task.id, role="executor",
+                       workstream=task.workstream, skills=selected)
     completion = call_model(
         role="executor",
         task_type="execute",

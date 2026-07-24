@@ -161,6 +161,18 @@ EVENT_SOURCING_AUTOADOPTED = "sourcing.autoadopted"
 EVENT_FAILURE_PATTERN_DETECTED = "failure.pattern_detected"
 EVENT_FIX_PROPOSED = "fix.proposed"
 
+# --- Skill attribution telemetry (runtime.skills.inject, ADR-0024) -----------
+#: Emitted whenever a REVIEWED skill is injected into a role's prompt (the P0
+#: attribution hook of the skill-efficacy foundation). BODY-FREE: the payload
+#: carries ONLY the injected skill NAME(s) + the acting role; the task_id lives on
+#: the envelope. It NEVER carries a skill's instruction body/resources/prompt text
+#: (invariants 5 & 6, mirroring the trajectory.* / model.call.failed discipline) —
+#: names are identifiers, not bodies. This is what makes per-skill usage
+#: attributable in the event log so ``skill_efficacy_report`` can compare an
+#: applied cohort against a baseline. An unreviewed/skipped skill is NOT injected,
+#: so it emits NO ``skill.applied``.
+EVENT_SKILL_APPLIED = "skill.applied"
+
 # --- Trajectory observability (runtime.trajectory) --------------------------
 #: The reasoning-trajectory writer (ADR-0020). These are BODY-FREE: payloads carry
 #: ONLY ids / types / seq / step_type / counts — NEVER rationale, summary, goal, or

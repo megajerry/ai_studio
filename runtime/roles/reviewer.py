@@ -68,7 +68,7 @@ from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
 from ..policy import PolicyConfig
-from ..skills import SkillRegistry, compose_prompt
+from ..skills import SkillRegistry, compose_prompt, emit_skill_applied
 from ..tools import ToolRegistry
 
 #: Role verdict/alarm events (``review.passed`` / ``review.flagged``; ``review.alarm``
@@ -385,6 +385,11 @@ def run_review(
     # 3. Traceability-only model call — persona + injected `rigorous-review`
     #    doctrine (ADR-0008/0014). Its opinion does NOT decide the verdict.
     prompt = _compose_review_prompt(target_type, skills)
+    # P0 attribution (ADR-0024): body-free skill.applied for the injected skill(s).
+    emit_skill_applied(
+        sink, task_id=task.id, role="reviewer", workstream=task.workstream,
+        skills=skills.select(_REVIEW_SKILL_QUERY) if skills is not None else None,
+    )
     call_model(
         role="reviewer",
         task_type="review",

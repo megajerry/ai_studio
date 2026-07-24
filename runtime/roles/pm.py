@@ -71,7 +71,7 @@ from ..model.call import call_model as _call_model
 from ..model.providers.dryrun import PLAN_GOAL_OPT
 from ..model.registry import Registry
 from ..models import Task, TaskStatus, make_event
-from ..skills import SkillRegistry
+from ..skills import SkillRegistry, emit_skill_applied
 from ..task_state import assert_acyclic
 from ..trajectory import add_step, close_trajectory, start_trajectory
 from .critic import CRITIC_ESCALATE, CRITIC_REVISE, Critique
@@ -630,6 +630,12 @@ def run_pm_tick(
         conn, task, goal, sink,
         registry=registry, skills=skills, call_model=call_model,
         charter=charter, overlay=overlay,
+    )
+    # P0 attribution (ADR-0024): body-free skill.applied for the skill(s) injected
+    # into the PM plan prompt above (same selection _compose_plan_prompt used).
+    emit_skill_applied(
+        sink, task_id=task.id, role="pm", workstream=task.workstream,
+        skills=skills.select(_PM_SKILL_QUERY) if skills is not None else None,
     )
     threshold = _confidence_threshold()
 

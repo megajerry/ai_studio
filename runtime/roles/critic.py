@@ -48,7 +48,7 @@ from ..event_types import EVENT_CRITIC_REVIEWED
 from ..model.call import call_model as _call_model
 from ..model.registry import Registry
 from ..models import make_event
-from ..skills import SkillRegistry
+from ..skills import SkillRegistry, emit_skill_applied
 from ..trajectory import add_step
 from .prompt import compose_role_prompt
 
@@ -363,6 +363,9 @@ def run_critic(
         skills=selected,
         budget_aware=True,
     )
+    # P0 attribution (ADR-0024): body-free skill.applied for the injected skill(s).
+    emit_skill_applied(sink, task_id=task_id, role="critic",
+                       workstream=workstream, skills=selected)
     call_model(
         role="critic",
         task_type="critique",
