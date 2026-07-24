@@ -12,7 +12,8 @@ from __future__ import annotations
 from typing import Callable
 
 from .anthropic import AnthropicProvider
-from .base import Completion, Message, Provider, messages_char_len
+from .base import Completion, Message, Provider, ProviderFallback, messages_char_len
+from .cursor_cli import CursorCliProvider
 from .dryrun import DryRunProvider
 from .google import GoogleProvider
 from .openai import OpenAIProvider
@@ -23,6 +24,7 @@ ADAPTERS: dict[str, Callable[[], Provider]] = {
     AnthropicProvider.name: AnthropicProvider,
     OpenAIProvider.name: OpenAIProvider,
     GoogleProvider.name: GoogleProvider,
+    CursorCliProvider.name: CursorCliProvider,
 }
 
 
@@ -36,11 +38,13 @@ __all__ = [
     "ADAPTERS",
     "AnthropicProvider",
     "Completion",
+    "CursorCliProvider",
     "DryRunProvider",
     "GoogleProvider",
     "Message",
     "OpenAIProvider",
     "Provider",
+    "ProviderFallback",
     "get_adapter",
     "messages_char_len",
 ]

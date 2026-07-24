@@ -43,6 +43,21 @@ CODING_WORKER_CMD_ENV = "CODING_WORKER_CMD"
 #: Default coding worker (architecture §14: the first replaceable "employee").
 DEFAULT_CODING_WORKER_CMD = "opencode"
 
+#: Per-worker command SHAPE, keyed by the worker binary's basename. Different
+#: coding CLIs take the goal differently — opencode uses ``run <goal>``; Cursor's
+#: agent harness uses ``-p <goal> --output-format json`` (its non-interactive
+#: form; there is NO raw HTTP inference endpoint, only this CLI). ``{goal}`` is
+#: substituted with the SHELL-QUOTED goal so it is always a single argument that
+#: cannot break out of the invocation. A worker not listed here falls back to
+#: :data:`_DEFAULT_TEMPLATE` (the opencode ``run`` convention), so adding a new
+#: coding CLI is a one-line config/mapping change, not a code rewrite.
+WORKER_COMMAND_TEMPLATES: dict[str, str] = {
+    "opencode": "{cmd} run {goal}",
+    "cursor-agent": "{cmd} -p {goal} --output-format json",
+}
+#: Shape used for any worker not in :data:`WORKER_COMMAND_TEMPLATES`.
+_DEFAULT_TEMPLATE = "{cmd} run {goal}"
+
 
 class CodingTool(Tool):
     """Run a coding worker on a prototype spec — but only inside a sandbox."""
@@ -85,11 +100,17 @@ class CodingTool(Tool):
 
         Pure + unit-tested (no Docker). The goal is shell-quoted so it is passed as
         a single argument to the worker and can never break out of the invocation.
-        Convention: ``<worker_cmd> run <goal>`` (opencode's non-interactive form).
-        The command runs in the container's workdir (the bind-mounted scratch
-        workspace at ``/workspace``), so files the worker writes land there.
+        The command SHAPE is per-worker (:data:`WORKER_COMMAND_TEMPLATES`, keyed by
+        the worker binary's basename): opencode -> ``<cmd> run <goal>``;
+        ``cursor-agent`` -> ``<cmd> -p <goal> --output-format json``. Unknown
+        workers fall back to the opencode ``run`` convention. The command runs in
+        the container's workdir (the bind-mounted scratch workspace at
+        ``/workspace``), so files the worker writes land there.
         """
-        return f"{self.worker_cmd} run {shlex.quote(goal)}"
+        template = WORKER_COMMAND_TEMPLATES.get(
+            os.path.basename(self.worker_cmd), _DEFAULT_TEMPLATE
+        )
+        return template.format(cmd=self.worker_cmd, goal=shlex.quote(goal))
 
     def execute(self, **kwargs) -> ToolResult:
         goal = kwargs.get("goal")
