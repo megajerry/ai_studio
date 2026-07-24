@@ -12,8 +12,18 @@ from spokesman.config import Settings
 
 from .conftest import API_TOKEN, make_settings
 
+# A valid new-contract /notify body (ADR-0021 S2): a labelled JUDGMENT needs no
+# evidence, so the request is schema-valid and the auth gate is what's exercised
+# here. (/notify fails closed to a 200 if the DB is unreachable, so these auth
+# checks stay DB-independent.)
+_NOTIFY_BODY = {
+    "kind": "inform",
+    "originating_identity": "role/test-auth",
+    "claims": [{"statement": "looks good to me", "is_judgment": True}],
+}
+
 PROTECTED = [
-    ("/notify", {"kind": "inform", "text": "hi"}),
+    ("/notify", _NOTIFY_BODY),
     ("/digest/flush", None),
 ]
 
