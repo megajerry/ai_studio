@@ -186,6 +186,21 @@ def load_policy(path: str | Path | None = None) -> PolicyConfig:
     return PolicyConfig.from_yaml(path if path is not None else resolve_policy_path())
 
 
+def human_relay_permitted(conn, identity: str) -> bool:
+    """Thin relay gate (ADR-0021): may ``identity`` speak to the human right now?
+
+    Additive hook the later Spokesman send track (S2) composes on top of the normal
+    :func:`decide` capability check for :data:`Capability.COMMS_HUMAN_RELAY`: even a
+    granted role is denied relay if the trust ledger has revoked it. Reads the
+    ledger via :func:`runtime.trust.is_relay_allowed` (imported lazily so this
+    module stays DB-free to import and unit-testable without psycopg). This does NOT
+    rewire existing tool gating — it is a standalone check a caller opts into.
+    """
+    from .trust import is_relay_allowed  # lazy: keep policy import DB-free
+
+    return is_relay_allowed(conn, identity)
+
+
 def decide(request: PolicyRequest, config: PolicyConfig) -> Decision:
     """Authorize one tool call. Pure: no I/O, no events (see :mod:`runtime.enforce`)."""
     granted = config.granted(request.role)
