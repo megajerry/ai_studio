@@ -230,9 +230,10 @@ def test_org_ceiling_utilization(conn):
         daily = [o for o in rep["org_ceiling"] if o["period"] == "daily"]
         assert len(daily) == 1
         o = daily[0]
-        assert o["cap_usd"] == org_cap
-        assert o["spent_usd"] == round(org_spent, 6)
-        assert o["utilization_usd"] == round(org_spent / org_cap, 6)
+        # cap_usd round-trips through numeric → compare with a FP tolerance.
+        assert o["cap_usd"] == pytest.approx(org_cap)
+        assert o["spent_usd"] == pytest.approx(round(org_spent, 6))
+        assert o["utilization_usd"] == pytest.approx(org_spent / org_cap, abs=1e-6)
     finally:
         with conn.transaction():
             with conn.cursor() as cur:
