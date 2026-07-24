@@ -47,7 +47,7 @@ import os
 import tempfile
 import time
 from typing import Any, Callable, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 from pydantic import BaseModel
@@ -72,7 +72,7 @@ from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
 from .roles.checkers import DEFAULT_REGISTRY, CheckerRegistry
 from .roles.executor import run_executor
-from .roles.pm import run_pm_tick
+from .roles.pm import REPLAN_TASK_TYPE, run_pm_replan, run_pm_tick
 from .roles.researcher import RESEARCH_TASK_TYPE, run_research as run_research_default
 from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
 from .roles.sourcing import SOURCING_TASK_TYPES, run_sourcing as run_sourcing_default
@@ -148,7 +148,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "unknown"
+    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "unknown"
     kind: str
     #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
@@ -202,6 +202,71 @@ def _handle_pm_tick(
         kind="pm",
         outcome="done",
         detail=detail,
+    )
+
+
+def _handle_replan(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    model_registry,
+    enqueue: Enqueuer,
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_replan: Callable[..., Any],
+    skills: Optional[SkillRegistry] = None,
+    charter: Optional[str] = None,
+    overlay: Optional[str] = None,
+) -> RunResult:
+    """Dispatch a ``replan`` task: the PM re-decomposes a stuck task (ADR-0023, R2).
+
+    The task carries ``stuck_task_id`` (the superseded/abandoned original). The PM
+    reads its preserved spec and enqueues N SMALLER subtasks, or — at the replan
+    depth cap — escalates to a human 🛑 (no subtasks). A replan NEVER re-enqueues a
+    replan (it enqueues only ``work.*`` subtasks), so it cannot recurse into a
+    replan-of-a-replan; the depth bound caps the work→stuck→replan chain itself. A
+    malformed task (no/invalid ``stuck_task_id``) is abandoned, never silently dropped.
+    """
+    payload = task.payload or {}
+    raw_id = payload.get("stuck_task_id")
+    heartbeat(conn, task.id, worker_id)
+    try:
+        stuck_id = UUID(str(raw_id))
+    except (TypeError, ValueError):
+        complete(
+            conn, task.id,
+            result={"error": f"replan task missing a valid stuck_task_id: {raw_id!r}"},
+            status=TaskStatus.ABANDONED,
+        )
+        return RunResult(
+            task_id=str(task.id), task_type=task.type, kind="replan",
+            outcome="failed", detail="missing/invalid stuck_task_id",
+        )
+
+    result = run_replan(
+        conn, stuck_id, sink,
+        registry=model_registry, skills=skills, enqueue=enqueue,
+        charter=charter, overlay=overlay,
+    )
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
+    if result.missing:
+        detail = f"stuck task {result.stuck_task_id} not found; nothing to replan"
+    elif result.decision == "escalated":
+        detail = (
+            f"replan depth {result.replan_depth} reached cap {result.max_depth} → "
+            f"🛑 approval {result.approval_id} (no re-decomposition)"
+        )
+    else:
+        detail = (
+            f"re-decomposed {result.stuck_task_id} into {result.subtask_count} "
+            f"smaller subtask(s) at depth {result.replan_depth}: {result.subtask_ids}"
+        )
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="replan",
+        outcome="done", detail=detail,
     )
 
 
@@ -752,6 +817,7 @@ def run_once(
     enqueue: Enqueuer = enqueue_task,
     block: Blocker = block_task,
     run_pm: Callable[..., Any] = run_pm_tick,
+    run_replan: Callable[..., Any] = run_pm_replan,
     run_exec: Callable[..., Any] = run_executor,
     run_verify: Callable[..., Any] = run_verify_default,
     run_retro: Callable[..., Any] = run_retro_default,
@@ -800,6 +866,19 @@ def run_once(
             model_registry=model_registry, enqueue=enqueue,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id, run_pm=run_pm,
             skills=eff_skills,
+            charter=(wcfg.charter if wcfg else None),
+            overlay=(wcfg.overlay_for("pm") if wcfg else None),
+        )
+
+    if task.type == REPLAN_TASK_TYPE:
+        # A stuck task's re-decomposition (ADR-0023, R2). The PM breaks the
+        # superseded original into SMALLER subtasks (or escalates at the depth cap).
+        # It enqueues only work.* subtasks (never another replan), so no loop.
+        return _handle_replan(
+            conn, task, sink,
+            model_registry=model_registry, enqueue=enqueue,
+            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            run_replan=run_replan, skills=eff_skills,
             charter=(wcfg.charter if wcfg else None),
             overlay=(wcfg.overlay_for("pm") if wcfg else None),
         )

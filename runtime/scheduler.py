@@ -26,7 +26,10 @@ from typing import Callable, Optional
 import psycopg
 
 from .db import connect
-from .models import Task
+from .event_types import EVENT_TASK_STUCK
+from .events import read_events
+from .models import Event, Task
+from .roles.pm import REPLAN_TASK_TYPE
 from .tasks import enqueue_task
 
 log = logging.getLogger("runtime.scheduler")
@@ -35,9 +38,14 @@ log = logging.getLogger("runtime.scheduler")
 PM_TICK_TYPE = "pm.tick"
 DEFAULT_PULSE_INTERVAL_S = 300.0
 
+#: Max ``task.stuck`` events consumed per replan-dispatch pass (bounded work).
+REPLAN_DISPATCH_LIMIT = 200
+
 # Injectable seams so `tick_once` is unit-testable with no database.
 PendingCheck = Callable[[psycopg.Connection, str], bool]
 Enqueuer = Callable[..., Task]
+EventReader = Callable[..., list]
+ReplanExistsCheck = Callable[[psycopg.Connection, object], bool]
 
 
 def _pm_tick_pending(conn: psycopg.Connection, workstream: str) -> bool:
@@ -82,6 +90,68 @@ def tick_once(
     return task
 
 
+# --- Replan dispatch: task.stuck signal → PM replan task (ADR-0023, R2) ------
+#
+# The queue consumer that turns the supervisor's ``task.stuck`` SIGNAL into work
+# WITHOUT any agent-to-agent call (CLAUDE.md invariant 1): it scans NEW
+# ``task.stuck`` events past a monotonic ``seq`` cursor and enqueues ONE ``replan``
+# task per stuck task, which the worker dispatches to :func:`runtime.roles.pm.run_pm_replan`.
+# Idempotent: a stuck task that already has a replan task is skipped, so a cursor
+# reset (process restart) never double-enqueues.
+
+
+def _has_replan_task(conn: psycopg.Connection, stuck_task_id: object) -> bool:
+    """True if a ``replan`` task already exists for ``stuck_task_id`` (idempotency)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM tasks WHERE type = %s AND payload->>'stuck_task_id' = %s LIMIT 1",
+            (REPLAN_TASK_TYPE, str(stuck_task_id)),
+        )
+        found = cur.fetchone() is not None
+    if not conn.autocommit:
+        conn.commit()
+    return found
+
+
+def dispatch_replans(
+    conn: psycopg.Connection,
+    *,
+    since_seq: int = 0,
+    limit: int = REPLAN_DISPATCH_LIMIT,
+    read: EventReader = read_events,
+    has_replan: ReplanExistsCheck = _has_replan_task,
+    enqueue: Enqueuer = enqueue_task,
+) -> tuple[int, list[str]]:
+    """Enqueue one PM ``replan`` task per NEW ``task.stuck`` event (queue-only).
+
+    Scans ``task.stuck`` events with ``seq > since_seq`` (ascending, bounded by
+    ``limit``) and, for each stuck task that does not already have a replan, enqueues
+    a ``replan`` task in the stuck task's workstream carrying its ``stuck_task_id``.
+    Returns ``(new_cursor, [replan_task_ids])`` — the new cursor is the high-water
+    ``seq`` of every event *scanned* (advanced past skipped/duplicate ones too), so a
+    caller persists it and never re-scans. Every seam is injectable so the consumer
+    is unit-testable with no database.
+    """
+    events: list[Event] = read(conn, type=EVENT_TASK_STUCK, since_seq=since_seq, limit=limit)
+    cursor = since_seq
+    replan_ids: list[str] = []
+    for ev in events:
+        cursor = max(cursor, ev.seq or 0)
+        if ev.task_id is None:
+            continue
+        if has_replan(conn, ev.task_id):
+            continue  # idempotent: this stuck task already has a replan
+        task = enqueue(
+            conn,
+            workstream=ev.workstream,
+            type=REPLAN_TASK_TYPE,
+            payload={"stuck_task_id": str(ev.task_id)},
+        )
+        replan_ids.append(str(task.id))
+        log.info("enqueued replan %s for stuck task %s", task.id, ev.task_id)
+    return cursor, replan_ids
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
@@ -109,11 +179,17 @@ def run(
     )
     log.info("scheduler starting: pm.tick every %.0fs for %s", interval_s, workstream)
     conn: Optional[psycopg.Connection] = None
+    # In-memory high-water cursor over task.stuck events (ADR-0023, R2). Starts at 0
+    # (a fresh process re-scans, but dispatch is idempotent so no duplicate replans);
+    # advances each pass so steady-state scans only new events.
+    replan_cursor = 0
     while True:
         try:
             if conn is None or conn.closed:
                 conn = connect()
             tick_once(conn, workstream)
+            # Turn any new task.stuck signal into a PM replan task (queue-only).
+            replan_cursor, _ = dispatch_replans(conn, since_seq=replan_cursor)
         except Exception:
             log.exception("scheduler tick failed; will retry after interval")
             conn = _safe_close(conn)
