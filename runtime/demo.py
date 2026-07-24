@@ -335,6 +335,87 @@ def _demonstrate_workstream_config(conn, scratch: str) -> bool:
                 and isolated and charter_in_prompt and overlay_in_prompt)
 
 
+def _demonstrate_failure_analyst(conn, scratch: str) -> bool:
+    """Show the failure→durable-fix→verify loop the stakeholder asked for: a
+    RECURRING API-error failure is recognized from telemetry (only above threshold
+    AND n ≥ floor, on the CI lower bound), a durable-fix candidate is PROPOSED (never
+    applied) + framed as an experiment, and — after a human applies the fix — the
+    experiment reads REAL post-fix traffic and confirms the fix worked."""
+    from .capabilities import Capability
+    from .enforce import DbEventSink
+    from .experiment import ExperimentStatus, start_experiment
+    from .policy import PolicyConfig
+    from .quality import failure_report
+    from .roles.failure_analyst import (
+        observe_and_evaluate_fix,
+        run_failure_analysis,
+    )
+    from .tools import FilesystemTool, ToolRegistry
+
+    ws = f"fail-{uuid4().hex[:8]}"
+    sink = DbEventSink(conn)
+    reg = ToolRegistry()
+    reg.register(FilesystemTool(root=scratch))
+    policy = PolicyConfig(roles={"failure_analyst": frozenset(
+        {Capability.FS_READ, Capability.FS_WRITE})})
+    print(f"\n=== failure-analyst demo (workstream={ws}) ===")
+
+    # 1. Seed a RECURRING API-error failure: 40 of 100 model calls die RateLimitError.
+    for _ in range(60):
+        append_event(conn, make_event(workstream=ws, type="model.call",
+                                      payload={"model": "dryrun", "cost_usd": 0.0,
+                                               "input_tokens": 1, "output_tokens": 1}))
+    for _ in range(40):
+        append_event(conn, make_event(
+            workstream=ws, type="model.call.failed",
+            payload={"error_type": "RateLimitError", "model": "m", "provider": "p",
+                     "role": "executor", "task_type": "work"}))
+    rep = failure_report(conn, ws)
+    er = rep["rates"]["model_call_error_rate"]
+    print(f"  telemetry: model_call_error_rate={er['rate']} (n={er['n']}, CI={er['ci95']})")
+
+    # 2. The analyst recognizes the pattern → PROPOSES a fix + frames an experiment.
+    now = datetime.now(timezone.utc)
+    task = Task(id=uuid4(), workstream=ws, type="analyze.failures",
+                status=TaskStatus.IN_PROGRESS, priority=0,
+                created_at=now, updated_at=now, payload={})
+    result = run_failure_analysis(conn, task, sink, tool_registry=reg, policy=policy)
+    if not result.proposals:
+        print("  no recurring pattern detected — INCOMPLETE")
+        return False
+    fix = result.proposals[0]
+    print(f"  detected: {fix.pattern_id} rate={fix.rate} (n={fix.n}) → proposed fix "
+          f"'{fix.proposal_path}' [{fix.proposal_status}], experiment={fix.experiment_id}")
+    print(f"  fix auto-applied? NO — candidate only (a human applies it); "
+          f"experiment target: {fix.metric_name} <= {fix.target}")
+
+    # 3. A human applies the fix + starts observing; capture the post-fix cursor.
+    start_experiment(conn, fix.experiment_id, sink=sink)
+    with conn.cursor() as cur:
+        cur.execute("SELECT max(seq) AS s FROM events")
+        cursor = int(cur.fetchone()["s"])
+    conn.commit()
+
+    # 4. Real POST-FIX traffic — the rate dropped to 0.05 (5/100) → fix works.
+    for _ in range(95):
+        append_event(conn, make_event(workstream=ws, type="model.call",
+                                      payload={"model": "dryrun", "cost_usd": 0.0,
+                                               "input_tokens": 1, "output_tokens": 1}))
+    for _ in range(5):
+        append_event(conn, make_event(
+            workstream=ws, type="model.call.failed",
+            payload={"error_type": "RateLimitError", "model": "m", "provider": "p",
+                     "role": "executor", "task_type": "work"}))
+    exp = observe_and_evaluate_fix(conn, fix.experiment_id, sink=sink,
+                                   workstream=ws, since_seq=cursor)
+    effective = exp.status in (ExperimentStatus.KEPT, ExperimentStatus.SCALED)
+    print(f"  post-fix traffic: observed rate={exp.observed_value} → experiment "
+          f"{exp.status.value} (fix {'CONFIRMED effective' if effective else 'ineffective'})")
+
+    return bool(fix.experiment_id and fix.proposal_status == "executed"
+                and exp.status is not ExperimentStatus.PROPOSED and effective)
+
+
 def main() -> int:
     # Keyless by construction — dry-run every model call.
     os.environ.setdefault("MODELS_DRY_RUN", "1")
@@ -412,7 +493,12 @@ def main() -> int:
         critiqued = _demonstrate_critic(conn, skills)
         print(f"runtime.demo: {'OK — critic partnered forward (consensus decomposed, unresolved disagreement escalated 🛑)' if critiqued else 'CRITIC INCOMPLETE'}")
 
-        return 0 if (ok and learned and reviewed and researched and configured and critiqued) else 1
+        # Seventh act: recognize a recurring failure → propose a durable fix (never
+        # auto-applied) → verify the fix on real post-fix traffic as an experiment.
+        healed = _demonstrate_failure_analyst(conn, scratch)
+        print(f"runtime.demo: {'OK — failure-pattern loop closed (recurring failure → proposed durable fix → verified effective on real traffic)' if healed else 'FAILURE-ANALYST INCOMPLETE'}")
+
+        return 0 if (ok and learned and reviewed and researched and configured and critiqued and healed) else 1
     finally:
         conn.close()
 

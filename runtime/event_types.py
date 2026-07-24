@@ -149,6 +149,17 @@ EVENT_RESEARCH_COMPLETED = "research.completed"
 #: Sourcing (runtime.roles.sourcing).
 EVENT_SOURCING_PROPOSED = "sourcing.proposed"
 EVENT_SOURCING_AUTOADOPTED = "sourcing.autoadopted"
+#: Failure-pattern analyst (runtime.roles.failure_analyst, ADR-0023 R3). These are
+#: BODY-FREE: payloads carry ONLY a pattern id / kind / the error_type|stall_reason
+#: CODE / the rate + sample size + Wilson CI / thresholds / ids — NEVER prompt,
+#: response, or any secret/body text (invariants 5 & 6, mirroring model.call.failed).
+#: ``failure.pattern_detected`` = a RECURRING failure pattern crossed the detection
+#: bound (CI lower bound > threshold AND n ≥ floor); ``fix.proposed`` = a durable-fix
+#: candidate was written to a review path + registered as an experiment.proposed
+#: (the fix is NEVER auto-applied — a human applies it and the experiment then
+#: watches real post-fix traffic to confirm/deny effectiveness).
+EVENT_FAILURE_PATTERN_DETECTED = "failure.pattern_detected"
+EVENT_FIX_PROPOSED = "fix.proposed"
 
 # --- Trajectory observability (runtime.trajectory) --------------------------
 #: The reasoning-trajectory writer (ADR-0020). These are BODY-FREE: payloads carry
