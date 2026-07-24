@@ -69,6 +69,7 @@ The PM is the highest-leverage role — give it the best.
 | Claude Opus 4.8 / Sonnet 5 | Anthropic | see above | Top coding quality. |
 | GPT-5.3-Codex | OpenAI | 1.75 / 14 | Dedicated long-horizon agentic coding. |
 | Kimi K3 / GLM-5.2 / DeepSeek V4.5 | self-host | GPU | Open-weight; Kimi K3 #1 Frontend Code Arena. |
+| **Cursor** (`cursor-composer`) | `cursor-cli` | **flat $200/mo** (Ultra) | **Not a keyed HTTP provider** — an executor **substrate** + a guarded CLI router adapter. No raw inference endpoint exists; inference runs *only* via the agent-harness CLI (`cursor-agent -p … --output-format json`), so it is heavier than a completion and guarded by a hard timeout + fallback (2026 `-p` hang bug). Flat-rate → $0 marginal/token; routes for the `coding` tier only. See [cost-model.md §7](cost-model.md#7-substrate-options-metered-api-flat-rate-or-self-host). |
 
 ### Embeddings (required for memory; Anthropic has none)
 Pick **one** and stick with it — **switching requires re-embedding everything.**
