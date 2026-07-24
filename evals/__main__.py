@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 
 from . import report as report_mod
+from .grounding_eval import run_grounding_eval
 from .pm_eval import run_pm_structural_eval
 from .stats import Rate, rate
 from .trajectory_eval import run_trajectory_eval
@@ -68,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
 
     pm = None
     trajectory = None
+    grounding = None
     quality = None
     all_passed = verifier["passed"]
 
@@ -101,6 +103,27 @@ def main(argv: list[str] | None = None) -> int:
             print("  NOTE: dryrun judge = MECHANISM signal only; a real model judges "
                   "the same trajectory at go-live with no code change.")
 
+            # --- Grounding/fabrication telemetry eval (needs DB) ------------
+            grounding_result = run_grounding_eval(conn)
+            grounding = grounding_result.to_dict()
+            gc = grounding["counts"]
+            gv = grounding["verification"]
+            print("\n=== Grounding/fabrication telemetry eval (S1 ledger, dry-run) ===")
+            print(f"  seeded prefix={grounding['prefix']} (throwaway, cleaned up)")
+            print(f"  claims: verified={gv['verified']} rejected={gv['rejected']} "
+                  f"unverifiable={gv['unverifiable']} pending={gv['pending']} "
+                  f"checked={gv['checked']}")
+            print(f"  identities: revoked={gc['revoked_identities']} "
+                  f"quarantined={gc['quarantined_identities']} "
+                  f"total_strikes={gc['total_strikes']} "
+                  f"top_offenders={grounding['top_offenders']}")
+            print(f"  passed={grounding['passed']}")
+            print("  rates (each with n + Wilson 95% CI):")
+            _print_rates(grounding_result.rates())
+            print("  NOTE: measures the LEDGER/TELEMETRY mechanism (recorded "
+                  "fabrications are counted + rated correctly); end-to-end "
+                  "fabrication-catch quality lands with the Spokesman gate + real models.")
+
             # --- Telemetry quality rollup (needs DB) ------------------------
             from runtime.quality import quality_report
             quality = quality_report(conn, workstream=args.workstream)
@@ -118,7 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                   f"avg_tokens/completed={quality['cost']['avg_tokens_per_completed_task']} "
                   f"avg_latency/completed_ms={quality['latency']['avg_latency_per_completed_task_ms']}")
 
-            all_passed = all_passed and pm["passed"] and trajectory["passed"]
+            all_passed = (all_passed and pm["passed"] and trajectory["passed"]
+                          and grounding["passed"])
         finally:
             conn.close()
     else:
@@ -126,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
               "evals skipped; run against the live Postgres for those. Verifier eval "
               "above ran without a DB.)")
 
-    full = report_mod.build_report(verifier, pm, quality, trajectory)
+    full = report_mod.build_report(verifier, pm, quality, trajectory, grounding)
     if args.json:
         Path(args.json).write_text(report_mod.to_json(full), encoding="utf-8")
         print(f"\nwrote JSON report -> {args.json}")

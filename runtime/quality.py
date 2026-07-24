@@ -30,6 +30,12 @@ Metrics (each rate is ``None`` when its denominator is 0, never a divide-by-zero
   reported with its sample size ``n``, a **Wilson 95% CI**, and an
   ``insufficient_sample`` flag (``n < 30``) so a point estimate on a tiny sample is
   never mistaken for a trustworthy signal. See :func:`pm_decision_quality`.
+- **grounding_global** — GROUNDING/FABRICATION telemetry from the S1 accountability
+  ledger (``comms_claims`` + ``identity_trust``, ADR-0021): claim verification
+  breakdown with a **verified-rate** and **fabrication-rate** (each via ``_rate_ci``
+  → n + Wilson CI + flag), plus revoked/quarantined identity counts and total
+  strikes — "is the grounding doctrine measurably working?". See
+  :func:`grounding_report`.
 
 NOTE (honest scope): dry-run means COST/TOKENS are the router's deterministic
 dry-run estimates and OUTCOME quality is not yet measured — these rollups measure
@@ -254,6 +260,125 @@ def pm_decision_quality(
     }
 
 
+def grounding_report(
+    conn: psycopg.Connection, identity_prefix: Optional[str] = None
+) -> dict:
+    """Grounding/fabrication telemetry: is the comms doctrine measurably working?
+
+    Rolls up the S1 accountability ledger (``comms_claims`` + ``identity_trust``,
+    ADR-0021) into the numbers the Retro / Reviewer / a Grafana panel read to judge
+    whether "everything said to the human is grounded" is actually holding. Read-only
+    and derived entirely from those two tables (the append-only ``comms.*`` /
+    ``trust.*`` events are the wire trail; the durable counts live in the tables).
+
+    Comms/trust are **identity-scoped, not workstream-scoped** (a claim concerns an
+    *identity*, not a vertical — ``comms_claims`` has no workstream column and the
+    events log under the Spokesman's own workstream), so this rollup is GLOBAL by
+    default. ``identity_prefix`` optionally restricts both tables to identities
+    ``LIKE '<prefix>%'`` — used by the eval/tests to assert an exact known shape on a
+    throwaway ``eval-grounding-*`` namespace without other rows polluting the counts.
+
+    Returns (every rate via :func:`_rate_ci`, so it carries ``n`` + Wilson 95% CI +
+    ``insufficient_sample``; None-safe on an empty ledger):
+
+    - ``verification`` — ``verified`` / ``rejected`` / ``unverifiable`` / ``pending``
+      counts, plus ``verified_rate`` and ``fabrication_rate`` (rejected / checked),
+      where ``checked`` = verified + rejected + unverifiable (claims that got a
+      verdict; ``pending``/NULL claims are excluded from the rate denominator).
+    - ``counts`` — total claims, distinct originating identities, identities tracked
+      in the trust ledger, and (from ``identity_trust``) ``revoked`` / ``quarantined``
+      counts + ``total_strikes``.
+    - ``top_offenders`` — identities with ≥1 rejected (fabricated) claim, most first.
+
+    HONEST SCOPE: this measures the *ledger/telemetry* mechanism — that fabrications,
+    once recorded, are counted and rated correctly. Whether the Spokesman gate + real
+    models actually CATCH fabrication end-to-end is measured once those land (S2 gate).
+    """
+    pfx = f"{identity_prefix}%" if identity_prefix else None
+    params = {"pfx": pfx}
+    with conn.cursor() as cur:
+        # --- claim verification breakdown (comms_claims) ----------------------
+        cur.execute(
+            """
+            SELECT
+              count(*)                                              AS total,
+              count(DISTINCT originating_identity)                  AS identities,
+              count(*) FILTER (WHERE verification_status='verified')     AS verified,
+              count(*) FILTER (WHERE verification_status='rejected')     AS rejected,
+              count(*) FILTER (WHERE verification_status='unverifiable') AS unverifiable,
+              count(*) FILTER (WHERE verification_status IS NULL)        AS pending
+            FROM comms_claims
+            WHERE (%(pfx)s::text IS NULL OR originating_identity LIKE %(pfx)s)
+            """,
+            params,
+        )
+        c = cur.fetchone()
+
+        # --- trust ledger (identity_trust) ------------------------------------
+        cur.execute(
+            """
+            SELECT
+              count(*)                                          AS identities_tracked,
+              count(*) FILTER (WHERE trust_state='revoked')     AS revoked,
+              count(*) FILTER (WHERE trust_state='quarantined') AS quarantined,
+              COALESCE(sum(strikes), 0)                         AS total_strikes
+            FROM identity_trust
+            WHERE (%(pfx)s::text IS NULL OR identity LIKE %(pfx)s)
+            """,
+            params,
+        )
+        tr = cur.fetchone()
+
+        # --- top offenders: identities with rejected (fabricated) claims ------
+        cur.execute(
+            """
+            SELECT originating_identity AS identity,
+                   count(*) FILTER (WHERE verification_status='rejected') AS fabrications
+            FROM comms_claims
+            WHERE (%(pfx)s::text IS NULL OR originating_identity LIKE %(pfx)s)
+            GROUP BY originating_identity
+            HAVING count(*) FILTER (WHERE verification_status='rejected') > 0
+            ORDER BY fabrications DESC, identity
+            LIMIT 10
+            """,
+            params,
+        )
+        offenders = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+
+    verified = int(c["verified"])
+    rejected = int(c["rejected"])
+    unverifiable = int(c["unverifiable"])
+    checked = verified + rejected + unverifiable
+
+    return {
+        "scope": "global" if identity_prefix is None else f"identity_prefix={identity_prefix!r}",
+        "verification": {
+            "verified": verified,
+            "rejected": rejected,
+            "unverifiable": unverifiable,
+            "pending": int(c["pending"]),
+            "checked": checked,
+            # verified/rejected over CHECKED claims — each carries n + Wilson CI + flag.
+            "verified_rate": _rate_ci(verified, checked),
+            "fabrication_rate": _rate_ci(rejected, checked),
+        },
+        "counts": {
+            "total_claims": int(c["total"]),
+            "distinct_identities": int(c["identities"]),
+            "identities_tracked": int(tr["identities_tracked"]),
+            "revoked_identities": int(tr["revoked"]),
+            "quarantined_identities": int(tr["quarantined"]),
+            "total_strikes": int(tr["total_strikes"]),
+        },
+        "top_offenders": [
+            {"identity": o["identity"], "fabrications": int(o["fabrications"])}
+            for o in offenders
+        ],
+    }
+
+
 def quality_report(
     conn: psycopg.Connection, workstream: Optional[str] = None
 ) -> dict:
@@ -261,10 +386,11 @@ def quality_report(
 
     ``workstream=None`` reports across ALL workstreams. Returns a nested dict of
     ``totals`` (raw counts), ``rates`` (the derived quality ratios), ``cost`` and
-    ``latency`` (per-completed-task efficiency), and ``by_model_global`` (the reused
+    ``latency`` (per-completed-task efficiency), ``by_model_global`` (the reused
     :func:`runtime.tasks.model_rollup`, which is process-wide, not ws-filtered — so
-    it is labeled ``_global``). Reads only the append-only event log +
-    ``task_transitions``.
+    it is labeled ``_global``), and ``grounding_global`` (the identity-scoped
+    :func:`grounding_report` — also global, not ws-filtered). Reads only the
+    append-only event log + ``task_transitions`` (+ the S1 comms/trust ledger).
     """
     params = {"ws": workstream}
     with conn.cursor() as cur:
@@ -370,4 +496,8 @@ def quality_report(
         # Outcome-attribution: PM decision quality (trajectory → tasks it created →
         # their lifecycle outcomes), every rate carrying n + Wilson 95% CI + flag.
         "pm_decision_quality": pm_decision_quality(conn, workstream),
+        # Grounding/fabrication telemetry from the S1 accountability ledger. Comms/
+        # trust are identity-scoped (not workstream-scoped), so this is GLOBAL like
+        # by_model_global — hence the _global suffix. Rates carry n + Wilson CI + flag.
+        "grounding_global": grounding_report(conn),
     }
