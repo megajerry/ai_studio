@@ -51,6 +51,16 @@ EVENT_TOOL_INVOKED = "tool.invoked"
 # --- Budget (runtime.budget) ------------------------------------------------
 EVENT_BUDGET_EXCEEDED = "budget.exceeded"
 EVENT_BUDGET_CHECKPOINT = "budget.checkpoint"
+# --- Graduated capacity governance (runtime.budget, ADR-0022) ---------------
+#: Tiered-threshold telemetry. All BODY-FREE: payloads carry ONLY amounts +
+#: workstream/period + zone (+ purpose on reserve) — never prompts, args, secrets
+#: (invariants 5 & 6). warn/throttle are NON-BLOCKING (the call proceeds); reserve
+#: is emitted when the workstream has entered the reserve buffer near its cap — a
+#: `normal` call is then WITHHELD (buffer preserved) while `wind_down`/`escalation`
+#: is allowed through, so a workstream can react/pivot/escalate BEFORE breaching.
+EVENT_BUDGET_WARN = "budget.warn"
+EVENT_BUDGET_THROTTLE = "budget.throttle"
+EVENT_BUDGET_RESERVE = "budget.reserve"
 
 # --- Memory (runtime.memory) ------------------------------------------------
 EVENT_MEMORY_REMEMBERED = "memory.remembered"
