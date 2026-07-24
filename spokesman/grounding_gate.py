@@ -370,7 +370,11 @@ def _task_ids_from_claim(claim: Claim) -> list[UUID]:
 
 
 def cascade_strike_to_approvers(
-    conn: psycopg.Connection, claim: Claim, triggering_claim_id: UUID
+    conn: psycopg.Connection,
+    claim: Claim,
+    triggering_claim_id: UUID,
+    *,
+    originating_identity: Optional[str] = None,
 ) -> list[str]:
     """Strike the identities that approved a task a fabricated claim references.
 
@@ -385,7 +389,10 @@ def cascade_strike_to_approvers(
     - ``agent_id`` may be NULL (e.g. the internal auto-approve path in
       :func:`runtime.tasks.complete_task` records no agent); such hops cannot be
       attributed and are skipped rather than guessed.
-    - The originating identity itself (already struck) is not double-struck here.
+    - The ``originating_identity`` (already struck for the fabrication itself) is
+      EXCLUDED from the cascade, so an identity that both originated the claim and
+      approved its task earns exactly ONE strike + ONE ``comms.fabrication_detected``
+      for that claim (no double-count in the fabrication-rate telemetry).
     - Fail-closed on read error: returns what it could derive, never crashes.
     Returns the list of identities struck by the cascade.
     """
@@ -404,6 +411,8 @@ def cascade_strike_to_approvers(
                     (tid,),
                 )
                 approvers.update(r["agent_id"] for r in cur.fetchall())
+        # The originator was already struck for the fabrication — never double-strike.
+        approvers.discard(originating_identity)
         if not conn.autocommit:
             conn.commit()
     except Exception as exc:  # noqa: BLE001 - best-effort, never crash the gate
@@ -502,7 +511,8 @@ def relay_claims(
                                    verified_by=GATE_IDENTITY, reason=verdict.reason)
             record_strike(conn, originating_identity, claim_id=cid,
                           kind=STRIKE_FABRICATION, detail=verdict.reason)
-            cascaded = cascade_strike_to_approvers(conn, claim, cid)
+            cascaded = cascade_strike_to_approvers(
+                conn, claim, cid, originating_identity=originating_identity)
             results.append({"claim_id": str(cid), "status": VERIFICATION_REJECTED,
                             "sent": False, "cascade_struck": cascaded})
 

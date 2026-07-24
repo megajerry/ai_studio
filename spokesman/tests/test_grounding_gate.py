@@ -234,6 +234,38 @@ def test_verifier_chain_cascade_strikes_the_approver(conn, ws, ident):
     assert is_relay_allowed(conn, reviewer) is False
 
 
+def test_cascade_does_not_double_strike_originator(conn, ws, ident):
+    """Regression (F1): an identity that is BOTH the claim's originator AND the
+    task's approver must earn exactly ONE strike + ONE comms.fabrication_detected
+    for that claim — never a double-count via the verifier-chain cascade."""
+    # The SAME identity approves the task AND later fabricates a claim about it.
+    t = enqueue_task(conn, workstream=ws, type="work.demo", payload={})
+    grab_task(conn, worker_id="w-gate", workstream=ws)
+    start_task(conn, t.id, "w-gate")
+    transition(conn, t.id, TaskStatus.READY_FOR_REVIEW)
+    transition(conn, t.id, TaskStatus.APPROVED, agent_id=ident, agent_type="reviewer")
+
+    assert is_relay_allowed(conn, ident) is True
+    notifier, _ = _notifier()
+    # Fabricate: the task is 'approved', the claim asserts 'merged' → contradiction.
+    claim = Claim(statement="task fully merged and shipped",
+                  evidence=[EvidenceRef(kind=EvidenceKind.TASK,
+                                        locator=f"task:{t.id}", expected="merged")])
+    result = relay_claims(conn, notifier, kind="inform",
+                          originating_identity=ident, claims=[claim])
+
+    assert result["fabrication"] is True
+    # The originator is NOT in the cascade set (it was already struck directly).
+    assert ident not in result["claims"][0]["cascade_struck"]
+    # Exactly ONE strike — not two.
+    assert get_trust(conn, ident).strikes == 1
+    # Exactly ONE comms.fabrication_detected event for this claim.
+    cid = result["claims"][0]["claim_id"]
+    fab = [e for e in _events_for_claim(conn, cid)
+           if e.type == EVENT_COMMS_FABRICATION_DETECTED]
+    assert len(fab) == 1
+
+
 def test_revoked_identity_cannot_relay(conn, ws, ident):
     t = _merged_task(conn, ws)
     notifier, client = _notifier()
