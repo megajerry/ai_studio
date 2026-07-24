@@ -945,6 +945,27 @@ class ReplanResult(BaseModel):
     missing: bool = False
 
 
+def _stuck_trajectory_id(conn: Any, task_id: UUID) -> Optional[UUID]:
+    """Read a task's linked ``trajectory_id`` (a DB column not on the Task model).
+
+    Observe-only + degrade-safe (ADR-0017/0020): the trajectory link is used purely
+    for outcome attribution, so any failure (no conn / fake seam / DB blip) returns
+    ``None`` and the replan proceeds unlinked — it is NEVER load-bearing.
+    """
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT trajectory_id FROM tasks WHERE id = %s", (task_id,))
+            row = cur.fetchone()
+        if not getattr(conn, "autocommit", True):
+            conn.commit()
+        return row["trajectory_id"] if row else None
+    except Exception:  # pragma: no cover - defensive: attribution is never load-bearing
+        log.warning("replan: could not read trajectory_id for %s; proceeding unlinked", task_id)
+        return None
+
+
 def _replan_goal(stuck: Task) -> str:
     """The goal to re-decompose: the stuck task's own spec (payload), else default."""
     payload = stuck.payload or {}
@@ -1098,7 +1119,8 @@ def run_pm_replan(
     order = _topo_order(edges)  # prerequisites first, so their ids exist on enqueue
 
     # Inherit the original's trajectory for outcome attribution (ADR-0020) when set.
-    traj_link = {"trajectory_id": stuck.trajectory_id} if stuck.trajectory_id else {}
+    traj_id = _stuck_trajectory_id(conn, stuck_task_id)
+    traj_link = {"trajectory_id": traj_id} if traj_id else {}
     id_by_index: dict[int, str] = {}
     for i in order:
         item = items[i - 1]
