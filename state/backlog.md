@@ -97,17 +97,25 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0022.
 
 - **Self-healing recovery ladder (ADR-0023)** — R1 (nudge+grace → re-kick →
   no-progress `task.stuck` escalation → abandon; progress detector; `model.call.failed`
-  reason capture) in review; R2 = PM consumes `task.stuck` → re-decompose the stuck
-  task into smaller DAG subtasks; R3 = failure-pattern → propose durable fix →
-  verify on real traffic (experiment primitive).
-- **Skill induction + dual-source learning (design, research-first)** — PM-led prior-art
-  study underway before designing. Direction (to become an ADR when the design lands):
-  the learning loop should be **dual-source — Retro (internal episodes) + Research
-  (external prior art)**, not Retro alone; and **skills** should capture *matured,
-  efficient procedures* (crystallized from recurring trajectory patterns, proposed for
-  review per ADR-0008, never auto-adopted), with an **efficacy feedback loop** measuring
-  a skill's effect on iterations / #agents / search-tool calls / input tokens per outcome
-  → keep/tune/retire. Possibly hierarchical (skill trees) if prior art supports it.
+  reason capture) **MERGED**. In flight: R2 = PM consumes `task.stuck` → re-decompose the
+  stuck task into smaller DAG subtasks (bounded replan depth → 🛑); R3 = failure-pattern
+  detector → propose durable fix (reviewable candidate) → verify on real traffic
+  (experiment primitive).
+- **Skill induction + dual-source learning** — prior-art research DONE (grounded brief;
+  closest analogues: Voyager, AWM, Anthropic Agent Skills, DreamCoder/DSPi/LATM verify-
+  before-admit). **Design decisions locked (2026-07-24):** learning is **dual-source —
+  Retro (internal) + Researcher (external, already drafts candidate skills)**; a **Skill
+  Curator** role induces from recurring+mature+efficient trajectory clusters and
+  **proposes a `reviewed:false` candidate** (Sourcing pattern, never mutates live);
+  **efficacy loop** via a new `skill.applied` attribution event → applied-cohort vs
+  baseline (iterations/#agents/search-tool calls/input tokens per outcome, n + Wilson CI),
+  **pooling across similar task_types** to reach n → keep/tune/retire; adoption =
+  propose→human-review PLUS a **narrow auto-adopt lane** (doc-only + shadow-eval +
+  Wilson-lower-bound gain at n≥30, behind its own ADR); **skill-trees DEFERRED** (adopt
+  intra-skill progressive disclosure now). Build phased: P0 `skill.applied` attribution →
+  P1 validate efficacy metric on existing skills → P2 Curator induction → P3 dual-source
+  convergence → P4 keep/tune/retire → P5 (deferred) hierarchy. ADR to be written with P0/P1.
+  **Queued behind R3** (both touch `runtime/quality.py`).
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
