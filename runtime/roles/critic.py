@@ -361,6 +361,7 @@ def run_critic(
         workstream_charter=charter,
         role_overlay=overlay,
         skills=selected,
+        budget_aware=True,
     )
     call_model(
         role="critic",

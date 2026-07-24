@@ -37,6 +37,13 @@ from .checkers import (
     marker_check,
     resolve_criterion,
 )
+from .capacity_steward import (
+    CapacityFlag,
+    CapacityReport,
+    capacity_steward_enabled,
+    recommend_action,
+    run_capacity_steward,
+)
 from .critic import (
     Concern,
     Critique,
@@ -73,6 +80,11 @@ __all__ = [
     "run_critic",
     "assess_concerns",
     "critic_decide",
+    "CapacityFlag",
+    "CapacityReport",
+    "run_capacity_steward",
+    "recommend_action",
+    "capacity_steward_enabled",
     "ExecutorResult",
     "run_executor",
     "VerifyResult",

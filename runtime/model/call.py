@@ -30,6 +30,7 @@ import time
 from typing import Any, Optional
 from uuid import UUID
 
+from ..budget import PURPOSE_NORMAL
 from ..enforce import EventSink, NullEventSink
 from ..models import make_event
 from ..event_types import EVENT_MODEL_CALL
@@ -77,6 +78,7 @@ def call_model(
     conn: Any = None,
     sink: Optional[EventSink] = None,
     workstream: str = "productivity",
+    purpose: str = PURPOSE_NORMAL,
     trace_id: Optional[str] = None,
     span_id: Optional[str] = None,
     force_dry_run: bool = False,
@@ -90,6 +92,13 @@ def call_model(
     ``task_id`` are both given, the call's total tokens are added to the task's
     ``spent_tokens``; without a ``conn`` the DB step is simply skipped, so the
     wrapper is fully usable with no database.
+
+    ``purpose`` (``normal`` (default) | ``wind_down`` | ``escalation``) is threaded
+    into :func:`runtime.budget.enforce`: the graduated engine (ADR-0022 C1) permits
+    a ``wind_down`` / ``escalation`` call to spend the reserve buffer near the cap
+    while withholding a ``normal`` one, so a role that is winding down / escalating
+    for more budget can still act BEFORE breaching. Existing callers omit it and get
+    ``normal`` — behavior-preserving.
     """
     if registry is None:
         registry = load_registry()
@@ -123,6 +132,7 @@ def call_model(
             workstream,
             est_usd=est_usd,
             est_tokens=est_tokens,
+            purpose=purpose,
             role=role,
             task_id=task_id,
             sink=sink,

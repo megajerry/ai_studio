@@ -21,6 +21,7 @@ from .bootstrap import BootstrapResult, bootstrap_workstream
 from .checkers import BUILTIN_CHECKERS, register_checker, video_audit
 from .config import (
     BudgetSpec,
+    CapacityStewardSpec,
     MemorySeedItem,
     SkillsSpec,
     WorkstreamConfig,
@@ -36,6 +37,7 @@ __all__ = [
     "WorkstreamConfig",
     "WorkstreamConfigError",
     "BudgetSpec",
+    "CapacityStewardSpec",
     "SkillsSpec",
     "MemorySeedItem",
     "config_path",

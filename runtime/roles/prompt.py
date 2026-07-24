@@ -14,11 +14,15 @@ clearly-delimited section (context discipline, ADR-0013):
 1. **shared role base** — the platform's persona for the role (unchanged);
 2. **workstream charter** — the vertical's mission / operating context (config);
 3. **per-role overlay** — the vertical's specialization of *this* role (config);
-4. **skills** — the relevant, REVIEWED on-demand skills (ADR-0008), reusing
+4. **budget awareness** — proactive capacity self-management (ADR-0022 C2 /
+   ADR-0013), injected only when ``budget_aware=True``: compact/checkpoint at
+   warn/throttle, wind down or escalate 🛑 at reserve BEFORE breaching. Fixed
+   platform text (never enforces; the engine does), off by default;
+5. **skills** — the relevant, REVIEWED on-demand skills (ADR-0008), reusing
    :func:`runtime.skills.compose_prompt` verbatim;
-5. **lessons** — the durable lessons prior retros distilled + this role recalled
+6. **lessons** — the durable lessons prior retros distilled + this role recalled
    (ADR-0003), reusing :func:`runtime.roles.lessons.compose_lessons` verbatim;
-6. **task specifics** — extra per-task context a vertical wants appended.
+7. **task specifics** — extra per-task context a vertical wants appended.
 
 **Behavior-preserving default.** With no charter, overlay, or task, and the same
 skills/lessons the role passed before, the output is *identical* to the previous
@@ -52,6 +56,31 @@ _OVERLAY_NOTE = (
 _TASK_HEADER = "### Task (the specific work in front of you)"
 _TASK_NOTE = "Concrete context for the task you are acting on right now."
 
+#: Proactive budget self-management (ADR-0022 C2 / ADR-0013). Additive, bounded
+#: guidance layered so EVERY role manages its own capacity BEFORE the deterministic
+#: engine has to block it. It is behavior text only — the actual gate is
+#: :func:`runtime.budget.enforce` (the engine), and raising a ceiling stays a 🛑
+#: PM/stakeholder decision (ADR-0006). Off by default (behavior-preserving); roles
+#: opt in via ``budget_aware=True``.
+_BUDGET_HEADER = "### Budget awareness (manage your own capacity — ADR-0022 / ADR-0013)"
+_BUDGET_NOTE = (
+    "The studio is budget-bounded: each workstream runs under a ceiling and every "
+    "model call is metered against graduated zones (ok -> warn -> throttle -> "
+    "reserve -> over). Watch your own burn and react EARLY, before the engine has "
+    "to block you."
+)
+_BUDGET_BODY = (
+    "- warn / throttle: you are approaching the cap. COMPACT your context "
+    "(summarize + drop stale detail, ADR-0013) and checkpoint your progress so a "
+    "wind-down or handoff loses nothing.\n"
+    "- reserve: the buffer near the cap is spendable ONLY to wind down or escalate. "
+    "Finish or safely park the task, then — if you genuinely need more — ESCALATE "
+    "for more budget (a 🛑 PM/stakeholder decision, ADR-0006) BEFORE you breach. "
+    "Never try to raise your own ceiling.\n"
+    "- You cannot enforce or override the budget; the engine does that. Your job is "
+    "to spend deliberately and stop cleanly."
+)
+
 
 def _section(prompt: str, header: str, note: str, body: str) -> str:
     """Append one bounded, clearly-delimited section to ``prompt``.
@@ -74,6 +103,7 @@ def compose_role_prompt(
     skills: Optional[Sequence[Skill]] = None,
     lessons: Optional[Sequence[str]] = None,
     task: Optional[str] = None,
+    budget_aware: bool = False,
     allow_unreviewed: bool = False,
 ) -> str:
     """Assemble a role's full prompt from its layers (see the module docstring).
@@ -85,7 +115,10 @@ def compose_role_prompt(
     reviewed subset is injected (:func:`runtime.skills.compose_prompt`), unless
     ``allow_unreviewed``. ``lessons`` is the ALREADY-RECALLED lesson texts
     (:func:`runtime.roles.lessons.recall_lesson_texts`). ``task`` is optional extra
-    per-task context.
+    per-task context. ``budget_aware`` (default ``False`` → omitted,
+    behavior-preserving) injects the fixed proactive budget self-management section
+    (ADR-0022 C2) so a role compacts/checkpoints and winds-down/escalates BEFORE the
+    deterministic engine has to block it.
 
     With every optional layer absent the exact ``role_base`` is returned unchanged.
     Each present layer is added in a bounded, delimited section reusing the same
@@ -95,6 +128,8 @@ def compose_role_prompt(
     prompt = role_base
     prompt = _section(prompt, _CHARTER_HEADER, _CHARTER_NOTE, workstream_charter or "")
     prompt = _section(prompt, _OVERLAY_HEADER, _OVERLAY_NOTE, role_overlay or "")
+    if budget_aware:
+        prompt = _section(prompt, _BUDGET_HEADER, _BUDGET_NOTE, _BUDGET_BODY)
     if skills:
         prompt = compose_prompt(prompt, list(skills), allow_unreviewed=allow_unreviewed)
     if lessons:
