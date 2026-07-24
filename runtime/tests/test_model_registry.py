@@ -50,6 +50,27 @@ def test_tiers_are_assigned():
     assert reg.get("text-embedding-005").tier is Tier.EMBEDDING
 
 
+def test_cursor_is_coding_tier_flat_rate_only():
+    reg = load_registry()
+    cursor = reg.get("cursor-composer")
+    assert cursor is not None
+    assert cursor.provider == "cursor-cli"
+    assert cursor.tier is Tier.CODING
+    # Flat-rate Ultra: no per-token marginal cost modelled in the registry.
+    assert cursor.price_in == 0.0 and cursor.price_out == 0.0
+    # It appears ONLY in the coding tier's chain — never cheap/classify/embed.
+    for tier in (Tier.CHEAP, Tier.MID, Tier.PM, Tier.EMBEDDING):
+        assert "cursor-composer" not in reg.policy.candidates(tier)
+    assert reg.policy.candidates(Tier.CODING)[0] == "cursor-composer"
+    # The coding chain carries a metered fallback after the flat-rate substrate.
+    assert "claude-opus-4.8" in reg.policy.candidates(Tier.CODING)
+
+
+def test_coding_tier_downshifts_to_mid():
+    reg = load_registry()
+    assert reg.policy.cheaper_tier(Tier.CODING) is Tier.MID
+
+
 def test_cost_usd_is_tokens_times_registry_price():
     reg = load_registry()
     opus = reg.get("claude-opus-4.8")  # 5 / 25 per 1M

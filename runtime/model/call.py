@@ -35,9 +35,16 @@ from ..enforce import EventSink, NullEventSink
 from ..models import make_event
 from ..event_types import EVENT_MODEL_CALL
 from ..policy import BudgetContext
-from .providers import Completion, DryRunProvider, Message, Provider, get_adapter
+from .providers import (
+    Completion,
+    DryRunProvider,
+    Message,
+    Provider,
+    ProviderFallback,
+    get_adapter,
+)
 from .registry import ModelSpec, Registry, Usage, cost_usd, load_registry
-from .router import route
+from .router import next_candidate, route
 
 #: The instrumented model-call event type (``model.call``, ADR-0012) is imported
 #: from the canonical :mod:`runtime.event_types`.
@@ -141,9 +148,23 @@ def call_model(
     # 3. select provider (dry-run if forced / no adapter / no key).
     provider = select_provider(spec, force_dry_run=force_dry_run)
 
-    # 4. complete, timing the call for latency telemetry.
+    # 4. complete, timing the call for latency telemetry. If the provider signals
+    #    a recoverable failure (ProviderFallback — e.g. the Cursor CLI hangs and
+    #    hits its timeout), walk the routed tier's data-driven chain to the next
+    #    present model (a metered fallback) and retry there ONCE, so coding/agentic
+    #    work is never blocked on the flat-rate substrate. This is pure provider
+    #    dispatch: routing/cost/budget accounting below still use the model that
+    #    actually served the call.
     start = time.monotonic()
-    completion = provider.complete(spec.id, messages, **opts)
+    try:
+        completion = provider.complete(spec.id, messages, **opts)
+    except ProviderFallback:
+        fallback = next_candidate(registry, spec.tier, spec.id)
+        if fallback is None:
+            raise
+        spec = fallback
+        provider = select_provider(spec, force_dry_run=force_dry_run)
+        completion = provider.complete(spec.id, messages, **opts)
     latency_ms = int((time.monotonic() - start) * 1000)
 
     # 4. cost = tokens × registry price (single source of cost truth).

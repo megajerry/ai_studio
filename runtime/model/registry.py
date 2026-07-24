@@ -46,12 +46,15 @@ class Tier(str, Enum):
     Named for the role they serve rather than the ADR's 🟢/🟡 approval tiers
     (those gate *actions*, not model choice). ``PM`` = premium/planner,
     ``MID`` = everyday executor, ``CHEAP`` = classify/route/high-volume,
-    ``EMBEDDING`` = vector embeddings (a separate axis — no generation).
+    ``CODING`` = long-horizon agentic code generation (the executor-substrate
+    tier — where a flat-rate coding harness like Cursor lives, docs/cost-model.md
+    §7), ``EMBEDDING`` = vector embeddings (a separate axis — no generation).
     """
 
     PM = "pm"
     MID = "mid"
     CHEAP = "cheap"
+    CODING = "coding"
     EMBEDDING = "embedding"
 
 

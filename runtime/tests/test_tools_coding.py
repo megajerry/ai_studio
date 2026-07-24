@@ -121,6 +121,52 @@ def test_default_worker_cmd_is_opencode(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# per-worker command SHAPE (opencode 'run' vs cursor-agent '-p ... json')
+# --------------------------------------------------------------------------- #
+
+def test_opencode_command_shape_unchanged():
+    # The default opencode convention must still be `run <goal>`.
+    assert CodingTool(worker_cmd="opencode").build_command("build a landing page") == (
+        "opencode run 'build a landing page'"
+    )
+
+
+def test_cursor_agent_command_shape():
+    # cursor-agent takes the goal via `-p` and emits JSON (its non-interactive,
+    # agent-harness form) — the goal stays a single shell-quoted argument.
+    cmd = CodingTool(worker_cmd="cursor-agent").build_command("scaffold a REST API")
+    assert cmd == "cursor-agent -p 'scaffold a REST API' --output-format json"
+
+
+def test_cursor_agent_goal_is_shell_quoted_single_argument():
+    cmd = CodingTool(worker_cmd="cursor-agent").build_command("make $(rm -rf /) safe")
+    assert cmd == "cursor-agent -p 'make $(rm -rf /) safe' --output-format json"
+
+
+def test_cursor_agent_runs_inside_sandbox_with_json_shape():
+    sb = _FakeSandbox()
+    r = CodingTool(sandbox=sb, worker_cmd="cursor-agent").execute(
+        goal="ship it", workspace="/scratch/ws"
+    )
+    assert r.ok is True
+    assert sb.ran == ["cursor-agent -p 'ship it' --output-format json"]
+
+
+def test_cursor_agent_swappable_via_env(monkeypatch):
+    monkeypatch.setenv("CODING_WORKER_CMD", "cursor-agent")
+    sb = _FakeSandbox()
+    tool = CodingTool(sandbox=sb)
+    assert tool.worker_cmd == "cursor-agent"
+    tool.execute(goal="ship")
+    assert sb.ran == ["cursor-agent -p ship --output-format json"]
+
+
+def test_unknown_worker_falls_back_to_run_shape():
+    # A CLI with no registered template uses the opencode `run` convention.
+    assert CodingTool(worker_cmd="gemini-cli").build_command("ship") == "gemini-cli run ship"
+
+
+# --------------------------------------------------------------------------- #
 # env allowlist — no host secrets leak (reuses the sandbox's env handling)
 # --------------------------------------------------------------------------- #
 

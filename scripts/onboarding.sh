@@ -58,6 +58,13 @@ prompt_var OPENAI_API_KEY      "OpenAI API key"                    secret
 prompt_var GOOGLE_API_KEY      "Google (Gemini) API key"           secret
 prompt_var VOYAGE_API_KEY      "Voyage embeddings API key"         secret
 prompt_var EMBEDDINGS_PROVIDER "Embeddings provider (google|openai|voyage)" plain
+# Cursor is an executor SUBSTRATE + a guarded router adapter, not a keyed HTTP
+# provider: inference runs only via its agent-harness CLI (`cursor-agent -p ...`).
+# This key authenticates that CLI (coding worker + the cursor-cli router adapter).
+prompt_var CURSOR_API_KEY      "Cursor API key (agent-harness CLI; optional)" secret
+# Optional: swap the sandboxed coding worker CLI (default: opencode). Set to
+# `cursor-agent` to use Cursor as the coding worker. Non-secret config.
+prompt_var CODING_WORKER_CMD   "Coding worker CLI (opencode|cursor-agent; optional)" plain
 
 echo "== Stakeholder WhatsApp (Meta Cloud API) =="
 prompt_var WHATSAPP_PHONE_NUMBER_ID      "WhatsApp phone number ID"          plain
@@ -89,6 +96,7 @@ TMP="$(mktemp)"
   echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for k in AI_STUDIO_ENV \
            ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_API_KEY VOYAGE_API_KEY EMBEDDINGS_PROVIDER \
+           CURSOR_API_KEY CODING_WORKER_CMD \
            WHATSAPP_PHONE_NUMBER_ID WHATSAPP_BUSINESS_ACCOUNT_ID WHATSAPP_ACCESS_TOKEN \
            WHATSAPP_APP_SECRET WHATSAPP_VERIFY_TOKEN STAKEHOLDER_WHATSAPP_NUMBER \
            SPOKESMAN_API_TOKEN \
@@ -102,3 +110,8 @@ mv "$TMP" "$ENV_FILE"
 
 echo "Wrote $ENV_FILE (chmod 600). It is git-ignored — verify with: git check-ignore .env"
 echo "Done. Re-run anytime to add or rotate values."
+echo
+echo "Note: this onboarding runs fine in Cursor's local integrated terminal (it"
+echo "  just writes your local .env). Cursor *cloud* agents do NOT read this file —"
+echo "  inject CURSOR_API_KEY (and any other secret) via their Secrets UI instead;"
+echo "  never bake secrets into tracked files or agent config (ADR-0011)."

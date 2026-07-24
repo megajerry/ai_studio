@@ -85,6 +85,32 @@ def _first_available(registry: Registry, tier: Tier) -> Optional[ModelSpec]:
     return by_tier[0] if by_tier else None
 
 
+def next_candidate(
+    registry: Registry, tier: Tier, after_model_id: str
+) -> Optional[ModelSpec]:
+    """The next model in ``tier``'s chain AFTER ``after_model_id`` (runtime fallback).
+
+    Used by :func:`runtime.model.call.call_model` when a provider raises
+    :class:`~runtime.model.providers.base.ProviderFallback` (e.g. the Cursor CLI
+    times out): the routed model failed *at call time*, so we walk the same
+    data-driven tier chain to the next present model — a metered fallback — and
+    retry. Selection stays deterministic and rules-as-data (ADR-0005): the chain
+    order in the registry decides the fallback, not code. Returns ``None`` if the
+    failed model is last (or absent) in the chain — nothing left to fall to.
+    """
+    chain = registry.policy.candidates(tier)
+    seen = False
+    for model_id in chain:
+        if not seen:
+            if model_id == after_model_id:
+                seen = True
+            continue
+        spec = registry.get(model_id)
+        if spec is not None:
+            return spec
+    return None
+
+
 def route_decision(
     task_type: str,
     quality: str = "standard",

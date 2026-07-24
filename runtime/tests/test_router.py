@@ -5,10 +5,11 @@ from __future__ import annotations
 import pytest
 
 from runtime.enforce import MemoryEventSink
-from runtime.model.registry import Registry, Tier
+from runtime.model.registry import Registry, Tier, load_registry
 from runtime.model.router import (
     EVENT_MODEL_ROUTED,
     OverBudget,
+    next_candidate,
     route,
     route_decision,
 )
@@ -105,3 +106,45 @@ def test_route_emits_model_routed_event():
 def test_invalid_quality_rejected():
     with pytest.raises(ValueError):
         route_decision("plan", "ultra", registry=_registry())
+
+
+# --------------------------------------------------------------------------- #
+# Cursor coding/agentic tier routing + runtime fallback
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    "task_type,quality",
+    [("agentic", "high"), ("agentic", "standard")],
+)
+def test_coding_agentic_tasks_can_select_cursor(task_type, quality):
+    d = route_decision(task_type, quality, registry=_registry())
+    assert d.model.id == "cursor-composer"
+    assert d.tier is Tier.CODING
+
+
+@pytest.mark.parametrize(
+    "task_type,quality",
+    [
+        ("classify", "standard"),   # cheap
+        ("classify", "high"),       # mid
+        ("extract", "standard"),    # cheap
+        ("summarize", "standard"),  # cheap
+        ("embed", "standard"),      # embedding
+        ("plan", "high"),           # pm
+        ("code", "high"),           # pm (Opus) — one-shot coding stays off the Cursor harness
+    ],
+)
+def test_cheap_classify_embed_tiers_never_select_cursor(task_type, quality):
+    d = route_decision(task_type, quality, registry=_registry())
+    assert d.model.id != "cursor-composer"
+    assert d.tier is not Tier.CODING
+
+
+def test_next_candidate_walks_to_metered_fallback():
+    reg = _registry()
+    # After the flat-rate substrate fails, the next model in the coding chain is
+    # the metered fallback (Opus) — deterministic, rules-as-data.
+    nxt = next_candidate(reg, Tier.CODING, "cursor-composer")
+    assert nxt is not None and nxt.id == "claude-opus-4.8"
+    # Nothing left after the last id in the chain.
+    assert next_candidate(reg, Tier.CODING, "claude-opus-4.8") is None

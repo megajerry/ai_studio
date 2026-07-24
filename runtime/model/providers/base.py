@@ -20,6 +20,21 @@ from ..registry import Usage
 Message = dict[str, Any]
 
 
+class ProviderFallback(Exception):
+    """A provider could not serve this call — the caller should try the fallback.
+
+    Raised by an adapter (e.g. the subprocess-based
+    :class:`~runtime.model.providers.cursor_cli.CursorCliProvider` on a
+    timeout / non-zero exit / unparseable output) to signal a *recoverable*
+    failure: the call is NOT lost, it should be retried on the next model in the
+    routed tier's fallback chain (a metered model). The single instrumented call
+    site (:func:`runtime.model.call.call_model`) catches this in its provider-
+    dispatch step and walks to that fallback. It is deliberately distinct from a
+    hard :class:`RuntimeError` (a misconfiguration bug) so that only genuine
+    provider-unavailable conditions trigger a fallback rather than masking bugs.
+    """
+
+
 class Completion:
     """The result of one model call: generated text + token usage.
 

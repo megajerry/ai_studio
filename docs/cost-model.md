@@ -128,6 +128,19 @@ The executor tier is where most volume lands, so its substrate drives ROI:
   for a single power user driving lots of coding, this can beat metered by a wide
   margin: you escape per-token billing entirely. Often the **best $/throughput
   for a solo operator's executor/coding tier.**
+  - **Cursor (Ultra, $200/mo flat)** — integrated as the studio's coding/agentic
+    **executor substrate** + a guarded router adapter (`cursor-cli`). Marginal
+    per-token cost is **$0** under the flat rate, so the registry prices it at 0;
+    the $200 is a fixed monthly line item. **Honest caveats:** (1) Cursor has **no
+    raw HTTP inference endpoint** — inference is only reachable via its
+    **agent-harness CLI** (`cursor-agent -p <prompt> --output-format json`), which
+    is *heavier and slower than a plain completion* (it runs a full planning/tool
+    loop per call). (2) There is a known 2026 bug where `cursor-agent -p` can
+    **hang with no output**, so the adapter enforces a **hard timeout + automatic
+    fallback** to a metered model (never blocks the studio). (3) At $200/mo flat it
+    **~consumes the entire recommended ~$200/mo cap** on its own — run it as *the*
+    coding substrate, not alongside a second full-price executor budget. It
+    routes for the `coding` tier only (never cheap/classify/embed).
 - **Self-host / usage-rented GPU** — see below; marginal cost → ~0 at volume.
 
 ### Self-hosting (local & open-weight)

@@ -77,6 +77,25 @@ models:
     provenance: docs/cost-model.md
     provenance_date: "2026-07-21"
 
+  # Coding/agentic executor SUBSTRATE — Cursor via its agent-harness CLI
+  # (`cursor-agent -p <prompt> --output-format json`), NOT a raw HTTP inference
+  # endpoint (Cursor has none). Served by the `cursor-cli` subprocess adapter
+  # (runtime/model/providers/cursor_cli.py) with a hard timeout + fallback (the
+  # 2026 `cursor-agent -p` hang bug). Flat-rate Ultra ($200/mo, ADR-0011 /
+  # docs/cost-model.md §7): marginal per-token cost is $0, so price_in/out are 0
+  # (the $200 is a fixed monthly line item, not per-token). No CURSOR_API_KEY /
+  # dry-run -> the adapter returns a deterministic stub (keyless-green). Lives in
+  # the `coding` tier ONLY, so it is never selectable for cheap/classify/embed.
+  - id: cursor-composer
+    provider: cursor-cli
+    tier: coding
+    price_in: 0.0                     # flat-rate Ultra $200/mo — no per-token bill
+    price_out: 0.0
+    context_window: 200000
+    task_fit: [coding, agentic, executor-substrate, flat-rate]
+    provenance: docs/cost-model.md §7 (Cursor Ultra flat-rate; agent-harness CLI)
+    provenance_date: "2026-07-24"
+
   # Router / classifier / extraction / high-volume (cheap & fast).
   - id: claude-haiku-4.5
     provider: anthropic
@@ -122,10 +141,15 @@ routing:
       high: pm
       standard: pm
       low: mid
-    code:                # coding: premium for hard, mid/cheap otherwise.
-      high: pm
+    code:                # one-shot coding — quality/reliability first (NOT the Cursor
+      high: pm           # harness). Frontier one-shot coding -> Opus (fast, reliable).
       standard: mid
       low: cheap
+    agentic:             # long-horizon agentic code generation -> Cursor substrate
+                         # (opt-in via CURSOR_API_KEY; hard timeout + fallback to Opus).
+      high: coding
+      standard: coding
+      low: mid
     execute:             # general agentic execution.
       high: pm
       standard: mid
@@ -158,9 +182,15 @@ routing:
     low: cheap
 
   # tier -> ordered model-id preference (the fallback chain; first present wins).
+  # The `coding` chain puts the flat-rate Cursor substrate FIRST, with a metered
+  # model (Opus) as the automatic fallback: if the cursor-cli adapter times out /
+  # fails at runtime (the hang bug), the call wrapper walks to the next id here —
+  # so coding/agentic work is never blocked on Cursor. cursor-composer appears in
+  # NO other tier, so it can never be selected for cheap/classify/extract/embed.
   tiers:
     pm: [claude-opus-4.8, gemini-3.1-pro]
     mid: [claude-sonnet-5, gemini-3.5-flash, deepseek-v4.5]
+    coding: [cursor-composer, claude-opus-4.8]
     cheap: [claude-haiku-4.5, gemini-3.1-flash-lite]
     embedding: [text-embedding-005]
 
@@ -170,3 +200,4 @@ routing:
   downshift:
     pm: mid
     mid: cheap
+    coding: mid
