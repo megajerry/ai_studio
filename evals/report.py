@@ -49,6 +49,7 @@ def build_report(
     quality: Optional[dict],
     trajectory: Optional[dict] = None,
     grounding: Optional[dict] = None,
+    capacity: Optional[dict] = None,
 ) -> dict:
     """Combine the eval outputs into one report dict (+ generated-at stamp).
 
@@ -68,6 +69,7 @@ def build_report(
         "pm_structural_decomposition": pm,
         "pm_trajectory_decision_quality": trajectory,
         "grounding_fabrication_telemetry": grounding,
+        "capacity_telemetry": capacity,
         "telemetry_quality_report": quality,
     }
 
@@ -182,6 +184,25 @@ def render_markdown(report: dict) -> str:
             "with the Spokesman gate + real models."
         )
         lines.append(f"- passed: {g.get('passed')}")
+        lines.append("")
+
+    cap = report.get("capacity_telemetry")
+    if cap:
+        lines.append("## Capacity telemetry (budget engine)")
+        lines.append("")
+        lines.append(
+            f"- allocations scored: {cap.get('allocations_scored')} | "
+            f"zone counts: {cap.get('zone_counts')} | "
+            f"projected breaches: {cap.get('projected_breaches')}"
+        )
+        for r in cap.get("rates", []):
+            lines.append(_rate_line(r))
+        lines.append(
+            "- NOTE: measures the TELEMETRY mechanism over the merged budget engine "
+            "(a known capacity standing — zones, reserve headroom, projected breach — "
+            "recovered exactly); burn uses dry-run spend."
+        )
+        lines.append(f"- passed: {cap.get('passed')}")
         lines.append("")
 
     q = report.get("telemetry_quality_report")

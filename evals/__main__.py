@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 
 from . import report as report_mod
+from .capacity_eval import run_capacity_eval
 from .grounding_eval import run_grounding_eval
 from .pm_eval import run_pm_structural_eval
 from .stats import Rate, rate
@@ -70,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     pm = None
     trajectory = None
     grounding = None
+    capacity = None
     quality = None
     all_passed = verifier["passed"]
 
@@ -124,6 +126,21 @@ def main(argv: list[str] | None = None) -> int:
                   "fabrications are counted + rated correctly); end-to-end "
                   "fabrication-catch quality lands with the Spokesman gate + real models.")
 
+            # --- Capacity telemetry eval (needs DB) -------------------------
+            capacity_result = run_capacity_eval(conn)
+            capacity = capacity_result.to_dict()
+            print("\n=== Capacity telemetry eval (budget engine, dry-run) ===")
+            print(f"  seeded prefix={capacity['prefix']} (throwaway, cleaned up)")
+            print(f"  allocations={capacity['allocations_scored']} "
+                  f"zone_counts={capacity['zone_counts']} "
+                  f"projected_breaches={capacity['projected_breaches']}")
+            print(f"  passed={capacity['passed']}")
+            print("  rates (each with n + Wilson 95% CI):")
+            _print_rates(capacity_result.rates())
+            print("  NOTE: measures the TELEMETRY mechanism over the merged budget "
+                  "engine (a known capacity standing — zones, headroom, projected "
+                  "breach — is recovered exactly); burn uses dry-run spend.")
+
             # --- Telemetry quality rollup (needs DB) ------------------------
             from runtime.quality import quality_report
             quality = quality_report(conn, workstream=args.workstream)
@@ -142,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"avg_latency/completed_ms={quality['latency']['avg_latency_per_completed_task_ms']}")
 
             all_passed = (all_passed and pm["passed"] and trajectory["passed"]
-                          and grounding["passed"])
+                          and grounding["passed"] and capacity["passed"])
         finally:
             conn.close()
     else:
@@ -150,7 +167,8 @@ def main(argv: list[str] | None = None) -> int:
               "evals skipped; run against the live Postgres for those. Verifier eval "
               "above ran without a DB.)")
 
-    full = report_mod.build_report(verifier, pm, quality, trajectory, grounding)
+    full = report_mod.build_report(verifier, pm, quality, trajectory, grounding,
+                                   capacity)
     if args.json:
         Path(args.json).write_text(report_mod.to_json(full), encoding="utf-8")
         print(f"\nwrote JSON report -> {args.json}")
