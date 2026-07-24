@@ -563,6 +563,148 @@ def capacity_report(
     }
 
 
+def failure_report(
+    conn: psycopg.Connection,
+    workstream: Optional[str] = None,
+    *,
+    since_seq: Optional[int] = None,
+) -> dict:
+    """Failure telemetry rollup: WHAT is breaking, HOW OFTEN, and HOW SURE (ADR-0023).
+
+    Rolls the append-only event log up into the failure signal the R3 failure-pattern
+    detector reads to recognize a RECURRING failure and the fix-experiment reads to
+    judge a proposed fix on real traffic. Everything is derived from the immutable
+    events (``model.call.failed`` / ``task.rekicked`` / ``task.stuck`` /
+    ``task.transition`` / ``verify.*``) — no new capture, so it is replayable.
+
+    ``workstream=None`` spans ALL workstreams. ``since_seq`` (exclusive on the
+    monotonic ``events.seq`` cursor — the same idiom as
+    :func:`runtime.events.read_events`) scopes the rollup to events *after* a cursor,
+    so a fix experiment can measure only POST-FIX traffic (capture the cursor when the
+    fix is applied, then read the rate over what happened since). ``ts`` is NOT used
+    for the window because it is the transaction-start time (see migration 0004).
+
+    Returns (None-safe — every proportion is ``None`` on a zero denominator, never a
+    divide-by-zero, and each carries ``n`` + Wilson 95% CI + ``insufficient_sample``
+    via :func:`_rate_ci`):
+
+    - ``totals`` — raw counts (model calls ok/failed/total, rekicks, stucks, terminal
+      tasks, verify passed/failed).
+    - ``rates`` — ``model_call_error_rate`` (failed / all model calls),
+      ``rekick_rate`` (rekicks / terminal), and ``error_rate`` (matching
+      :func:`quality_report`: (abandoned + verify.failed) / all outcome signals).
+    - ``by_error_type`` — ``model.call.failed`` broken out by the body-free
+      ``error_type`` CLASS, each with its ``count`` and ``share`` = that class as a
+      proportion of ALL model calls (``_rate_ci`` over ``n`` = total calls) — the
+      per-class recurrence signal the detector fires on.
+    - ``by_stall_reason`` — ``task.stuck`` broken out by the ``stall_reason`` CODE,
+      each with its ``count`` and ``share`` = that reason as a proportion of terminal
+      tasks (``_rate_ci`` over ``n`` = terminal tasks).
+    """
+    params = {"ws": workstream, "since_seq": since_seq}
+    _window = "AND (%(since_seq)s::bigint IS NULL OR seq > %(since_seq)s::bigint)"
+    _ws = "(%(ws)s::text IS NULL OR workstream = %(ws)s::text)"
+    with conn.cursor() as cur:
+        # --- aggregate counts ------------------------------------------------
+        cur.execute(
+            f"""
+            SELECT
+              count(*) FILTER (WHERE type='model.call')            AS model_calls_ok,
+              count(*) FILTER (WHERE type='model.call.failed')     AS model_calls_failed,
+              count(*) FILTER (WHERE type='task.rekicked')         AS rekicks,
+              count(*) FILTER (WHERE type='task.stuck')            AS stucks,
+              count(*) FILTER (WHERE type='task.transition'
+                               AND payload->>'to'='merged')        AS merged,
+              count(*) FILTER (WHERE type='task.transition'
+                               AND payload->>'to'='abandoned')     AS abandoned,
+              count(*) FILTER (WHERE type='verify.passed')         AS verify_passed,
+              count(*) FILTER (WHERE type='verify.failed')         AS verify_failed
+            FROM events
+            WHERE {_ws} {_window}
+            """,
+            params,
+        )
+        agg = cur.fetchone()
+
+        # --- model.call.failed by error_type CLASS ---------------------------
+        cur.execute(
+            f"""
+            SELECT payload->>'error_type' AS error_type, count(*) AS n
+            FROM events
+            WHERE type='model.call.failed' AND {_ws} {_window}
+            GROUP BY payload->>'error_type'
+            ORDER BY n DESC, error_type
+            """,
+            params,
+        )
+        error_rows = cur.fetchall()
+
+        # --- task.stuck by stall_reason CODE ---------------------------------
+        cur.execute(
+            f"""
+            SELECT payload->>'stall_reason' AS stall_reason, count(*) AS n
+            FROM events
+            WHERE type='task.stuck' AND {_ws} {_window}
+            GROUP BY payload->>'stall_reason'
+            ORDER BY n DESC, stall_reason
+            """,
+            params,
+        )
+        stall_rows = cur.fetchall()
+    if not conn.autocommit:
+        conn.commit()
+
+    ok = int(agg["model_calls_ok"])
+    failed = int(agg["model_calls_failed"])
+    total_calls = ok + failed
+    rekicks = int(agg["rekicks"])
+    merged = int(agg["merged"])
+    abandoned = int(agg["abandoned"])
+    vp = int(agg["verify_passed"])
+    vf = int(agg["verify_failed"])
+    terminal = merged + abandoned
+
+    return {
+        "workstream": workstream,
+        "window": {"since_seq": since_seq},
+        "totals": {
+            "model_calls_ok": ok,
+            "model_calls_failed": failed,
+            "model_calls_total": total_calls,
+            "rekicks": rekicks,
+            "stucks": int(agg["stucks"]),
+            "tasks_terminal": terminal,
+            "verify_passed": vp,
+            "verify_failed": vf,
+        },
+        "rates": {
+            # Fraction of ALL model calls that died with a provider error — the
+            # headline API-error failure signal (n = total model calls).
+            "model_call_error_rate": _rate_ci(failed, total_calls),
+            "rekick_rate": _rate_ci(rekicks, terminal),
+            "error_rate": _rate_ci(abandoned + vf, terminal + vp + vf),
+        },
+        # Each error_type CLASS as a share of ALL model calls (n = total calls).
+        "by_error_type": [
+            {
+                "error_type": r["error_type"],
+                "count": int(r["n"]),
+                "share": _rate_ci(int(r["n"]), total_calls),
+            }
+            for r in error_rows
+        ],
+        # Each stall_reason CODE as a share of terminal tasks (n = terminal).
+        "by_stall_reason": [
+            {
+                "stall_reason": r["stall_reason"],
+                "count": int(r["n"]),
+                "share": _rate_ci(int(r["n"]), terminal),
+            }
+            for r in stall_rows
+        ],
+    }
+
+
 def quality_report(
     conn: psycopg.Connection, workstream: Optional[str] = None
 ) -> dict:
@@ -690,4 +832,8 @@ def quality_report(
         # workstream zone/spend/headroom/burn/projection + a studio-wide roll-up.
         # Spans ALL budgeted workstreams (not ws-filtered) → _global, None-safe.
         "capacity_global": capacity_report(conn),
+        # Failure telemetry (ADR-0023 R3): model.call.failed by error_type + task.stuck
+        # by stall_reason + failure rates, each proportion carrying n + Wilson CI + flag.
+        # Workstream-scoped like the counts above; None-safe on empty.
+        "failure": failure_report(conn, workstream),
     }

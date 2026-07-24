@@ -54,6 +54,14 @@ roles:
     - fs.write
     - net.fetch
 
+  # The Failure-pattern analyst (ADR-0023 R3) reads the event log and writes a
+  # REVIEWABLE durable-fix proposal via the filesystem tool (fs.write 🟡) — never a
+  # live code path. It proposes a fix + frames it as an experiment; it NEVER applies
+  # a fix and enqueues nothing. Least privilege: read + write (no net, no shell).
+  failure_analyst:
+    - fs.read
+    - fs.write
+
   # Writes code + commits; cannot delete or deploy. Dispatches a coding worker
   # (opencode) via the `coding` tool — code.run is 🔴, so the dispatch still
   # requires human approval and only ever runs inside the sandbox (architecture §14).
