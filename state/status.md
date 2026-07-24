@@ -7,7 +7,7 @@ _Updated: 2026-07-23. Pointers: **what's left** → [`backlog.md`](backlog.md);
 
 - **Platform complete & operating end-to-end (keyless, on a live Postgres).**
   Buildable backlog exhausted — only stakeholder-boundary items remain (below).
-- Verified: **721 tests pass, 0 skips** on a real Postgres; `python -m runtime.demo`
+- Verified: **732 tests pass, 0 skips** on a real Postgres; `python -m runtime.demo`
   runs 6 green acts (operate · learn · reviewer-guard · research · config-drives-vertical · critic-consensus).
 
 ## Capabilities (one line each; details in git log / docs)

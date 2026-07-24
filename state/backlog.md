@@ -75,11 +75,24 @@ ledger): one fabrication → permanent human-relay revocation + quarantine from
 `grab_task` + strike + 🚨 escalation + verifier-chain cascade; body-free `comms.*`/`trust.*`
 events; `COMMS_HUMAN_RELAY` capability; **fabrication-rate telemetry** (`quality.py`,
 n + Wilson CI) + measurability eval. Adversarially reviewed (26+ attacks, all caught) ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0021.
+**Capacity-governance foundation** (ADR-0022; migration 0013): deterministic
+graduated budget zones (warn→throttle→**reserve**→hard) in `runtime/budget.py` with
+a reserve buffer spendable only on `wind_down`/`escalation` (so a workstream keeps
+tokens to react/escalate before breach), two-level org+allocation ceiling,
+burn-rate projection; body-free `budget.warn/throttle/reserve` events; additive
+(NULL fracs = old hard cap) · onboarding/secrets · model shortlist + cost model ·
+ADRs 0001–0022.
 
 ## 🔄 In progress
 
-- _(nothing in flight)_
+- **Capacity governance C2/C3** — optional Capacity Steward role (config-driven) +
+  proactive budget self-management in role charters + `purpose`-tagging of calls +
+  capacity/burn telemetry + eval. (Foundation C1 merged.)
+- **Cursor integration** — cursor-agent as a coding-worker substrate + a *guarded*
+  router provider adapter (CLI `cursor-agent -p --output-format json`, hard timeout +
+  fallback for the known hang bug, not on cheap/classify tiers) + `CURSOR_API_KEY`
+  onboarding + Ultra plan in the cost model. (Cursor has NO raw HTTP inference
+  endpoint — verified; inference only via the agent harness.)
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
@@ -131,6 +144,13 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0021.
   for reformatting), reserving REJECTED-fabrication for a well-formed `expected` that
   genuinely contradicts source of truth. Higher priority than a nit given the maximal
   penalty. (ADR-0021 follow-up.)
+- **Test isolation under a polluted shared DB**: several worker/lifecycle tests
+  (e.g. `test_approvals_db` worker-block flow) assume a quiet queue and fail when the
+  shared ephemeral DB has many stray `up_for_grabs` tasks (grab-by-sort claims a
+  cross-workstream task). Product is correct; tests should scope the worker to their
+  own workstream or reset the DB per run. Surfaced 2026-07-23.
+- `burn_rate` per-minute rate can inflate when seeded `model.call` events share a
+  near-zero timestamp span (guard only covers <2 calls); non-blocking, `calls_to_exhaustion` unaffected. (ADR-0022 polish.)
 
 ## Context (from the PM audit, 2026-07-22)
 
