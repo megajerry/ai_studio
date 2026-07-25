@@ -34,6 +34,13 @@ from .inject import (
 from .loader import load_skill, parse_skill
 from .models import Skill, SkillError
 from .registry import DEFAULT_SELECT_LIMIT, SkillRegistry, default_root
+from .review_queue import (
+    Candidate,
+    PromoteResult,
+    adopt_fingerprint,
+    promote_candidate,
+    scan_candidates,
+)
 
 __all__ = [
     "Skill",
@@ -48,4 +55,10 @@ __all__ = [
     "emit_skill_applied",
     "filter_injectable",
     "Composition",
+    # Review queue + human-gated promote (ADR-0024 P3).
+    "Candidate",
+    "PromoteResult",
+    "scan_candidates",
+    "promote_candidate",
+    "adopt_fingerprint",
 ]
