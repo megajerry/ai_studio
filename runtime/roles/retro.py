@@ -44,6 +44,7 @@ from ..model.registry import Registry
 from ..models import Task, make_event
 from ..trajectory_worker import rotate_mined_trajectories
 from .critic import Critique
+from .curator import CURATOR_TASK_TYPES
 
 #: Role event (``retro.completed``): a retro distilled + stored N lessons for a
 #: target task. Imported from the canonical :mod:`runtime.event_types`.
@@ -53,6 +54,13 @@ RETRO_TASK_TYPE = "retro"
 
 #: Hard cap on lessons per retro — bounds reflection (ADR-0003), never a loop.
 MAX_LESSONS = 3
+
+#: The internal handoff type the Retro enqueues when it nominates a clean, first-pass
+#: WORK episode as a reusable procedure worth crystallizing (ADR-0024 P3 dual-source):
+#: it enqueues a ``curate`` task (queue-only, never a direct call — invariant 1) and
+#: the Curator then gates recurrence/maturity/efficiency over the whole cluster. This
+#: is the ONLY type a retro ever enqueues, so it cannot recurse into a retro-of-a-retro.
+CRYSTALLIZE_TASK_TYPE = CURATOR_TASK_TYPES[0]
 
 # Retro persona. The trail summary is PII-free (event-type counts only); the model
 # call is logged for traceability but does NOT decide the lessons.
@@ -110,6 +118,24 @@ def distill_lessons(
     return lessons[: max(1, max_lessons)]
 
 
+def _worth_crystallizing(
+    outcome: str, event_types: list[str], target_task_type: str
+) -> bool:
+    """Is this episode a candidate reusable WORK procedure worth crystallizing?
+
+    Pure + deterministic. A clean, FIRST-PASS work success (no failed verify, no
+    retry) is nominated to the Curator; a failed/retried episode is not a matured
+    procedure, and meta-episodes (retro / curate / research / …) are never
+    crystallized. The Retro only NOMINATES — the Curator gates recurrence + maturity
+    + efficiency over the whole cluster before proposing a candidate.
+    """
+    if outcome == "failed":
+        return False
+    if EVENT_VERIFY_FAILED in event_types or EVENT_WORK_RETRY in event_types:
+        return False
+    return str(target_task_type or "").startswith("work")
+
+
 class RetroResult(BaseModel):
     """What one retro produced (returned to the worker for the task result)."""
 
@@ -123,6 +149,10 @@ class RetroResult(BaseModel):
     #: The Critic's recommendation on the lessons, if a critic was consulted
     #: (``proceed`` / ``revise``); ``None`` when no critic was wired (ADR-0019).
     critic_recommendation: Optional[str] = None
+    #: True when the retro nominated this episode to the Curator (enqueued a
+    #: ``curate`` task, queue-only). ``curate_task_id`` is that task's id (id only).
+    crystallize_enqueued: bool = False
+    curate_task_id: Optional[str] = None
 
 
 def _target_trajectory_id(conn: Any, target_id: Any) -> Optional[str]:
@@ -178,6 +208,7 @@ def run_retro(
     model_registry: Optional[Registry] = None,
     max_lessons: int = MAX_LESSONS,
     critic: Optional[Callable[..., Critique]] = None,
+    enqueue: Optional[Callable[..., Any]] = None,
     add_lesson: Callable[..., Any] = _add_lesson,
     read: Callable[..., list] = read_events,
 ) -> RetroResult:
@@ -187,14 +218,23 @@ def run_retro(
     ``target_task_type`` / ``outcome``. Reads the target's event trail (falling back
     to the workstream trail), runs a traceability-only dry-run model call, distills
     up to ``max_lessons`` lessons, stores each in the Knowledge layer, and emits
-    ``retro.completed`` (count + task ref only — never lesson text). Never enqueues
-    another task (no retro-loop). ``add_lesson``/``read`` are injectable for tests.
+    ``retro.completed`` (count + task ref only — never lesson text). ``add_lesson`` /
+    ``read`` are injectable for tests.
 
     ``critic`` is the opt-in Critic consult (ADR-0019): when supplied (a
     :func:`runtime.roles.critic.run_critic`-shaped callable) it challenges the
     distilled lessons BEFORE they are stored — a single bounded, advisory consult
     that records the recommendation and emits ``critic.reviewed`` (counts only).
     With ``critic=None`` (default) the retro behaves exactly as before.
+
+    ``enqueue`` is the opt-in dual-source handoff (ADR-0024 P3): when supplied (an
+    :func:`runtime.tasks.enqueue_task`-shaped callable) and this episode is a clean,
+    first-pass WORK success (:func:`_worth_crystallizing`), the retro enqueues ONE
+    ``curate`` task (queue-only, invariant 1) nominating the episode to the Curator —
+    which then gates recurrence/maturity/efficiency before proposing a candidate. It
+    NEVER enqueues anything else (only ``curate``), so it cannot recurse into a
+    retro-of-a-retro. With ``enqueue=None`` (default) the retro enqueues nothing —
+    behavior-preserving.
     """
     sink = sink or NullEventSink()
     payload = task.payload or {}
@@ -283,6 +323,23 @@ def run_retro(
         if getattr(item, "id", None):
             lesson_ids.append(str(item.id))
 
+    # 3d. Dual-source handoff (ADR-0024 P3, opt-in): nominate a clean first-pass WORK
+    #     episode to the Curator by enqueuing ONE `curate` task (queue-only, invariant
+    #     1 — never a direct agent call). The Curator gates recurrence/maturity/
+    #     efficiency over the whole cluster before proposing a candidate. Only ever a
+    #     `curate` type is enqueued, so there is no retro-of-a-retro loop. Skipped when
+    #     no enqueue seam is wired (behavior-preserving).
+    curate_task_id: Optional[str] = None
+    if enqueue is not None and _worth_crystallizing(outcome, event_types, target_type):
+        curate_task = enqueue(
+            conn,
+            workstream=task.workstream,
+            type=CRYSTALLIZE_TASK_TYPE,
+            payload={"trigger": "retro", "target_task_type": target_type},
+            priority=task.priority,
+        )
+        curate_task_id = str(getattr(curate_task, "id", "")) or None
+
     # 4. Emit retro.completed — COUNT + task ref only, NEVER the lesson text.
     #    When the mined episode has an associated reasoning trajectory (the target
     #    task carries a trajectory_id, ADR-0020), include its id: this body-free
@@ -297,6 +354,9 @@ def run_retro(
     mined_traj_id = _target_trajectory_id(conn, target_id)
     if mined_traj_id is not None:
         payload["trajectory_id"] = mined_traj_id
+    # Only present when the retro actually nominated the episode (body-free id).
+    if curate_task_id is not None:
+        payload["curate_task_id"] = curate_task_id
     sink.emit(
         make_event(
             workstream=task.workstream,
@@ -313,4 +373,6 @@ def run_retro(
         lessons_count=len(lessons),
         lesson_ids=lesson_ids,
         critic_recommendation=critic_recommendation,
+        crystallize_enqueued=curate_task_id is not None,
+        curate_task_id=curate_task_id,
     )

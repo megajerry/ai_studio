@@ -182,6 +182,15 @@ EVENT_SKILL_APPLIED = "skill.applied"
 #: PROPOSAL only: ``reviewed`` is always false and ``auto_adopted`` always false —
 #: adopting a candidate is a separate, human-gated step (never auto-adopt here).
 EVENT_SKILL_PROPOSED = "skill.proposed"
+#: Emitted by the review-gate adoption (ADR-0024 P3, :func:`runtime.skills.review_queue
+#: .promote_candidate`) when a HUMAN-APPROVED candidate is adopted into the live
+#: ``skills/`` root with ``reviewed: true``. BODY-FREE: the payload carries ONLY the
+#: candidate slug + its source (``curator``/``researcher``) + the approving identity +
+#: the approval id + the reviewed/auto_adopted flags — NEVER the skill's instruction
+#: body (invariants 5 & 6). It is NEVER emitted without an approved request: promote
+#: pends on a real ``request_approval`` and adopts only on a consumed one-shot grant,
+#: so ``auto_adopted`` is always false (no auto-adopt lane here).
+EVENT_SKILL_ADOPTED = "skill.adopted"
 
 # --- Trajectory observability (runtime.trajectory) --------------------------
 #: The reasoning-trajectory writer (ADR-0020). These are BODY-FREE: payloads carry

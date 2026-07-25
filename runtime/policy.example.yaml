@@ -72,6 +72,16 @@ roles:
     - fs.read
     - fs.write
 
+  # The Skill Promoter (ADR-0024 P3) performs the human-gated ADOPTION of a reviewed
+  # candidate into the live skills/ root. The adopt WRITE is fs.write (🟡), but the
+  # adoption itself is 🔴: runtime.skills.review_queue.promote_candidate raises a real
+  # request_approval and writes NOTHING until a human-approved one-shot grant is
+  # consumed — so a candidate can never reach reviewed:true without human approval.
+  # Least privilege: read + write only.
+  skill_promoter:
+    - fs.read
+    - fs.write
+
   # Writes code + commits; cannot delete or deploy. Dispatches a coding worker
   # (opencode) via the `coding` tool — code.run is 🔴, so the dispatch still
   # requires human approval and only ever runs inside the sandbox (architecture §14).

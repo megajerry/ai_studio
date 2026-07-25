@@ -584,21 +584,29 @@ def _handle_retro(
     model_registry,
     heartbeat: Heartbeater,
     complete: Completer,
+    enqueue: Enqueuer,
     worker_id: str,
     run_retro: Callable[..., Any],
 ) -> RunResult:
     """Dispatch a ``retro`` task: distill + store lessons, then commit.
 
-    A retro NEVER enqueues another task (no ``enqueue`` seam is threaded here), so
-    the learning loop cannot recurse into a retro-of-a-retro.
+    The ``enqueue`` seam is threaded ONLY for the dual-source handoff (ADR-0024 P3):
+    when the retro judges the episode a clean, first-pass WORK success, it enqueues
+    ONE ``curate`` task nominating it to the Curator (queue-only, invariant 1). That
+    is the ONLY type a retro ever enqueues — it never enqueues another retro/work —
+    so the learning loop still cannot recurse into a retro-of-a-retro. The Curator
+    (which itself enqueues nothing) then gates recurrence/maturity/efficiency.
     """
     heartbeat(conn, task.id, worker_id)
-    result = run_retro(conn, task, sink, model_registry=model_registry)
+    result = run_retro(conn, task, sink, model_registry=model_registry, enqueue=enqueue)
     heartbeat(conn, task.id, worker_id)
     complete(conn, task.id, result=result.model_dump(), status=TaskStatus.MERGED)
+    detail = f"distilled {result.lessons_count} lesson(s)"
+    if result.crystallize_enqueued:
+        detail += f"; nominated to Curator (curate task {result.curate_task_id})"
     return RunResult(
         task_id=str(task.id), task_type=task.type, kind="retro",
-        outcome="done", detail=f"distilled {result.lessons_count} lesson(s)",
+        outcome="done", detail=detail,
     )
 
 
@@ -988,12 +996,14 @@ def run_once(
         )
 
     if task.type == RETRO_TASK_TYPE:
-        # A retro distills lessons from a finished episode. It never enqueues
-        # another task, so pm.tick / retro never trigger a retro (no loop).
+        # A retro distills lessons from a finished episode. It may enqueue ONE
+        # `curate` task (the dual-source handoff, ADR-0024 P3) nominating a clean
+        # first-pass WORK success to the Curator — never another retro/work — so
+        # pm.tick / retro still never trigger a retro (no retro-of-a-retro loop).
         return _handle_retro(
             conn, task, sink,
             model_registry=model_registry,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
+            heartbeat=heartbeat, complete=complete, enqueue=enqueue, worker_id=worker_id,
             run_retro=run_retro,
         )
 
