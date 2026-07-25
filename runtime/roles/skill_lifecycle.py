@@ -312,7 +312,11 @@ def run_skill_lifecycle(
     report = efficacy_report(conn, task.workstream)
     verdicts = compute_verdicts(
         report,
-        live_skills=set(live_paths) if skills is not None else None,
+        # ALWAYS pass a concrete live set (never None): an empty/None registry yields
+        # an empty set → NOTHING is judged. This upholds the "only LIVE (reviewed)
+        # skills are judged" invariant even by direct API — a candidate/unknown applied
+        # skill is never judged (never proposed for deprecation/revision).
+        live_skills=set(live_paths),
         min_sample=min_sample,
         efficiency_floor=efficiency_floor,
     )

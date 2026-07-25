@@ -398,6 +398,27 @@ def test_candidate_skill_not_judged_when_not_live(conn, ws, tmp_path):
     assert sink.types() == []
 
 
+@pytestmark_db
+@pytest.mark.parametrize("skills", [None, "empty"])
+def test_no_registry_judges_nothing_never_touches_candidate(conn, ws, tmp_path, skills):
+    # Regression: with NO skills registry (None) OR an EMPTY registry, NO skill is
+    # LIVE — so an applied CANDIDATE underperformer is NEVER judged and NO deprecation
+    # proposal / event is produced (upholds the "only LIVE skills judged" invariant
+    # even by direct API — not just via the worker's empty-registry path).
+    _seed_underperformer(conn, ws, "some-candidate")
+    sink = MemoryEventSink()
+    registry = None if skills is None else SkillRegistry([])
+    result = run_skill_lifecycle(
+        conn, _lifecycle_task(ws), sink,
+        tool_registry=_registry(tmp_path), policy=WRITE,
+        skills=registry, min_sample=30,
+    )
+    assert result.skills_judged == 0 and result.proposals_made == 0
+    assert result.proposals == []
+    assert sink.types() == []                             # nothing judged → nothing emitted
+    assert not (Path(tmp_path) / "proposals").exists()    # nothing written
+
+
 # ===========================================================================
 # Worker dispatch
 # ===========================================================================
