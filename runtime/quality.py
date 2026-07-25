@@ -60,7 +60,7 @@ real models are wired at go-live. See ``docs/evaluation.md``.
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import psycopg
 
@@ -967,6 +967,220 @@ def skill_efficacy_report(
         "pooling": {"method": SKILL_POOL_METHOD,
                     "min_trustworthy_sample": MIN_TRUSTWORTHY_SAMPLE},
         "skills_measured": len(by_skill),
+        "by_skill": by_skill,
+    }
+
+
+# ===========================================================================
+# Skill keep/tune/retire verdicts (ADR-0024 P4)
+# ===========================================================================
+#
+# Turns the P1 efficacy SIGNAL (``skill_efficacy_report``) into a per-live-skill
+# KEEP / TUNE(revise) / RETIRE verdict — the input a human-gated deprecation/revision
+# proposal reads. It is pure (takes the efficacy report dict, no DB) and reuses the
+# same Wilson-CI machinery as the rest of this module, so a verdict never fires on a
+# tiny/insufficient sample: a skill earns ``retire``/``revise`` ONLY when its applied
+# cohort shows NO benefit or a CONFIDENT degradation vs baseline, judged at
+# ``n ≥ MIN_TRUSTWORTHY_SAMPLE``. Everything else is ``keep``/``insufficient`` (never
+# retire on thin evidence — the statistical-rigor doctrine).
+
+#: The keep/tune/retire verdict vocabulary. ``revise`` == "tune": the skill isn't
+#: helping but isn't confidently harmful → propose a revision. ``retire`` == the
+#: applied cohort is CONFIDENTLY worse than baseline → propose deprecation.
+VERDICT_KEEP = "keep"
+VERDICT_REVISE = "revise"
+VERDICT_RETIRE = "retire"
+VERDICT_INSUFFICIENT = "insufficient"
+
+#: Strongest-concern order (most concerning first) for rolling the per-family
+#: verdicts up to ONE per-skill verdict: retire > revise > keep > insufficient.
+_VERDICT_SEVERITY = {
+    VERDICT_RETIRE: 0,
+    VERDICT_REVISE: 1,
+    VERDICT_KEEP: 2,
+    VERDICT_INSUFFICIENT: 3,
+}
+
+#: The three efficiency-delta keys (``applied_mean - baseline_mean``; NEGATIVE = the
+#: applied cohort explored LESS = the efficacy signal). Mirrors the P1 proxies.
+_EFFICIENCY_DELTA_KEYS = (
+    "iterations_mean",
+    "input_tokens_mean",
+    "tool_search_calls_mean",
+)
+
+#: An efficiency delta must be at least this far BELOW zero (applied mean lower than
+#: baseline by this margin) to count as a real exploration benefit on that axis.
+#: Counts (iterations / tokens / calls) are NOT proportions → no Wilson CI (mirroring
+#: :func:`_mean_stat`). Default ``0.0``: any strictly-negative delta is a benefit.
+DEFAULT_EFFICIENCY_FLOOR = 0.0
+
+
+def _ci_confidently_worse(applied_rate: dict, baseline_rate: dict) -> bool:
+    """Applied outcome-rate CI is CONFIDENTLY below baseline's (the CIs don't overlap).
+
+    True only when BOTH cohorts carry a Wilson 95% CI (:func:`_rate_ci` ``ci95``) and
+    the applied UPPER bound is below the baseline LOWER bound — the applied cohort's
+    best case is still worse than the baseline's worst case, so the applied-minus-
+    baseline degradation CI excludes ``≥0``. Reuses the per-proportion Wilson interval
+    already on each rate; no new statistics, None-safe on a missing CI."""
+    a, b = applied_rate.get("ci95"), baseline_rate.get("ci95")
+    return a is not None and b is not None and a[1] < b[0]
+
+
+def _ci_confidently_better(applied_rate: dict, baseline_rate: dict) -> bool:
+    """Mirror of :func:`_ci_confidently_worse`: applied CI LOWER > baseline CI UPPER
+    (the applied cohort is confidently BETTER on this outcome rate)."""
+    a, b = applied_rate.get("ci95"), baseline_rate.get("ci95")
+    return a is not None and b is not None and a[0] > b[1]
+
+
+def _family_lifecycle_verdict(
+    fam: dict, *, min_sample: int, efficiency_floor: float
+) -> dict:
+    """Keep/tune/retire verdict for ONE (skill, task_type family) cohort pair.
+
+    Judged from the P1 applied-vs-baseline block. Order (fail-safe → never retire on
+    thin evidence):
+
+    1. **insufficient** — the applied OR baseline first-pass-merge sample is below
+       ``min_sample``: not enough evidence to compare → NEVER retire/revise.
+    2. **retire** — the applied first-pass-merge CI is CONFIDENTLY below baseline's
+       (:func:`_ci_confidently_worse`): a degradation whose CI excludes ``≥0``.
+    3. **keep** — a real benefit shows: the applied cohort explored less on ≥1 axis
+       (delta below the floor) OR its first-pass-merge is confidently better.
+    4. **revise** — none of the above: a trustworthy sample with NO measurable
+       benefit (no exploration reduction, no outcome improvement) → propose a tune.
+    """
+    applied = fam["applied"]
+    baseline = fam["baseline"]
+    delta = fam["delta"]
+    fp_a = applied["first_pass_merge_rate"]
+    fp_b = baseline["first_pass_merge_rate"]
+    na, nb = int(fp_a["n"]), int(fp_b["n"])
+
+    # Exploration benefit: axes where applied explored at least `efficiency_floor`
+    # fewer units than baseline (delta < -floor). NEGATIVE delta = less exploration.
+    benefit_axes = [
+        k for k in _EFFICIENCY_DELTA_KEYS
+        if delta.get(k) is not None and delta[k] < -efficiency_floor
+    ]
+    better = _ci_confidently_better(fp_a, fp_b)
+
+    if na < min_sample or nb < min_sample:
+        verdict = VERDICT_INSUFFICIENT
+        reason = (
+            f"insufficient first-pass-merge sample (applied n={na}, baseline n={nb}; "
+            f"floor {min_sample}) — never retire/revise on thin evidence"
+        )
+    elif _ci_confidently_worse(fp_a, fp_b):
+        verdict = VERDICT_RETIRE
+        reason = (
+            f"first-pass-merge DEGRADED: applied {fp_a['rate']} (CI {fp_a['ci95']}, "
+            f"n={na}) confidently below baseline {fp_b['rate']} (CI {fp_b['ci95']}, "
+            f"n={nb}) — applied CI upper < baseline CI lower (degradation CI excludes ≥0)"
+        )
+    elif benefit_axes or better:
+        verdict = VERDICT_KEEP
+        parts = []
+        if benefit_axes:
+            parts.append(f"less exploration on {benefit_axes}")
+        if better:
+            parts.append("first-pass-merge confidently higher (CIs separated)")
+        reason = "benefit shown: " + " and ".join(parts)
+    else:
+        verdict = VERDICT_REVISE
+        eff = {k: delta.get(k) for k in _EFFICIENCY_DELTA_KEYS}
+        reason = (
+            "no measurable benefit at a trustworthy sample: no exploration reduction "
+            f"(deltas {eff} not below floor {efficiency_floor}) and first-pass-merge "
+            f"not confidently better than baseline (applied {fp_a['rate']} n={na} vs "
+            f"baseline {fp_b['rate']} n={nb})"
+        )
+    return {
+        "task_family": fam["task_family"],
+        "verdict": verdict,
+        "reason": reason,
+        "applied_first_pass_rate": fp_a["rate"],
+        "applied_first_pass_ci95": fp_a["ci95"],
+        "applied_n": na,
+        "baseline_first_pass_rate": fp_b["rate"],
+        "baseline_first_pass_ci95": fp_b["ci95"],
+        "baseline_n": nb,
+        "first_pass_delta": delta.get("first_pass_merge_rate"),
+        "efficiency_delta": {k: delta.get(k) for k in _EFFICIENCY_DELTA_KEYS},
+        "efficiency_benefit_axes": benefit_axes,
+        "min_sample": min_sample,
+        "efficiency_floor": efficiency_floor,
+    }
+
+
+def skill_lifecycle_verdicts(
+    report: dict,
+    *,
+    live_skills: Optional[Iterable[str]] = None,
+    min_sample: int = MIN_TRUSTWORTHY_SAMPLE,
+    efficiency_floor: float = DEFAULT_EFFICIENCY_FLOOR,
+) -> dict:
+    """Per-skill KEEP / TUNE(revise) / RETIRE verdict from a :func:`skill_efficacy_report`.
+
+    Pure + deterministic (takes the efficacy report dict; no DB). For each measured
+    skill it computes a :func:`_family_lifecycle_verdict` per task_type family and
+    rolls them up to ONE per-skill verdict = the STRONGEST CONCERN across families
+    (retire > revise > keep > insufficient), retaining the driving family + all
+    per-family detail. A skill earns ``retire``/``revise`` ONLY on a trustworthy
+    sample showing a confident degradation / no benefit; a tiny/insufficient sample is
+    ``insufficient`` (never retire on thin evidence).
+
+    ``live_skills`` restricts the judgment to LIVE (``reviewed:true``) skill names —
+    the lifecycle role passes the reviewed set so candidate/unknown applied skills are
+    NOT judged. ``None`` (default) judges every applied skill in the report. None-safe
+    on an empty report (``by_skill=[]``). Returns
+    ``{workstream, min_sample, efficiency_floor, verdicts (counts), skills_judged, by_skill}``.
+    """
+    live = None if live_skills is None else set(live_skills)
+    by_skill: list[dict] = []
+    for s in report.get("by_skill", []):
+        name = s["skill"]
+        if live is not None and name not in live:
+            continue  # judge only LIVE (reviewed) skills; skip candidates/unknown
+        fam_verdicts = [
+            _family_lifecycle_verdict(f, min_sample=min_sample,
+                                      efficiency_floor=efficiency_floor)
+            for f in s.get("by_task_family", [])
+        ]
+        if fam_verdicts:
+            # Strongest concern drives the per-skill verdict (stable tie-break on
+            # family name so the choice is deterministic).
+            driving = min(
+                fam_verdicts,
+                key=lambda fv: (_VERDICT_SEVERITY[fv["verdict"]], fv["task_family"]),
+            )
+            overall = driving["verdict"]
+            reason = driving["reason"]
+            driving_family = driving["task_family"]
+        else:
+            overall = VERDICT_INSUFFICIENT
+            reason = "no task_type family cohorts to judge"
+            driving_family = None
+        by_skill.append({
+            "skill": name,
+            "verdict": overall,
+            "reason": reason,
+            "driving_family": driving_family,
+            "applied_task_count": s.get("applied_task_count"),
+            "by_family": fam_verdicts,
+        })
+    by_skill.sort(key=lambda x: x["skill"])
+    return {
+        "workstream": report.get("workstream"),
+        "min_sample": min_sample,
+        "efficiency_floor": efficiency_floor,
+        "verdicts": {
+            v: sum(1 for x in by_skill if x["verdict"] == v)
+            for v in (VERDICT_RETIRE, VERDICT_REVISE, VERDICT_KEEP, VERDICT_INSUFFICIENT)
+        },
+        "skills_judged": len(by_skill),
         "by_skill": by_skill,
     }
 
