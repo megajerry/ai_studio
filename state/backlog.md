@@ -101,27 +101,24 @@ monolith → smaller DAG subtasks, bounded replan depth → 🛑) → abandon ba
 (`roles/failure_analyst.py`: fires only at n≥floor AND Wilson-lower-bound>threshold →
 proposes a reviewable durable fix, never auto-applies) → **verify-as-experiment** on real
 post-fix traffic; all body-free events, supervisor stays non-LLM ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0023.
+**Skill induction + dual-source learning** (ADR-0024; research-first, prior-art-grounded —
+Voyager/AWM/Agent-Skills/DreamCoder/DSPy/LATM): **P0** `skill.applied` attribution (body-free)
+· **P1** `quality.skill_efficacy_report` (applied-vs-baseline on iterations/tokens/tool+search
+calls/first-pass, task_type-family pooled, n + Wilson CI) — validated on existing skills first
+· **P2** Skill **Curator** (`roles/curator.py`: induces recurring+mature+efficient trajectory
+clusters → proposes a `reviewed:false` candidate; never mutates live) · **P3** dual-source
+convergence (`skills/review_queue.py`: one queue over Curator + Researcher candidates + Retro→
+Curator handoff) + **human-gated 🔴 promote** (adopt to live `skills/` `reviewed:true` only on
+an approved one-shot grant) · **P4** keep/tune/retire (`roles/skill_lifecycle.py`: applied-cohort
+efficacy verdict → reviewable deprecation/revision proposal, never auto-retires). Dual-source
+(Retro internal + Researcher external); statistically gated (n≥floor + Wilson bound); adoption
+= review-gate (narrow auto-adopt lane deferred to its own ADR); **P5 hierarchy/skill-trees
+DEFERRED** (intra-skill progressive disclosure adopted) ·
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
 
 ## 🔄 In progress
 
-- **Skill induction + dual-source learning** — prior-art research DONE (grounded brief;
-  closest analogues: Voyager, AWM, Anthropic Agent Skills, DreamCoder/DSPi/LATM verify-
-  before-admit). **Design decisions locked (2026-07-24):** learning is **dual-source —
-  Retro (internal) + Researcher (external, already drafts candidate skills)**; a **Skill
-  Curator** role induces from recurring+mature+efficient trajectory clusters and
-  **proposes a `reviewed:false` candidate** (Sourcing pattern, never mutates live);
-  **efficacy loop** via a new `skill.applied` attribution event → applied-cohort vs
-  baseline (iterations/#agents/search-tool calls/input tokens per outcome, n + Wilson CI),
-  **pooling across similar task_types** to reach n → keep/tune/retire; adoption =
-  propose→human-review PLUS a **narrow auto-adopt lane** (doc-only + shadow-eval +
-  Wilson-lower-bound gain at n≥30, behind its own ADR); **skill-trees DEFERRED** (adopt
-  intra-skill progressive disclosure now). Build phased: P0 `skill.applied` attribution →
-  P1 validate efficacy metric on existing skills → P2 Curator induction → P3 dual-source
-  convergence → P4 keep/tune/retire → P5 (deferred) hierarchy. **P0+P1 MERGED** (ADR-0024;
-  `skill.applied` attribution + `quality.skill_efficacy_report`, measure-first, no induction
-  yet). **P2 (Curator) is the next phase — checkpoint before building** (its induction value
-  is go-live-gated on real traffic).
+- _(nothing in flight)_
 
 ## 📋 Remaining — buildable now (no stakeholder input needed)
 
