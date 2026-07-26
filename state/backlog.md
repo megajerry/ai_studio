@@ -161,13 +161,9 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
   capability-drop risk). Now **base ∪ grants − explicit `policy_revocations`**:
   additive by default, deliberate scope-down via revocations (revocation wins,
   enforced at the gate). Least-privilege preserved; no capability regression.
-- Eval-harness auto-seeds throwaway `eval-traj-*` trajectory rows each run
-  (isolated, not in the telemetry rollup); wants periodic cleanup if run often.
-- Trajectory-writer in-repo concurrency test is sequential-interleaved (the
-  mechanism was proven race-free out-of-band with an 8-thread load); wants a
-  threaded regression test.
-- Ingest CLI could scrub/warn on non-synthetic example files (invariant documented;
-  shipped example is synthetic).
+- ✅ **RESOLVED (41e017d)** — evals/tests now tear down their own prefixed throwaway rows (`eval-traj-*`, `capws-*`) in a `finally`, scoped to their own prefix (never clobbers peers).
+- ✅ **RESOLVED (41e017d)** — added a real 8-thread × 12-step trajectory `seq` regression test (barrier-synced, separate connections; proven to fail if the `FOR UPDATE` lock is removed).
+- ✅ **RESOLVED (41e017d)** — ingest CLI now scans bodies + logs a warning on secret/PII-ish content (guard-rail, not enforcement — never blocks); synthetic example scans clean.
 - ✅ **RESOLVED (db70e39)** — Grounding gate false-positive fabrication risk: a
   malformed `expected` now → UNVERIFIABLE (proof requested, no strike), reserving
   fabrication for a well-formed `expected` that genuinely contradicts source of truth
@@ -190,9 +186,7 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
 - ✅ **RESOLVED (0586aba)** — Budget fallback pre-gate: a `ProviderFallback` retry is
   now re-gated against the FALLBACK spec's cost before running (a fallback that would
   breach the cap is blocked + 🛑, not run-then-accounted-post-hoc).
-- `test_quality_capacity_db.py` / some capacity tests seed prefixed rows with no
-  teardown (rely on unique-prefix isolation) → orphan rows accumulate in the shared
-  DB across runs. Add a fixture `finally` deleting `LIKE '<pfx>%'`. (Test-hygiene.)
+- ✅ **RESOLVED (41e017d)** — capacity test `pfx` fixture now deletes its own `capws-*` budgets + events on teardown.
 
 ## Context (from the PM audit, 2026-07-22)
 
