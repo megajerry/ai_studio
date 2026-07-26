@@ -156,7 +156,11 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
 - `state/status.md` should keep an evidence-based (command + count) status line.
 - ✅ **RESOLVED (0586aba)** — Budget pre-call USD estimate now prices output tokens
   too (was input-only → systematic under-count); `call.py` step-comment numbering fixed.
-- `effective_policy` REPLACE-not-union for a workstream's role grants (documented).
+- ✅ **RESOLVED (0868f39)** — `effective_policy` was an accidental REPLACE footgun
+  (docs said "merged"; example config had to re-list base caps to add one → silent
+  capability-drop risk). Now **base ∪ grants − explicit `policy_revocations`**:
+  additive by default, deliberate scope-down via revocations (revocation wins,
+  enforced at the gate). Least-privilege preserved; no capability regression.
 - Eval-harness auto-seeds throwaway `eval-traj-*` trajectory rows each run
   (isolated, not in the telemetry rollup); wants periodic cleanup if run often.
 - Trajectory-writer in-repo concurrency test is sequential-interleaved (the
@@ -167,11 +171,11 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
 - ✅ **RESOLVED (db70e39)** — Grounding gate false-positive fabrication risk: a
   malformed `expected` now → UNVERIFIABLE (proof requested, no strike), reserving
   fabrication for a well-formed `expected` that genuinely contradicts source of truth
-  (per-`EvidenceKind` validation in `spokesman/grounding_gate.py`). Minor open
-  follow-up: within a SINGLE `db_row` ref, a malformed column short-circuits before a
-  genuine contradiction on another field → UNVERIFIABLE (misses the strike) but still
-  WITHHOLDS the false claim (fails safe); optionally make a real contradiction take
-  precedence over a malformed sibling field within one ref.
+  (per-`EvidenceKind` validation in `spokesman/grounding_gate.py`). Follow-up also
+  RESOLVED (6a630c2): within a single `db_row` ref a genuine contradiction now beats a
+  malformed sibling field (evaluate all fields, contradiction-wins, order-independent),
+  so a lie bundled with a bogus column still takes the strike; an only-malformed ref
+  stays UNVERIFIABLE (honest mis-format still unpunished).
 - ✅ **RESOLVED (b867a62)** — Test isolation under a polluted shared DB: the suite
   already tolerates a polluted queue via per-test unique-workstream scoping (verified
   888 passing under 5280 stray `up_for_grabs`); 2 genuinely concurrency-flaky
