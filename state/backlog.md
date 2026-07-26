@@ -114,6 +114,17 @@ efficacy verdict → reviewable deprecation/revision proposal, never auto-retire
 (Retro internal + Researcher external); statistically gated (n≥floor + Wilson bound); adoption
 = review-gate (narrow auto-adopt lane deferred to its own ADR); **P5 hierarchy/skill-trees
 DEFERRED** (intra-skill progressive disclosure adopted) ·
+**Go-live readiness self-check** (`python -m runtime.readiness` / `make readiness`):
+6 real cold-start checks — imports+deps · migrations contiguous+apply-clean (isolated
+throwaway schema, no pollution) · demo green · **config/secret coverage** (AST-scans
+env-var reads incl. name-constant indirection, cross-checks `.env.example`+onboarding;
+FAILs on an undocumented secret, prints NAMES never values — already caught + fixed the
+undocumented TAVILY/EXA/BRAVE search keys) · compose/bootstrap coherence · host-required
++ stakeholder-boundary report; + `docs/go-live.md` runbook; enforces "a fresh clone must
+bootstrap" (CONTRIBUTING) · **Improvement sweep** (safety/reliability/correctness nits —
+grounding-gate false-positive, test isolation, budget accounting ×4, recall relevance
+floor, db_row strike-precedence, `effective_policy` union-vs-replace footgun, test/example
+hygiene — all resolved & evidence-reviewed) ·
 onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
 
 ## 🔄 In progress
