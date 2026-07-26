@@ -139,6 +139,17 @@ git clone <repo> && cd ai_studio
 ./bootstrap                 # start the M0 infra spine + health check (or: make up)
 ```
 
+**Before going live, run the cold-start readiness self-check** — it proves a
+fresh clone can actually bootstrap (imports, migrations apply cleanly, demo
+green, every env var the code reads is documented/collected, compose coherence):
+
+```bash
+python -m runtime.readiness   # or: make readiness  (exits non-zero on FAIL)
+```
+
+The ordered launch steps, pre-flight checklist, and stakeholder decisions live in
+the [go-live runbook](docs/go-live.md).
+
 M0 (the infra spine) is implemented; the supervisor and agent runtime arrive in
 later milestones. The **Spokesman WhatsApp channel (v1)** is implemented as an
 opt-in compose service — see the runbook

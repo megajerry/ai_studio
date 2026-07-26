@@ -1,7 +1,7 @@
 # AI Studio — convenience targets for the M0 infra spine.
 DC := $(shell if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi)
 
-.PHONY: help onboard up down restart ps logs health clean migrate test coverage evals
+.PHONY: help onboard up down restart ps logs health clean migrate readiness test coverage evals
 
 help:
 	@echo "AI Studio — targets:"
@@ -13,6 +13,7 @@ help:
 	@echo "  make logs      Tail logs"
 	@echo "  make health    Run the health check"
 	@echo "  make migrate   Apply runtime DB migrations (event log + task queue)"
+	@echo "  make readiness Cold-start readiness self-check (imports/migrations/demo/config/compose)"
 	@echo "  make test      Run the full test suite (runtime + spokesman + evals)"
 	@echo "  make coverage  Run the suite under coverage + print the report (needs pytest-cov)"
 	@echo "  make evals     Run the evaluation harness (Verifier P/R, PM structural, telemetry)"
@@ -41,6 +42,12 @@ health:
 
 migrate:
 	python -m runtime.migrate
+
+# Cold-start readiness self-check: does a fresh clone actually bootstrap? Runs
+# real checks (imports, migrations apply to a throwaway schema, demo green,
+# config/secret coverage, compose coherence) and exits non-zero on a FAIL.
+readiness:
+	python -m runtime.readiness
 
 test:
 	python -m pytest runtime/tests/ spokesman/tests/ evals/ -q
