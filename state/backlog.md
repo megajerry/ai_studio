@@ -152,8 +152,8 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
   embeddings land.
 - `find_grant`/read-path commit coupling on non-autocommit connections (harmless).
 - `state/status.md` should keep an evidence-based (command + count) status line.
-- Budget pre-call USD estimate uses input-only pricing (conservative under-count).
-- `call.py` budget step-comment numbering is off-by-one (cosmetic).
+- ✅ **RESOLVED (0586aba)** — Budget pre-call USD estimate now prices output tokens
+  too (was input-only → systematic under-count); `call.py` step-comment numbering fixed.
 - `effective_policy` REPLACE-not-union for a workstream's role grants (documented).
 - Eval-harness auto-seeds throwaway `eval-traj-*` trajectory rows each run
   (isolated, not in the telemetry rollup); wants periodic cleanup if run often.
@@ -178,12 +178,12 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
   multi-agent DB (clobbers concurrent runs' scoped rows + ACCESS-EXCLUSIVE startup
   stall). Real per-session schema/DB isolation remains a possible future upgrade if
   concurrent test runs ever need full independence.
-- `burn_rate` per-minute rate can inflate when seeded `model.call` events share a
-  near-zero timestamp span (guard only covers <2 calls); non-blocking, `calls_to_exhaustion` unaffected. (ADR-0022 polish.)
-- Budget pre-spend check runs against the *routed* spec; a Cursor→Opus runtime
-  fallback call serves on metered Opus but isn't pre-gated for that one call (cost
-  is accounted post-hoc, so spend catches up next call). Minor edge on the rare
-  hang-fallback path. (Cursor/ADR-0022 awareness.)
+- ✅ **RESOLVED (0586aba)** — `burn_rate` near-zero-span guard added (per-minute rate
+  falls back to the window denominator below `MIN_SPAN_MIN`; no more absurd rates;
+  per-call/exhaustion unaffected).
+- ✅ **RESOLVED (0586aba)** — Budget fallback pre-gate: a `ProviderFallback` retry is
+  now re-gated against the FALLBACK spec's cost before running (a fallback that would
+  breach the cap is blocked + 🛑, not run-then-accounted-post-hoc).
 - `test_quality_capacity_db.py` / some capacity tests seed prefixed rows with no
   teardown (rely on unique-prefix isolation) → orphan rows accumulate in the shared
   DB across runs. Add a fixture `finally` deleting `LIKE '<pfx>%'`. (Test-hygiene.)
