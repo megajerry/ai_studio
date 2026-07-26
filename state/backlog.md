@@ -124,7 +124,16 @@ undocumented TAVILY/EXA/BRAVE search keys) · compose/bootstrap coherence · hos
 bootstrap" (CONTRIBUTING) · **Improvement sweep** (safety/reliability/correctness nits —
 grounding-gate false-positive, test isolation, budget accounting ×4, recall relevance
 floor, db_row strike-precedence, `effective_policy` union-vs-replace footgun, test/example
-hygiene — all resolved & evidence-reviewed) ·
+hygiene — all resolved & evidence-reviewed) · **Proactive security audit + fix**
+(read-only adversarial audit of the capability-gating/approval boundary found a
+HIGH defect feature-reviews missed: 🔴 one-shot grants bound only to
+`(task_id,tool,caps)` → **bait-and-switch** (approve `delete harmless` → reuse to
+`delete secret`) + **cross-workstream grant reuse**; FIXED `b52d17a` by binding the
+fingerprint to a one-way **args-digest + workstream** (invariant-5-safe — hash, never
+raw values) — both exploits reproduced then verified CLOSED, args-digest survived
+collision/stability/serialization attacks; also fenced `quarantined` in
+`is_relay_allowed`. Rest of the boundary got a clean bill: fail-closed, true one-shot,
+tier mapping, secret non-leakage, `effective_policy`, revoked-on-grab all verified) ·
 onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
 
 ## 🔄 In progress
