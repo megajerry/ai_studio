@@ -106,6 +106,24 @@ honest "I couldn't verify this" is `unverifiable` (no strike); asserting a
 falsehood as verified fact is a fabrication (permanent revocation). The
 distinction is the whole point.
 
+**Follow-up (ill-formed `expected` is not fabrication).** The gate must
+distinguish "you lied" from "you wrote the evidence spec wrong". A contradiction
+(→ fabrication) is only declared against an `expected` the resolver can actually
+*interpret* as an assertion for its `EvidenceKind`: a **task** status must be a
+bare value from the canonical lifecycle set; a **db_row** `expected` must be
+`col=val` on a column that exists; a **metric** `expected` must be a numeric count
+(all whitelisted metrics are counts); a **file** `expected` must be a 64-char
+sha256 digest. If `expected` cannot be parsed as a valid assertion for the kind
+(wrong syntax — e.g. a `db_row`-style `status=merged` on a `task` — an unknown
+column, a non-status, a non-numeric metric, a non-hash file), the ref is
+**malformed** → the claim is `unverifiable` (withheld + `comms.proof_requested`,
+**no strike, no revocation**), never `rejected`. An honest agent that merely
+mis-formats its spec must not be branded a permanent fabricator; only a
+well-formed `expected` whose value genuinely contradicts the source of truth
+still triggers the zero-tolerance penalty. Implemented in
+`spokesman/grounding_gate.py` (`RefResolution.malformed`, per-kind `expected`
+validation) with the same fail-closed guarantees.
+
 ## Scope — what lands in S1 (this) vs later
 
 - **S1 (this track):** the foundation, additive and non-breaking — this ADR, the
