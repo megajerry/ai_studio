@@ -41,9 +41,20 @@ def conn():
 
 
 @pytest.fixture
-def pfx() -> str:
-    """A unique throwaway workstream prefix so each test asserts an exact shape."""
-    return f"capws-{uuid4().hex[:12]}"
+def pfx(conn) -> str:
+    """A unique throwaway workstream prefix so each test asserts an exact shape.
+
+    Tears down THIS test's own ``capws-*`` rows (budgets + seeded model.call events)
+    afterward so throwaway rows don't accumulate in the shared DB across runs.
+    Scoped strictly to its own prefix — never a global truncate."""
+    prefix = f"capws-{uuid4().hex[:12]}"
+    try:
+        yield prefix
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM budgets WHERE workstream LIKE %s", (f"{prefix}%",))
+            cur.execute("DELETE FROM events WHERE workstream LIKE %s", (f"{prefix}%",))
+        conn.commit()
 
 
 # --- seeding helpers --------------------------------------------------------

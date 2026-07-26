@@ -143,6 +143,20 @@ def seed_demo_trajectory(
     return tid
 
 
+def cleanup_trajectory_shape(conn: Any, workstream: str) -> None:
+    """Delete every throwaway row seeded under the ``eval-traj-*`` ``workstream``.
+
+    Mirrors :func:`evals.grounding_eval.cleanup_grounding_shape`: scoped to this
+    seeder's OWN workstream only (never a global truncate). Deleting the trajectory
+    cascades its ``trajectory_steps`` (``ON DELETE CASCADE``); the body-free
+    ``trajectory.*`` events emitted under the same workstream are removed too."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM trajectories WHERE workstream LIKE %s",
+                    (f"{workstream}%",))
+        cur.execute("DELETE FROM events WHERE workstream LIKE %s", (f"{workstream}%",))
+    conn.commit()
+
+
 def run_trajectory_eval(
     conn: Any,
     trajectory_id: Optional[UUID] = None,
@@ -150,30 +164,41 @@ def run_trajectory_eval(
     judge: Optional[Judge] = None,
     rubric: Optional[Rubric] = None,
     workstream: str = "eval-judge",
+    keep: bool = False,
 ) -> TrajectoryEvalResult:
     """Read a persisted PM trajectory and score its decision quality via the judge.
 
     ``trajectory_id=None`` seeds a demo trajectory first (so the harness always has
-    real state to score). Needs a live ``conn`` (reads the trajectory tables + the
-    judge's model.call telemetry lands through it); keyless via the dryrun judge."""
+    real state to score) — that throwaway ``eval-traj-*`` episode is deleted after
+    the run (unless ``keep=True``) so orphans don't accumulate in the shared DB. A
+    ``trajectory_id`` passed IN is left untouched (we didn't create it). Needs a
+    live ``conn`` (reads the trajectory tables + the judge's model.call telemetry
+    lands through it); keyless via the dryrun judge."""
+    seeded_ws: Optional[str] = None
     if trajectory_id is None:
-        trajectory_id = seed_demo_trajectory(conn)
-    traj = get_trajectory(conn, trajectory_id)
-    if traj is None:
-        raise ValueError(f"trajectory {trajectory_id} not found")
-    steps = list_steps(conn, trajectory_id)
+        seeded_ws = f"eval-traj-{uuid4().hex[:8]}"
+        trajectory_id = seed_demo_trajectory(conn, workstream=seeded_ws)
+    try:
+        traj = get_trajectory(conn, trajectory_id)
+        if traj is None:
+            raise ValueError(f"trajectory {trajectory_id} not found")
+        steps = list_steps(conn, trajectory_id)
 
-    rubric = rubric or load_rubric(PM_DECISION_RUBRIC_ID)
-    judge = judge or Judge()
-    item = build_trajectory_item(traj, steps)
-    verdict = judge.score(rubric, item, conn=conn, workstream=workstream)
+        rubric = rubric or load_rubric(PM_DECISION_RUBRIC_ID)
+        judge = judge or Judge()
+        item = build_trajectory_item(traj, steps)
+        verdict = judge.score(rubric, item, conn=conn, workstream=workstream)
 
-    return TrajectoryEvalResult(
-        trajectory_id=str(trajectory_id),
-        rubric_id=rubric.id,
-        verdict=verdict,
-        item=item,
-    )
+        return TrajectoryEvalResult(
+            trajectory_id=str(trajectory_id),
+            rubric_id=rubric.id,
+            verdict=verdict,
+            item=item,
+        )
+    finally:
+        # Only clean up what WE seeded; never a caller-supplied (real) trajectory.
+        if seeded_ws is not None and not keep:
+            cleanup_trajectory_shape(conn, seeded_ws)
 
 
 __all__ = [
@@ -181,5 +206,6 @@ __all__ = [
     "TrajectoryEvalResult",
     "build_trajectory_item",
     "seed_demo_trajectory",
+    "cleanup_trajectory_shape",
     "run_trajectory_eval",
 ]
