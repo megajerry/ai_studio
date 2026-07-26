@@ -187,30 +187,38 @@ def test_pending_approval_shows_in_poll_and_digest(conn, ws) -> None:
 @pytestmark_live
 def test_review_alarm_is_classified_immediate(conn, ws) -> None:
     baseline = _max_seq(conn)
+    tid = uuid4()
     append_event(conn, make_event(
-        workstream=ws, type="review.alarm", task_id=uuid4(),
+        workstream=ws, type="review.alarm", task_id=tid,
         payload={"severity": "high", "signal_count": 1,
                  "reasons": ["hallucinated success"], "mark": "ALARM"},
     ))
     batch = poll_notifications(conn, baseline)
-    alarms = [i for i in batch.alarms if i.event_type == "review.alarm"]
+    # Scope to THIS alarm's task_id: the shared event log may carry other alarms
+    # appended concurrently, so assert on our own event, not a global count.
+    alarms = [i for i in batch.alarms
+              if i.event_type == "review.alarm" and i.task_id == str(tid)]
     assert len(alarms) == 1 and alarms[0].kind is NotifyKind.ALARM
 
 
 @pytestmark_live
 def test_cursor_prevents_renotification(conn, ws) -> None:
     baseline = _max_seq(conn)
-    request_approval(
+    a = request_approval(
         conn, task_id=uuid4(), role="executor", tool="filesystem",
         capabilities=["fs.write"], tier="red", reason="x", sink=DbEventSink(conn),
         workstream=ws,
     )
     first = poll_notifications(conn, baseline)
-    assert len(first.items) >= 1
-    # A second poll from the advanced cursor sees nothing new.
+    assert any(i.approval_id == str(a.id) for i in first.items)
+    # A second poll from the advanced cursor never RE-notifies an item already
+    # seen (the cursor's whole job). On the shared event log unrelated events may
+    # be appended concurrently between the two polls, so assert the real
+    # invariant — our own approval is not re-surfaced and the cursor only ever
+    # advances — rather than an idle-DB "nothing changed" delta.
     second = poll_notifications(conn, first.cursor)
-    assert second.items == []
-    assert second.cursor == first.cursor
+    assert all(i.approval_id != str(a.id) for i in second.items)
+    assert second.cursor >= first.cursor
 
 
 @pytestmark_live
