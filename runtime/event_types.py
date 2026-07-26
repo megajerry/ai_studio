@@ -71,6 +71,18 @@ EVENT_APPROVAL_RESUMED = "approval.resumed"
 EVENT_APPROVAL_REQUESTED = "approval.requested"
 EVENT_APPROVAL_RESOLVED = "approval.resolved"
 
+# --- Async open-ended decisions (runtime.decisions, ADR-0025) ----------------
+#: The open-ended analogue of the binary approval loop: a real stakeholder
+#: QUESTION (a chosen option / free text — not approve/deny) that PARKS the
+#: dependent task so the worker is freed, then RESUMES it on the async answer.
+#: BOTH are BODY-FREE: payloads carry ONLY id / workstream / seq / status /
+#: has_options / resolver — NEVER the question or answer TEXT (that lives in the
+#: decisions row only; invariants 5 & 6, mirroring the approval.* discipline).
+#: ``decision.requested`` = an open decision was raised (+ its dependent task parked);
+#: ``decision.answered`` = a human answered it (+ its dependent task resumed).
+EVENT_DECISION_REQUESTED = "decision.requested"
+EVENT_DECISION_ANSWERED = "decision.answered"
+
 # --- Policy enforcement (runtime.enforce) -----------------------------------
 EVENT_POLICY_DECISION = "policy.decision"
 EVENT_TOOL_INVOKED = "tool.invoked"

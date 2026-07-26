@@ -38,6 +38,7 @@ from .classify import Notifier, NotifyKind
 from .config import Settings, get_settings
 from .grounding_gate import relay_claims
 from .runtime_bridge import (
+    answer,
     load_cursor,
     poll_notifications,
     resolve,
@@ -58,6 +59,8 @@ logger = logging.getLogger("spokesman.app")
 STATUS_KEYWORD = "status"
 #: Inbound command verbs that resolve an approval: ``<verb> <approval-id>``.
 _RESOLVE_VERBS = {"approve", "approved", "deny", "denied", "reject", "yes", "no"}
+#: Inbound verb that answers an OPEN-ENDED decision: ``decide <id> <answer>`` (ADR-0025).
+_DECIDE_VERB = "decide"
 
 #: Default DB connection factory (the live runtime Postgres). Injectable for tests.
 ConnectFn = Callable[[], object]
@@ -149,6 +152,8 @@ def handle_inbound_command(
     - ``status``            → live DB summary (falls back to ``state/status.md``).
     - ``approve <id>`` /
       ``deny <id>``         → resolve the real approval via the runtime store.
+    - ``decide <id> <answer>`` → answer an OPEN-ENDED decision (ADR-0025) via the
+      runtime decision store; this also resumes the parked dependent task.
 
     A reply is always sent for a recognized command (so the stakeholder gets
     confirmation); unrecognized text is ignored (returns ``None``). The webhook's
@@ -200,6 +205,37 @@ def handle_inbound_command(
             return {"command": verb, "ok": False, "error": "not pending"}
         client.send_text(f"Approval {approval_id} {approval.status}.", to=to)
         return {"command": verb, "ok": True, "status": approval.status}
+
+    if verb == _DECIDE_VERB:
+        # `decide <id> <answer...>` — the answer is the free-text remainder, so a
+        # multi-word answer ("go with vendor B") is preserved verbatim.
+        if len(parts) < 3:
+            client.send_text(f"Usage: {_DECIDE_VERB} <decision-id> <answer>", to=to)
+            return {"command": _DECIDE_VERB, "ok": False, "error": "missing id/answer"}
+        decision_id = parts[1]
+        answer_text = msg.text.strip().split(None, 2)[2]
+        resolver = f"whatsapp:{mask_number(msg.sender)}"
+        try:
+            conn = connect()
+            try:
+                decision = answer(conn, decision_id, answer_text, resolver)
+            finally:
+                _close(conn)
+        except ValueError:
+            client.send_text(f"Invalid decision id: {decision_id}", to=to)
+            return {"command": _DECIDE_VERB, "ok": False, "error": "invalid id"}
+        except Exception:  # noqa: BLE001 - DB unreachable / transient
+            logger.exception("answer failed for decision %s", decision_id)
+            client.send_text("Could not reach the runtime; try again shortly.", to=to)
+            return {"command": _DECIDE_VERB, "ok": False, "error": "db unavailable"}
+
+        if decision is None:
+            client.send_text(
+                f"Decision {decision_id} not found or already answered.", to=to
+            )
+            return {"command": _DECIDE_VERB, "ok": False, "error": "not open"}
+        client.send_text(f"Decision {decision_id} answered.", to=to)
+        return {"command": _DECIDE_VERB, "ok": True, "status": decision.status}
 
     return None
 

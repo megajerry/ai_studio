@@ -33,9 +33,11 @@ from uuid import UUID
 import psycopg
 
 from runtime.approvals import STATUS_APPROVED, STATUS_DENIED, pending_approvals
+from runtime.decisions import get_decision
 from runtime.enforce import DbEventSink
 from runtime.event_types import (
     EVENT_APPROVAL_REQUESTED,
+    EVENT_DECISION_REQUESTED,
     EVENT_REVIEW_ALARM,
     EVENT_REVIEW_FLAGGED,
     EVENT_TASK_FAILED_EXHAUSTED,
@@ -51,6 +53,9 @@ from .classify import NotifyKind
 ALARM_EVENT_TYPES = frozenset({EVENT_REVIEW_ALARM})
 #: 🛑 approve (blocks) — batched into the periodic digest.
 APPROVE_EVENT_TYPES = frozenset({EVENT_APPROVAL_REQUESTED})
+#: 🛑 decide (blocks) — an OPEN-ENDED decision that parks a task (ADR-0025); like an
+#: approval it needs a human reply, so it is batched into the same periodic digest.
+DECISION_EVENT_TYPES = frozenset({EVENT_DECISION_REQUESTED})
 #: 📣 inform (non-blocking) — major mistake / recovery, written to the feed.
 INFORM_EVENT_TYPES = frozenset({EVENT_TASK_FAILED_EXHAUSTED, EVENT_REVIEW_FLAGGED})
 
@@ -101,6 +106,7 @@ class NotificationItem:
     event_type: str
     task_id: Optional[str] = None
     approval_id: Optional[str] = None
+    decision_id: Optional[str] = None
 
 
 @dataclass
@@ -123,7 +129,50 @@ class NotificationBatch:
         return [i for i in self.items if i.kind is not NotifyKind.ALARM]
 
 
-def classify_event(event: Event) -> Optional[NotificationItem]:
+def _render_decision(
+    decision_id: object, payload: dict, conn: Optional[psycopg.Connection]
+) -> str:
+    """Render a leak-free 🛑 decision prompt: question + options + default + reply.
+
+    The ``decision.requested`` event is body-free (no question text), so the human
+    text is composed from the ``decisions`` ROW (read via ``conn`` — only that row's
+    own question / options / default_choice, no arg values or secrets). Without a
+    ``conn`` (pure classification) it degrades to the body-free payload so the item
+    is never dropped. The reply hint drives the inbound ``decide <id> <answer>`` verb.
+    """
+    short = _short(decision_id)
+    question = ""
+    options: Optional[list] = None
+    default_choice = None
+    if conn is not None and decision_id:
+        try:
+            decision = get_decision(conn, str(decision_id))
+        except Exception:  # noqa: BLE001 - a render read must never break the poll
+            decision = None
+        if decision is not None:
+            question = (decision.question or "").strip()
+            options = decision.options
+            default_choice = decision.default_choice
+
+    if len(question) > MAX_REASON_CHARS:
+        question = question[:MAX_REASON_CHARS].rstrip() + "…"
+
+    text = f"Decision needed [{short}]"
+    text += f": {question}" if question else (
+        " (options)" if payload.get("has_options") else ""
+    )
+    if options:
+        text += "\nOptions: " + " | ".join(str(o) for o in options)
+    if default_choice:
+        text += f"\nDefault if unanswered: {default_choice}"
+    if decision_id:
+        text += f"\nReply: decide {decision_id} <answer>"
+    return text
+
+
+def classify_event(
+    event: Event, conn: Optional[psycopg.Connection] = None
+) -> Optional[NotificationItem]:
     """Classify one runtime event into an ADR-0006 :class:`NotificationItem`, or None.
 
     Only the event types the stakeholder must see become items; everything else
@@ -132,6 +181,12 @@ def classify_event(event: Event) -> Optional[NotificationItem]:
     ``review.flagged`` at HIGH severity is dropped here because the same episode
     already emits a ``review.alarm`` (🚨) + an ``approval.requested`` (🛑) — this
     avoids a duplicate 📣 for one incident.
+
+    An OPEN-ENDED ``decision.requested`` (ADR-0025) is surfaced 🛑 batched like an
+    approval, but its wire event is body-free (no question text), so ``conn`` is used
+    to read the question / options / default_choice from the ``decisions`` row for
+    rendering (leak-free — only that row's own fields). Without a ``conn`` the item
+    still renders from the body-free payload (id + has_options) so it is never lost.
     """
     etype = event.type
     payload = event.payload or {}
@@ -163,6 +218,14 @@ def classify_event(event: Event) -> Optional[NotificationItem]:
         return NotificationItem(
             kind=NotifyKind.APPROVE, text=text, seq=seq, event_type=etype,
             task_id=task_id, approval_id=str(approval_id) if approval_id else None,
+        )
+
+    if etype in DECISION_EVENT_TYPES:
+        decision_id = payload.get("decision_id")
+        text = _render_decision(decision_id, payload, conn)
+        return NotificationItem(
+            kind=NotifyKind.APPROVE, text=text, seq=seq, event_type=etype,
+            task_id=task_id, decision_id=str(decision_id) if decision_id else None,
         )
 
     if etype in INFORM_EVENT_TYPES:
@@ -210,7 +273,7 @@ def poll_notifications(
     for event in events:
         if event.seq is not None and event.seq > batch.cursor:
             batch.cursor = event.seq
-        item = classify_event(event)
+        item = classify_event(event, conn)
         if item is not None:
             batch.items.append(item)
     return batch
@@ -331,6 +394,28 @@ def resolve(
     if isinstance(approval_id, str):
         approval_id = UUID(approval_id)
     return resolve_approval(conn, approval_id, canonical, resolver, DbEventSink(conn))
+
+
+def answer(
+    conn: psycopg.Connection,
+    decision_id: UUID | str,
+    answer_text: str,
+    resolver: str,
+):
+    """Answer an OPEN-ENDED decision (ADR-0025) via the runtime decision store.
+
+    The async analogue of :func:`resolve`: it records the chosen answer / free text
+    (``answer_decision`` is guarded to ``open``) and, inside the same store call,
+    RESUMES the parked dependent task (``blocked → up_for_grabs``) so a fresh worker
+    re-grabs it and reads the answer. Returns the answered
+    :class:`runtime.decisions.Decision`, or ``None`` if the id is unknown / already
+    answered. Emits a body-free ``decision.answered`` to the live event log.
+    """
+    from runtime.decisions import answer_decision  # local import: keeps psycopg lazy
+
+    if isinstance(decision_id, str):
+        decision_id = UUID(decision_id)
+    return answer_decision(conn, decision_id, answer_text, resolver, DbEventSink(conn))
 
 
 # --- cursor persistence -----------------------------------------------------
