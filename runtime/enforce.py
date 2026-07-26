@@ -197,8 +197,18 @@ def invoke(
     if decision.effect is Effect.NEEDS_APPROVAL:
         # A live grant (find_grant) turns 🔴 into a one-shot ALLOW; else PEND.
         if conn is not None:
+            # Bind the grant to the EXACT action: task, tool, caps, workstream AND
+            # argument values (via a one-way digest — invariant 5). The SAME
+            # fingerprint is used to look the grant up (find_grant) and, on a miss,
+            # to persist the pending request (request_approval) — so a grant matches
+            # ONLY an identical re-invoke; a swapped arg (bait-and-switch) or a
+            # different workstream re-pends instead of silently executing.
             fingerprint = compute_fingerprint(
-                task_id, tool_name, sorted(c.value for c in required)
+                task_id,
+                tool_name,
+                sorted(c.value for c in required),
+                workstream=workstream,
+                args=kwargs,
             )
             grant = find_grant(conn, fingerprint)
             if grant is not None and consume_grant(conn, grant.id) is not None:
