@@ -16,9 +16,13 @@ Lifecycle of one action::
 
     resolve_approval(denied) → [denied]  → the blocked task is failed.
 
-`request_fingerprint` is a stable hash of ``(task_id, tool, sorted capabilities)``
-so a later retry of the *same* action matches its grant. It contains NO argument
-values or secrets (CLAUDE.md invariant 5) — only the action's identity.
+`request_fingerprint` is a stable hash of ``(task_id, tool, sorted capabilities,
+workstream, args-digest)`` so a later retry of the *same* action — same task,
+tool, capabilities, workstream AND argument values — matches its grant, and a
+bait-and-switch (approve ``delete harmless.txt``, then run ``delete secret.txt``)
+or a cross-workstream reuse does NOT. It contains NO argument values or secrets
+(CLAUDE.md invariant 5): the args enter only as a one-way SHA-256 *digest* (a hash
+of the canonicalized args), which cannot reveal them — only the action's identity.
 
 All functions take an open ``conn`` (the caller owns the transaction boundary,
 matching :mod:`runtime.tasks`) and an :class:`EventSink` for observability
@@ -28,8 +32,9 @@ matching :mod:`runtime.tasks`) and an :class:`EventSink` for observability
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 from uuid import UUID
 
 import psycopg
@@ -86,20 +91,55 @@ class ApprovalDigest(BaseModel):
     items: list[Approval] = Field(default_factory=list)
 
 
-def compute_fingerprint(
-    task_id: Optional[UUID], tool: str, capabilities: Iterable[str]
-) -> str:
-    """Stable hash identifying a 🔴 action so a grant can be matched to a retry.
+def args_digest(args: Optional[Mapping[str, Any]]) -> str:
+    """A stable, one-way SHA-256 digest of a tool call's arguments (invariant 5).
 
-    Pure and deterministic: the same ``(task_id, tool, capabilities)`` always
-    yields the same fingerprint, so the first (pending) invocation and a later
-    (post-approval) retry of the *same* task+tool+capabilities collide on it —
-    which is how :func:`find_grant` re-attaches the grant. Capability order is
-    normalized (sorted) so it never depends on set iteration order. No argument
-    values enter the hash (invariant 5).
+    The danger of a 🔴 action lives in its ARGS (``delete path=X``), so a grant
+    must bind the exact args it was approved for. We fold the args into the
+    fingerprint only as this digest — a hash of the canonical JSON
+    (``sort_keys=True`` for order-independence, ``default=str`` so non-JSON types
+    like ``UUID``/``Path`` are still deterministic). The digest is one-way: it
+    NEVER reveals the argument values, so it is safe to store/compare (invariant 5).
+
+    ``None`` or an empty mapping yields a well-defined empty digest ``""`` so a
+    legitimately arg-free action (e.g. a budget-raise approval) still matches its
+    grant, and two identical arg-free actions still share one — that's the same
+    action, which is acceptable.
+    """
+    if not args:
+        return ""
+    canonical = json.dumps(args, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_fingerprint(
+    task_id: Optional[UUID],
+    tool: str,
+    capabilities: Iterable[str],
+    *,
+    workstream: Optional[str] = None,
+    args: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Stable hash identifying a 🔴 *action* so a grant can be matched to a retry.
+
+    Pure and deterministic: the same
+    ``(task_id, tool, capabilities, workstream, args)`` always yields the same
+    fingerprint, so the first (pending) invocation and a later (post-approval)
+    retry of the *identical action* collide on it — which is how
+    :func:`find_grant` re-attaches the grant. Any difference — a swapped argument
+    value or a different workstream — yields a DIFFERENT fingerprint, so a grant
+    can never be reused for a different action (no bait-and-switch, no
+    cross-workstream sharing).
+
+    Capability order is normalized (sorted) so it never depends on set iteration
+    order. The ``workstream`` is folded in verbatim (it is not sensitive), and the
+    ``args`` enter only via :func:`args_digest` — a one-way hash, so NO argument
+    value ever enters the material (invariant 5).
     """
     caps = ",".join(sorted(capabilities))
-    material = "|".join([str(task_id or ""), tool, caps])
+    material = "|".join(
+        [str(task_id or ""), tool, caps, str(workstream or ""), args_digest(args)]
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -139,6 +179,7 @@ def request_approval(
     sink: "EventSink",
     workstream: str = "productivity",
     fingerprint: Optional[str] = None,
+    args: Optional[Mapping[str, Any]] = None,
 ) -> Approval:
     """Create a ``pending`` approval row and emit ``approval.requested``.
 
@@ -146,9 +187,17 @@ def request_approval(
     (``approved``) row already exists for the same action, it is returned as-is
     and NO duplicate row or event is created. Consumed/denied rows do not block a
     fresh request — a re-run after a grant was spent legitimately pends again.
+
+    When the caller does not supply an explicit ``fingerprint``, the action's
+    fingerprint is computed from ``(task_id, tool, caps, workstream, args)`` so the
+    grant binds this workstream and these exact argument values (invariant 5: the
+    args enter only as a one-way digest — see :func:`compute_fingerprint`). Callers
+    with their own scheme (e.g. budget-raise, review-queue) still pass ``fingerprint``.
     """
     caps = sorted(capabilities)
-    fp = fingerprint or compute_fingerprint(task_id, tool, caps)
+    fp = fingerprint or compute_fingerprint(
+        task_id, tool, caps, workstream=workstream, args=args
+    )
 
     with conn.transaction():
         with conn.cursor() as cur:

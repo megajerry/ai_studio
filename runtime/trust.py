@@ -174,11 +174,18 @@ def is_relay_allowed(conn: psycopg.Connection, identity: str) -> bool:
     """True iff ``identity`` may currently relay to the human.
 
     Reads the ledger (auto-creating a trusted row on first contact) and requires
-    BOTH ``human_relay_allowed`` AND ``trust_state != revoked`` — a revoked
-    identity can never speak to the human again, regardless of the flag.
+    BOTH ``human_relay_allowed`` AND a non-fenced ``trust_state`` — neither
+    ``revoked`` (a revoked identity can never speak to the human again) NOR
+    ``quarantined``. This mirrors the claim-side fence in
+    :func:`runtime.tasks.grab_task` (ADR-0021), so a quarantined identity is
+    symmetrically barred from BOTH claiming work and relaying to the human,
+    regardless of the flag.
     """
     rec = get_trust(conn, identity)
-    return rec.human_relay_allowed and rec.trust_state != TRUST_REVOKED
+    return rec.human_relay_allowed and rec.trust_state not in (
+        TRUST_REVOKED,
+        TRUST_QUARANTINED,
+    )
 
 
 # --- claims -----------------------------------------------------------------

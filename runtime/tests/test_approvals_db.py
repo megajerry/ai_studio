@@ -135,7 +135,7 @@ def test_request_is_idempotent_per_fingerprint(conn, ws):
 def test_resolve_approve_then_grant_consumed_once(conn, ws):
     sink = DbEventSink(conn)
     tid = uuid4()
-    fp = compute_fingerprint(tid, "filesystem", ["fs.write"])
+    fp = compute_fingerprint(tid, "filesystem", ["fs.write"], workstream=ws)
     a = request_approval(
         conn, task_id=tid, role="executor", tool="filesystem",
         capabilities=["fs.write"], tier="red", reason="🔴", sink=sink, workstream=ws,
@@ -158,7 +158,7 @@ def test_resolve_approve_then_grant_consumed_once(conn, ws):
 def test_resolve_deny_leaves_no_grant(conn, ws):
     sink = DbEventSink(conn)
     tid = uuid4()
-    fp = compute_fingerprint(tid, "filesystem", ["fs.write"])
+    fp = compute_fingerprint(tid, "filesystem", ["fs.write"], workstream=ws)
     a = request_approval(
         conn, task_id=tid, role="executor", tool="filesystem",
         capabilities=["fs.write"], tier="red", reason="🔴", sink=sink, workstream=ws,
@@ -275,6 +275,115 @@ def test_events_carry_identity_not_secrets(conn, ws, tmp_path):
     assert req.payload["role"] == "executor" and req.payload["tool"] == "filesystem"
     assert req.payload["tier"] == "red" and req.payload["reason"]
     assert resv.payload["status"] == "approved" and resv.payload["resolver"] == "tester"
+
+
+# --- grant binds the exact ACTION: args + workstream (bait-and-switch / cross-ws) ---
+
+
+def test_bait_and_switch_blocked_but_identical_reinvoke_executes(conn, ws, tmp_path):
+    """A grant approved for one arg-set must NOT authorize a different arg-set.
+
+    Reproduces the audited bait-and-switch: approve ``write harmless.txt``, then
+    try ``write important_secret.txt`` (same task+tool+caps). The swapped call must
+    RE-PEND and never execute — the secret file survives. The legitimate re-invoke
+    with the SAME approved args still executes (the grant matches the identical
+    action). Applies equally to delete/shell/spend/deploy — the danger is in ARGS.
+    """
+    (tmp_path / "important_secret.txt").write_text("TOP_SECRET")
+    reg = _registry(tmp_path)
+    cfg = _red_write_config()
+    sink = DbEventSink(conn)
+    tid = uuid4()
+
+    # 1. Approve a harmless write.
+    r1 = invoke(role="executor", tool_name="filesystem", registry=reg, config=cfg,
+                events=sink, conn=conn, workstream=ws, task_id=tid,
+                op="write", path="harmless.txt", content="ok")
+    assert r1.status is InvokeStatus.PENDING
+    resolve_approval(conn, r1.approval_id, STATUS_APPROVED, "tester", sink, workstream=ws)
+
+    # 2. Bait-and-switch: same task+tool+caps, DIFFERENT args → must RE-PEND.
+    r2 = invoke(role="executor", tool_name="filesystem", registry=reg, config=cfg,
+                events=sink, conn=conn, workstream=ws, task_id=tid,
+                op="write", path="important_secret.txt", content="PWNED")
+    assert r2.status is InvokeStatus.PENDING  # NOT executed
+    assert r2.approval_id != r1.approval_id  # a fresh pending for the new action
+    assert (tmp_path / "important_secret.txt").read_text() == "TOP_SECRET"  # survives
+    # The harmless grant is still live (unspent) — the swap never touched it.
+    assert get_approval(conn, r1.approval_id).status == STATUS_APPROVED
+
+    # 3. Legitimate re-invoke with the SAME approved args → EXECUTES (grant matches).
+    r3 = invoke(role="executor", tool_name="filesystem", registry=reg, config=cfg,
+                events=sink, conn=conn, workstream=ws, task_id=tid,
+                op="write", path="harmless.txt", content="ok")
+    assert r3.status is InvokeStatus.EXECUTED
+    assert r3.approval_id == r1.approval_id
+    assert (tmp_path / "harmless.txt").read_text() == "ok"
+    assert get_approval(conn, r1.approval_id).status == STATUS_CONSUMED
+
+
+def test_cross_workstream_grant_not_shared(conn, tmp_path):
+    """A grant approved in workstream A must NOT be consumed by workstream B.
+
+    Reproduces the audited cross-workstream reuse with ``task_id=None`` (allowed
+    throughout ``enforce.invoke``): same tool+caps+args in two unrelated
+    workstreams used to collapse to ONE fingerprint. The B call must RE-PEND.
+    """
+    reg = _registry(tmp_path)
+    cfg = _red_write_config()
+    sink = DbEventSink(conn)
+    ws_a = f"test-wsA-{uuid4().hex[:8]}"
+    ws_b = f"test-wsB-{uuid4().hex[:8]}"
+    args = dict(op="write", path="f.txt", content="x")
+
+    # Approve in workstream A (task_id=None).
+    ra = invoke(role="executor", tool_name="filesystem", registry=reg, config=cfg,
+                events=sink, conn=conn, workstream=ws_a, task_id=None, **args)
+    assert ra.status is InvokeStatus.PENDING
+    resolve_approval(conn, ra.approval_id, STATUS_APPROVED, "tester", sink, workstream=ws_a)
+
+    # Unrelated call in workstream B (same tool+caps+args, task_id=None) → RE-PENDS.
+    rb = invoke(role="executor", tool_name="filesystem", registry=reg, config=cfg,
+                events=sink, conn=conn, workstream=ws_b, task_id=None, **args)
+    assert rb.status is InvokeStatus.PENDING
+    assert rb.approval_id != ra.approval_id
+    assert not (tmp_path / "f.txt").exists()  # B never executed
+    # A's grant remains live and unspent — B did not consume it.
+    assert get_approval(conn, ra.approval_id).status == STATUS_APPROVED
+
+
+def test_fingerprint_binds_args_and_workstream_without_leaking_values(conn, ws, tmp_path):
+    """Invariant 5: the args bind the grant, but no raw arg VALUE is ever stored.
+
+    The fingerprint distinguishes actions by arg value and by workstream, yet the
+    persisted approval row (request_fingerprint) and its events carry only the
+    one-way digest — never the argument values themselves.
+    """
+    from runtime.approvals import args_digest, compute_fingerprint
+
+    # Arg values change the fingerprint; workstream changes it; but neither value
+    # appears in the (hex) fingerprint output.
+    fp_a = compute_fingerprint(None, "filesystem", ["fs.write"],
+                               workstream=ws, args={"op": "write", "path": "a.txt"})
+    fp_b = compute_fingerprint(None, "filesystem", ["fs.write"],
+                               workstream=ws, args={"op": "write", "path": "b.txt"})
+    fp_ws = compute_fingerprint(None, "filesystem", ["fs.write"],
+                                workstream="other", args={"op": "write", "path": "a.txt"})
+    assert fp_a != fp_b != fp_ws and fp_a != fp_ws  # args + ws both discriminate
+    assert len(fp_a) == 64 and all(c in "0123456789abcdef" for c in fp_a)
+    assert "a.txt" not in fp_a and "b.txt" not in fp_b  # no raw value leaks
+    # Arg-free actions get a well-defined empty digest (budget-raise stays shareable).
+    assert args_digest(None) == "" == args_digest({})
+
+    # The persisted row stores only the digest-bearing fingerprint, no arg value.
+    reg = _registry(tmp_path)
+    res = invoke(role="executor", tool_name="filesystem", registry=reg,
+                 config=_red_write_config(), events=DbEventSink(conn), conn=conn,
+                 workstream=ws, task_id=uuid4(),
+                 op="write", path="q.txt", content="SUPER_SECRET_ARG_VALUE")
+    row = get_approval(conn, res.approval_id)
+    blob = row.model_dump_json()
+    assert "SUPER_SECRET_ARG_VALUE" not in blob and "q.txt" not in blob
 
 
 # --- worker end-to-end: block → grant → resume → retry → execute → done -----
