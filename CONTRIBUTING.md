@@ -58,7 +58,11 @@ Any actor that intends to change this repo follows this loop:
   must carry an ADR justifying it.
 - **Self-sufficiency.** A change isn't done until a fresh `git clone` on the
   target machine can bootstrap and run it — update bootstrap scripts / prereqs
-  / `.env.example` accordingly.
+  / `.env.example` accordingly. **Prove it with the cold-start readiness check:**
+  `python -m runtime.readiness` (or `make readiness`) must be green — it verifies
+  imports, migrations, the demo, config/secret coverage (every env var the code
+  reads is documented in `.env.example` or collected by onboarding), and compose
+  coherence. See the [go-live runbook](docs/go-live.md).
 
 ## Commit & PR conventions
 
