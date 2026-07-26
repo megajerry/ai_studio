@@ -9,10 +9,14 @@ It mirrors :func:`runtime.skills.inject.compose_prompt` (ADR-0008): a bounded,
 clearly-delimited ``### Lessons`` section appended to the base prompt. Two
 invariants:
 
-1. **Bounded + scoped (ADR-0013).** Only the top-``k`` lessons relevant to the
-   query are recalled, and at most ``limit`` are injected. Recall is
-   workstream-scoped (:func:`runtime.memory.recall_lessons`) — a workstream never
-   sees another's private lessons (global lessons are shared deliberately).
+1. **Bounded + scoped + relevance-floored (ADR-0013).** Only the top-``k``
+   lessons relevant to the query are recalled, and at most ``limit`` are injected.
+   A cosine relevance floor (``min_score``, default :data:`RECOMMENDED_MIN_SCORE`)
+   drops weakly/irrelevant candidates BEFORE top-N, so an injected lesson is
+   always genuinely relevant (a barely-related lesson pollutes the prompt and
+   hurts quality). Recall is workstream-scoped
+   (:func:`runtime.memory.recall_lessons`) — a workstream never sees another's
+   private lessons (global lessons are shared deliberately).
 2. **Behavior-preserving.** With no ``conn``, no workstream, no recalled lessons,
    or a recall error, the base prompt is returned **unchanged** — a role with an
    empty lessons corpus behaves exactly as before.
@@ -24,6 +28,7 @@ anything. Any action still goes through the policy-gated tool path (`invoke`).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Optional
 
 from ..memory import recall_lessons as _recall_lessons
@@ -33,12 +38,55 @@ logger = logging.getLogger("runtime.roles.lessons")
 #: Default cap on how many lessons are injected into one prompt (ADR-0013 bound).
 DEFAULT_LIMIT = 3
 
-#: Recommended production cosine floor for lesson recall. A modest floor keeps
-#: only genuinely relevant lessons out of a prompt (a weak, off-topic match is
-#: worse than no lesson). ~0.2 suits the dry-run embedder; tune per real
-#: embedding model. Left as guidance — the default below is ``None`` (no floor,
-#: behavior-preserving); a caller opts in by passing ``min_score``.
+#: Default cosine floor applied to lesson recall BEFORE top-N selection, so an
+#: injected lesson is always at least this relevant (a weak, off-topic match is
+#: worse than no lesson — it pollutes the prompt and hurts quality).
+#:
+#: Justification (measured on the dry-run embedder, which is deterministic —
+#: signed feature-hashing of character n-grams, see runtime/memory/embed.py):
+#: genuinely on-topic lesson/query pairs score ~0.5-0.9 cosine, while clearly
+#: irrelevant pairs score roughly -0.1..+0.1. ``0.2`` sits in the empty gap
+#: between the two clusters, so it excludes clearly-irrelevant lessons while
+#: keeping every genuinely-relevant one — conservative by design (no
+#: empty-injection regression: the existing learning-loop recalls all clear it).
+#:
+#: PRE-REAL-EMBEDDINGS DEFAULT: this floor is tuned to the dry-run embedder and
+#: MUST be re-tuned once a real embedding model lands (its cosine scale differs).
+#: Tune without a code change via the ``AI_STUDIO_LESSON_MIN_SCORE`` env var.
 RECOMMENDED_MIN_SCORE = 0.2
+
+#: Env override for the floor (a float). Empty/unset → :data:`RECOMMENDED_MIN_SCORE`.
+_MIN_SCORE_ENV = "AI_STUDIO_LESSON_MIN_SCORE"
+
+#: Sentinel for "caller did not pass ``min_score``" → use the env/default floor.
+#: Distinct from an explicit ``None``, which DISABLES the floor entirely (recall
+#: returns its top-N unfiltered — the old behavior, kept as an escape hatch).
+_DEFAULT_FLOOR: Any = object()
+
+
+def _resolve_min_score(min_score: Any) -> Optional[float]:
+    """Resolve the effective floor: explicit caller value wins; else env; else default.
+
+    - an explicit ``float`` → used as-is;
+    - an explicit ``None`` → no floor (escape hatch);
+    - omitted (:data:`_DEFAULT_FLOOR`) → ``AI_STUDIO_LESSON_MIN_SCORE`` if set to a
+      valid float, otherwise :data:`RECOMMENDED_MIN_SCORE`.
+    """
+    if min_score is not _DEFAULT_FLOOR:
+        return min_score  # explicit float floor, or None to disable
+    raw = os.environ.get(_MIN_SCORE_ENV, "").strip()
+    if not raw:
+        return RECOMMENDED_MIN_SCORE
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "ignoring invalid %s=%r; using default lesson floor %.2f",
+            _MIN_SCORE_ENV,
+            raw,
+            RECOMMENDED_MIN_SCORE,
+        )
+        return RECOMMENDED_MIN_SCORE
 
 _SECTION_HEADER = "### Lessons (durable know-how from prior retros — apply these)"
 _SECTION_NOTE = (
@@ -75,7 +123,7 @@ def recall_lesson_texts(
     query: str,
     *,
     k: int = DEFAULT_LIMIT,
-    min_score: Optional[float] = None,
+    min_score: Any = _DEFAULT_FLOOR,
     recall: Callable[..., list] = _recall_lessons,
 ) -> list[str]:
     """Recall the lesson TEXTS most relevant to ``query`` (workstream-scoped).
@@ -89,9 +137,11 @@ def recall_lesson_texts(
     """
     if conn is None or not workstream:
         return []
-    # Only thread min_score when set, so a custom `recall` seam whose signature
-    # predates the floor keeps working (behavior-preserving when min_score=None).
-    extra = {} if min_score is None else {"min_score": min_score}
+    floor = _resolve_min_score(min_score)
+    # Only thread min_score when a floor applies, so an explicit None (escape
+    # hatch) — and a custom `recall` seam whose signature predates the floor —
+    # keep working unfiltered.
+    extra = {} if floor is None else {"min_score": floor}
     try:
         items = recall(conn, workstream, query, k=k, **extra)
     except Exception:  # pragma: no cover - defensive: never let recall break a role
@@ -108,7 +158,7 @@ def inject_lessons(
     *,
     k: int = DEFAULT_LIMIT,
     limit: int = DEFAULT_LIMIT,
-    min_score: Optional[float] = None,
+    min_score: Any = _DEFAULT_FLOOR,
     recall: Callable[..., list] = _recall_lessons,
 ) -> str:
     """Recall the lessons most relevant to ``query`` and inject them into the prompt.
@@ -118,9 +168,10 @@ def inject_lessons(
     unchanged when there is no ``conn``/``workstream``, when nothing is recalled,
     or when recall fails — so a role is never blocked by the learning layer.
 
-    ``min_score`` is an optional cosine floor threaded into recall to drop weakly
-    relevant lessons; ``None`` (default) applies no floor (behavior-preserving).
-    See :data:`RECOMMENDED_MIN_SCORE` for the suggested production value.
+    ``min_score`` is the cosine relevance floor applied BEFORE top-N selection so
+    an injected lesson is always at least that relevant. Omitted → the
+    :data:`RECOMMENDED_MIN_SCORE` default (overridable via ``AI_STUDIO_LESSON_MIN_SCORE``);
+    pass an explicit ``float`` to override, or ``None`` to disable the floor.
     """
     texts = recall_lesson_texts(
         conn, workstream, query, k=k, min_score=min_score, recall=recall
