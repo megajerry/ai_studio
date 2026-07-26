@@ -162,14 +162,14 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
   threaded regression test.
 - Ingest CLI could scrub/warn on non-synthetic example files (invariant documented;
   shipped example is synthetic).
-- **Grounding gate false-positive fabrication risk**: a MALFORMED `expected` spec
-  (e.g. `task` ref given `db_row`'s `col=val` syntax) reads as a *contradiction* →
-  fabrication → permanent zero-tolerance revocation. The gate can't distinguish "you
-  lied" from "you mis-formatted the evidence spec." Fix: validate/normalize `expected`
-  per `EvidenceKind` and treat unparseable/ill-formed specs as UNVERIFIABLE (bounce
-  for reformatting), reserving REJECTED-fabrication for a well-formed `expected` that
-  genuinely contradicts source of truth. Higher priority than a nit given the maximal
-  penalty. (ADR-0021 follow-up.)
+- ✅ **RESOLVED (db70e39)** — Grounding gate false-positive fabrication risk: a
+  malformed `expected` now → UNVERIFIABLE (proof requested, no strike), reserving
+  fabrication for a well-formed `expected` that genuinely contradicts source of truth
+  (per-`EvidenceKind` validation in `spokesman/grounding_gate.py`). Minor open
+  follow-up: within a SINGLE `db_row` ref, a malformed column short-circuits before a
+  genuine contradiction on another field → UNVERIFIABLE (misses the strike) but still
+  WITHHOLDS the false claim (fails safe); optionally make a real contradiction take
+  precedence over a malformed sibling field within one ref.
 - **Test isolation under a polluted shared DB**: several worker/lifecycle tests
   (e.g. `test_approvals_db` worker-block flow) assume a quiet queue and fail when the
   shared ephemeral DB has many stray `up_for_grabs` tasks (grab-by-sort claims a
