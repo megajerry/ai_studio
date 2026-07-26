@@ -1036,6 +1036,22 @@ def rekick_task(
     preserving the pre-ADR-0023 behavior.
     """
     with conn.transaction():
+        # Re-kick ONLY an actively-held task (claimed/in_progress) — the documented
+        # contract, and all the supervisor ever feeds here (find_stale_tasks filters
+        # to those two states). Locking + checking the row FIRST closes the park
+        # race: the state machine also permits blocked→up_for_grabs, so without this
+        # guard a re-kick could clobber a task that was concurrently PARKED `blocked`
+        # by request_decision — stranding an `open` decision against a runnable task.
+        # The FOR UPDATE lock held for this transaction serializes against the park:
+        # either the park committed first (status is now `blocked` → we bail, leaving
+        # it parked) or we win (status still in_progress → the park then aborts).
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM tasks WHERE id = %s FOR UPDATE", (task_id,))
+            row = cur.fetchone()
+        if row is None or row["status"] not in (
+            TaskStatus.CLAIMED.value, TaskStatus.IN_PROGRESS.value
+        ):
+            return None
         task = transition(
             conn, task_id, TaskStatus.UP_FOR_GRABS,
             clear_claim=True, increment_retries=True,
