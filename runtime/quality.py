@@ -575,6 +575,7 @@ def failure_report(
     workstream: Optional[str] = None,
     *,
     since_seq: Optional[int] = None,
+    lookback: int = 0,
 ) -> dict:
     """Failure telemetry rollup: WHAT is breaking, HOW OFTEN, and HOW SURE (ADR-0023).
 
@@ -585,11 +586,20 @@ def failure_report(
     ``task.transition`` / ``verify.*``) — no new capture, so it is replayable.
 
     ``workstream=None`` spans ALL workstreams. ``since_seq`` (exclusive on the
-    monotonic ``events.seq`` cursor — the same idiom as
-    :func:`runtime.events.read_events`) scopes the rollup to events *after* a cursor,
-    so a fix experiment can measure only POST-FIX traffic (capture the cursor when the
-    fix is applied, then read the rate over what happened since). ``ts`` is NOT used
-    for the window because it is the transaction-start time (see migration 0004).
+    ``events.seq`` cursor — the same idiom as :func:`runtime.events.read_events`)
+    scopes the rollup to events *after* a cursor, so a fix experiment can measure
+    only POST-FIX traffic (capture the cursor when the fix is applied, then read the
+    rate over what happened since). ``ts`` is NOT used for the window because it is
+    the transaction-start time (see migration 0004).
+
+    HONESTY on the ``since_seq`` window: ``seq`` is insert-order, not commit-order
+    (see :mod:`runtime.events`). A failure event whose transaction commits *after*
+    the ``since_seq`` cursor was captured, but whose seq is at/below it, would be
+    attributed to the pre-window side and **silently under-counted**. ``lookback``
+    (default ``0``) widens the lower bound to ``since_seq - lookback`` so such a
+    late/out-of-order-committing event near the boundary is still counted — the same
+    bounded-overlap idiom as :func:`runtime.events.read_events`. It only matters
+    when ``since_seq`` is set (a full report already counts everything committed).
 
     Returns (None-safe — every proportion is ``None`` on a zero denominator, never a
     divide-by-zero, and each carries ``n`` + Wilson 95% CI + ``insufficient_sample``
@@ -608,7 +618,13 @@ def failure_report(
       each with its ``count`` and ``share`` = that reason as a proportion of terminal
       tasks (``_rate_ci`` over ``n`` = terminal tasks).
     """
-    params = {"ws": workstream, "since_seq": since_seq}
+    if lookback < 0:
+        raise ValueError(f"lookback must be >= 0, got {lookback}")
+    # Bounded lookback overlap: widen the exclusive lower bound so a failure event
+    # that committed out-of-order near the boundary is still counted (commit-safety
+    # for the since_seq window; see runtime/events.py). No-op when since_seq is None.
+    window_floor = None if since_seq is None else max(0, since_seq - lookback)
+    params = {"ws": workstream, "since_seq": window_floor}
     _window = "AND (%(since_seq)s::bigint IS NULL OR seq > %(since_seq)s::bigint)"
     _ws = "(%(ws)s::text IS NULL OR workstream = %(ws)s::text)"
     with conn.cursor() as cur:
@@ -673,7 +689,7 @@ def failure_report(
 
     return {
         "workstream": workstream,
-        "window": {"since_seq": since_seq},
+        "window": {"since_seq": since_seq, "lookback": lookback},
         "totals": {
             "model_calls_ok": ok,
             "model_calls_failed": failed,
