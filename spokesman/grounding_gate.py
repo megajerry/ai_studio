@@ -33,11 +33,28 @@ Verdict rules (be honest about what each proves):
 
 - **VERIFIED**  — every ref resolves AND matches its ``expected`` where given.
 - **UNVERIFIABLE** — some ref cannot be resolved (missing proof, or the DB was
-  unreachable). This is an honest "couldn't confirm", NOT a fabrication: the
-  claim is withheld and proof is requested from the originator.
-- **REJECTED (fabrication)** — a ref *resolves* but its actual value CONTRADICTS
-  the claim's declared ``expected``. The agent asserted something the source of
-  truth actively contradicts.
+  unreachable), OR a ref's ``expected`` is **ill-formed / uninterpretable** for
+  its :class:`EvidenceKind` (see below). This is an honest "couldn't confirm",
+  NOT a fabrication: the claim is withheld and proof is requested from the
+  originator.
+- **REJECTED (fabrication)** — a ref *resolves*, its ``expected`` is a
+  **well-formed** assertion for its kind, and the referent's actual value
+  CONTRADICTS it. The agent asserted something the source of truth actively
+  contradicts.
+
+Ill-formed ``expected`` is NOT fabrication (ADR-0021 follow-up)
+--------------------------------------------------------------
+A contradiction can only be declared against an ``expected`` the resolver can
+actually *interpret* as an assertion for that kind (a task status from the
+canonical set; a ``col=val`` on an existing column for ``db_row``; a numeric
+count for the count ``metric`` queries; a 64-char sha256 for a ``file``). If
+``expected`` cannot be parsed as a valid assertion for the kind (wrong syntax,
+unknown column, non-status for a ``task``, non-numeric metric, non-hash file),
+the ref is **malformed** → the claim is UNVERIFIABLE (proof requested), never
+``contradicted``. Rationale: an honest agent that merely *mis-formats* its
+evidence spec must not be branded a fabricator and permanently revoked — the gate
+must distinguish "you lied" from "you wrote the spec wrong". Only a well-formed,
+genuinely-contradicted ``expected`` still triggers the zero-tolerance penalty.
 
 Fail-closed (ADR-0017): if source of truth cannot be reached, every ref is
 treated as unresolved → the claim is UNVERIFIABLE → it is NEVER relayed as fact.
@@ -56,6 +73,7 @@ from uuid import UUID
 import psycopg
 
 from runtime.grounding import Claim, EvidenceKind, EvidenceRef
+from runtime.models import TaskStatus
 from runtime.trust import (
     STRIKE_FABRICATION,
     VERIFICATION_REJECTED,
@@ -82,6 +100,12 @@ _READABLE_TABLES: frozenset[str] = frozenset({
     "task_transitions", "approvals", "budgets",
 })
 
+#: The canonical task-lifecycle statuses (ADR-0015). A ``task`` ref's ``expected``
+#: is only interpretable as a status assertion if it is one of these bare values;
+#: anything else (a ``db_row``-style ``status=merged``, garbage) is *malformed* and
+#: routes to UNVERIFIABLE, never to a fabrication verdict.
+_TASK_STATUSES: frozenset[str] = frozenset(s.value for s in TaskStatus)
+
 #: Named, read-only metric queries the ``metric`` resolver may run. A metric ref's
 #: ``locator`` must be one of these names — arbitrary SQL is never executed. Each
 #: returns a single scalar column ``v`` (rendered to text for comparison against
@@ -101,17 +125,24 @@ _METRIC_QUERIES: dict[str, str] = {
 class RefResolution:
     """The outcome of resolving one :class:`EvidenceRef` against source of truth.
 
-    ``resolved`` — the referent was found in source of truth. ``contradicted`` —
-    it was found but its actual value contradicts the ref's ``expected`` (this is
-    the fabrication signal). ``actual`` + ``note`` are LOCAL-ONLY diagnostics
-    (they may carry real values) used to compose the local ``reason``; they are
-    NEVER placed on the event wire.
+    ``resolved`` — the referent was found in source of truth AND its ``expected``
+    (if any) was a well-formed assertion the resolver could check and it matched.
+    ``contradicted`` — the referent was found, ``expected`` was a *well-formed*
+    assertion for the kind, and the actual value differs (this is the fabrication
+    signal). ``malformed`` — the referent may or may not exist, but ``expected``
+    is *ill-formed / uninterpretable* for the kind (wrong syntax, unknown column,
+    non-status task, …); the assertion cannot be checked, so this routes to
+    UNVERIFIABLE (proof requested), NEVER to fabrication. ``malformed`` implies
+    ``resolved=False`` and ``contradicted=False``. ``actual`` + ``note`` are
+    LOCAL-ONLY diagnostics (they may carry real values) used to compose the local
+    ``reason``; they are NEVER placed on the event wire.
     """
 
     kind: str
     locator: str
     resolved: bool
     contradicted: bool = False
+    malformed: bool = False
     actual: Optional[str] = None
     note: str = ""
 
@@ -162,8 +193,15 @@ def _resolve_event(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
 
 
 def _resolve_task(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
-    """``task`` — the task exists; if ``expected`` is given it must equal the task
-    ``status``. Locator: a task uuid, optionally ``task:<uuid>``."""
+    """``task`` — the task exists; if ``expected`` is given it must be a **bare
+    status** from the canonical lifecycle set and equal the task ``status``.
+    Locator: a task uuid, optionally ``task:<uuid>``.
+
+    ``expected`` validation (ADR-0021 follow-up): a task-status assertion is only
+    interpretable as a bare status in :data:`_TASK_STATUSES`. Anything else — a
+    ``db_row``-style ``"status=merged"``, or any non-status string — is
+    *malformed* → UNVERIFIABLE, never a contradiction. Only a well-formed status
+    that differs from the actual status is a fabrication."""
     loc = ref.locator.strip()
     if loc.startswith("task:"):
         loc = loc[5:]
@@ -175,24 +213,42 @@ def _resolve_task(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
         return RefResolution(ref.kind.value, ref.locator, resolved=False,
                              note="no such task")
     actual = row["status"]
-    if ref.expected is not None and actual != ref.expected:
-        return RefResolution(ref.kind.value, ref.locator, resolved=True,
-                             contradicted=True, actual=actual,
-                             note=f"task status is {actual!r}, expected {ref.expected!r}")
+    if ref.expected is not None:
+        want = ref.expected.strip()
+        if want not in _TASK_STATUSES:
+            return RefResolution(ref.kind.value, ref.locator, resolved=False,
+                                 malformed=True, actual=actual,
+                                 note=f"task expected {ref.expected!r} is not a known "
+                                      "status (expected a bare lifecycle status)")
+        if actual != want:
+            return RefResolution(ref.kind.value, ref.locator, resolved=True,
+                                 contradicted=True, actual=actual,
+                                 note=f"task status is {actual!r}, expected {want!r}")
     return RefResolution(ref.kind.value, ref.locator, resolved=True, actual=actual)
 
 
-def _parse_expected_fields(expected: Optional[str]) -> list[tuple[str, str]]:
-    """Parse a ``db_row`` ``expected`` of ``"col=val[,col2=val2...]"`` into pairs."""
+def _parse_expected_fields(
+    expected: Optional[str],
+) -> tuple[list[tuple[str, str]], Optional[str]]:
+    """Parse a ``db_row`` ``expected`` of ``"col=val[,col2=val2...]"`` into pairs.
+
+    Returns ``(fields, error)``. ``error`` is a non-None note when ``expected`` is
+    *malformed* (a segment without ``=``, or a segment with an empty column name);
+    such an ``expected`` cannot be interpreted as a column assertion, so the
+    caller routes it to UNVERIFIABLE rather than treating it as a contradiction.
+    Does NOT raise (ADR-0021 follow-up: mis-formatting is not fabrication)."""
     out: list[tuple[str, str]] = []
     if not expected:
-        return out
+        return out, None
     for part in expected.split(","):
         if "=" not in part:
-            raise ValueError(f"db_row expected must be col=val, got {part!r}")
+            return [], f"db_row expected must be col=val, got {part.strip()!r}"
         col, _, val = part.partition("=")
-        out.append((col.strip(), val.strip()))
-    return out
+        col = col.strip()
+        if not col:
+            return [], f"db_row expected has an empty column name in {part.strip()!r}"
+        out.append((col, val.strip()))
+    return out, None
 
 
 def _resolve_db_row(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
@@ -222,10 +278,15 @@ def _resolve_db_row(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution
     if row is None:
         return RefResolution(ref.kind.value, ref.locator, resolved=False,
                              note="no such row")
-    for col, want in _parse_expected_fields(ref.expected):
-        if col not in row:
+    fields, parse_error = _parse_expected_fields(ref.expected)
+    if parse_error is not None:  # ill-formed spec → unverifiable, not fabrication
+        return RefResolution(ref.kind.value, ref.locator, resolved=False,
+                             malformed=True, note=parse_error)
+    for col, want in fields:
+        if col not in row:  # references a column that doesn't exist → uninterpretable
             return RefResolution(ref.kind.value, ref.locator, resolved=False,
-                                 note=f"no such column {col!r}")
+                                 malformed=True,
+                                 note=f"db_row expected references unknown column {col!r}")
         got = row[col]
         if str(got) != want:
             return RefResolution(ref.kind.value, ref.locator, resolved=True,
@@ -236,7 +297,13 @@ def _resolve_db_row(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution
 
 def _resolve_metric(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
     """``metric`` — a whitelisted read query returns a value matching ``expected``.
-    Locator must be a key of :data:`_METRIC_QUERIES` (arbitrary SQL is refused)."""
+    Locator must be a key of :data:`_METRIC_QUERIES` (arbitrary SQL is refused).
+
+    ``expected`` validation (ADR-0021 follow-up): every whitelisted metric returns
+    an integer count, so a metric assertion is only interpretable as a numeric
+    value. A non-numeric ``expected`` is *malformed* → UNVERIFIABLE, never a
+    contradiction. A numeric ``expected`` that differs from the actual count is a
+    fabrication (compared by integer value, so ``"5"`` == ``" 5 "``)."""
     sql = _METRIC_QUERIES.get(ref.locator.strip())
     if sql is None:
         return RefResolution(ref.kind.value, ref.locator, resolved=False,
@@ -248,16 +315,36 @@ def _resolve_metric(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution
     if actual is None:
         return RefResolution(ref.kind.value, ref.locator, resolved=False,
                              note="metric returned no value")
-    if ref.expected is not None and actual != ref.expected:
-        return RefResolution(ref.kind.value, ref.locator, resolved=True,
-                             contradicted=True, actual=actual,
-                             note=f"metric is {actual!r}, expected {ref.expected!r}")
+    if ref.expected is not None:
+        try:
+            want = int(ref.expected.strip())
+        except (TypeError, ValueError):  # non-numeric spec for a count metric
+            return RefResolution(ref.kind.value, ref.locator, resolved=False,
+                                 malformed=True, actual=actual,
+                                 note=f"metric expected {ref.expected!r} is not a "
+                                      "numeric count")
+        if int(actual) != want:
+            return RefResolution(ref.kind.value, ref.locator, resolved=True,
+                                 contradicted=True, actual=actual,
+                                 note=f"metric is {actual!r}, expected {want!r}")
     return RefResolution(ref.kind.value, ref.locator, resolved=True, actual=actual)
 
 
+def _is_sha256_hex(value: str) -> bool:
+    """True iff ``value`` is a 64-char lowercase-able hex sha256 digest."""
+    v = value.strip().lower()
+    return len(v) == 64 and all(c in "0123456789abcdef" for c in v)
+
+
 def _resolve_file(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
-    """``file`` — a ``path[:line]`` resolves on disk; if ``expected`` is a 64-char
-    hex sha256, the file's digest must match it. (``conn`` unused; kept uniform.)"""
+    """``file`` — a ``path[:line]`` resolves on disk; if ``expected`` is given it
+    must be a 64-char hex sha256 and the file's digest must match it. (``conn``
+    unused; kept uniform.)
+
+    ``expected`` validation (ADR-0021 follow-up): the only interpretable assertion
+    about a file's content is its sha256 digest. A non-hash ``expected`` is
+    *malformed* → UNVERIFIABLE (rather than silently ignored/passed), never a
+    contradiction. A well-formed hash that mismatches is a fabrication."""
     loc = ref.locator.strip()
     path = loc
     head, sep, tail = loc.rpartition(":")
@@ -267,10 +354,14 @@ def _resolve_file(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
         return RefResolution(ref.kind.value, ref.locator, resolved=False,
                              note="path does not exist")
     exp = ref.expected
-    if exp and len(exp) == 64 and all(c in "0123456789abcdef" for c in exp.lower()):
+    if exp is not None:
+        if not _is_sha256_hex(exp):
+            return RefResolution(ref.kind.value, ref.locator, resolved=False,
+                                 malformed=True,
+                                 note="file expected must be a 64-char sha256 hex digest")
         with open(path, "rb") as fh:
             digest = hashlib.sha256(fh.read()).hexdigest()
-        if digest != exp.lower():
+        if digest != exp.strip().lower():
             return RefResolution(ref.kind.value, ref.locator, resolved=True,
                                  contradicted=True, actual=digest,
                                  note="file hash mismatch")
@@ -324,7 +415,11 @@ def resolve_ref(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
 def verify_claim(conn: psycopg.Connection, claim: Claim) -> ClaimVerdict:
     """Return the structural verdict for one FACTUAL claim (see module docstring).
 
-    REJECTED if any ref is contradicted; else VERIFIED iff every ref resolved;
+    REJECTED only if a ref is *contradicted* — i.e. it resolved and its
+    **well-formed** ``expected`` differs from the actual value. A ref whose
+    ``expected`` is *malformed* (uninterpretable for its kind) is NOT a
+    contradiction: it routes to UNVERIFIABLE (proof requested), so a mis-formatted
+    spec is never punished as fabrication. Else VERIFIED iff every ref resolved;
     else UNVERIFIABLE. A judgment should never reach here (judgments are relayed
     labelled, not verified) — if one does it is treated as UNVERIFIABLE (no
     evidence to structurally confirm)."""
@@ -338,8 +433,11 @@ def verify_claim(conn: psycopg.Connection, claim: Claim) -> ClaimVerdict:
         reason = "all evidence resolved and matched"
     else:
         status = VERIFICATION_UNVERIFIABLE
-        missing = "; ".join(r.note for r in resolutions if not r.resolved) or "no evidence"
-        reason = f"unresolved: {missing}"
+        problems = "; ".join(r.note for r in resolutions if not r.resolved) or "no evidence"
+        if any(r.malformed for r in resolutions):
+            reason = f"unverifiable (evidence spec not interpretable): {problems}"
+        else:
+            reason = f"unresolved: {problems}"
     return ClaimVerdict(status=status, refs=resolutions, reason=reason)
 
 
