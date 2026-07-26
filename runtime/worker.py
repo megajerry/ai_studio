@@ -1021,8 +1021,9 @@ def run_once(
     # Resolve the claimed task's workstream config (config-not-code). None when the
     # workstream has no config file → the platform's inline base behavior is used
     # (behavior-preserving). When present, it drives the role prompts (charter +
-    # per-role overlays), the Verifier's domain checkers, and — merged over the
-    # base — this workstream's policy grants + skill set. Budget/policy are already
+    # per-role overlays), the Verifier's domain checkers, and — unioned onto the
+    # base (additive grants + explicit revocations) — this workstream's policy
+    # grants + skill set. Budget/policy are already
     # keyed by workstream in the DB (budgets table / effective policy).
     wcfg = resolve_config(task.workstream)
     eff_config = wcfg.effective_policy(config) if (wcfg and config is not None) else config

@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from runtime import db
+from runtime.capabilities import Capability
 from runtime.enforce import MemoryEventSink
 from runtime.policy import load_policy
 from runtime.roles.executor import ExecutorResult
@@ -92,9 +93,15 @@ def test_committed_example_config_loads_and_drives_seams():
     assert cfg.overlay_for("pm") and cfg.overlay_for("executor")
     assert "video_audit" in cfg.checker_registry().names()
     assert cfg.object_store_bucket == "ws-example-video"
-    # policy grants merge over the base: operator gains fs.write here.
-    eff = cfg.effective_policy(load_policy())
-    assert "fs.write" in {c.value for c in eff.granted("operator")}
+    # policy grants are ADDITIVE (union): operator gains fs.write here while
+    # KEEPING every base capability — no base grant is silently dropped, and none
+    # is over-granted (effective = base ∪ {fs.write}, exactly).
+    base = load_policy()
+    eff = cfg.effective_policy(base)
+    base_operator = {c.value for c in base.granted("operator")}
+    eff_operator = {c.value for c in eff.granted("operator")}
+    assert base_operator <= eff_operator  # nothing dropped
+    assert eff_operator == base_operator | {"fs.write"}  # exactly the one addition
 
 
 def test_full_config_round_trips(tmp_path):
@@ -196,14 +203,59 @@ def test_effective_policy_no_grants_returns_base_unchanged():
     assert cfg.effective_policy(base) is base  # behavior-preserving
 
 
-def test_effective_policy_merges_grants_over_base():
+def test_effective_policy_unions_grants_over_base():
+    """policy_grants is ADDITIVE: a role KEEPS its base grants and gains the new
+    ones (union, never REPLACE — adding one grant can't silently drop the base)."""
     base = load_policy()
-    cfg = WorkstreamConfig(name="x", policy_grants={"executor": ["fs.read"]})
+    base_executor = base.granted("executor")  # {fs.read, fs.write}
+    assert Capability.FS_WRITE in base_executor  # precondition for the drop check
+    cfg = WorkstreamConfig(name="x", policy_grants={"executor": ["net.fetch"]})
     eff = cfg.effective_policy(base)
-    # executor lost fs.write for THIS workstream (grants are replaced per role)...
-    assert {c.value for c in eff.granted("executor")} == {"fs.read"}
-    # ...but roles not named keep the base grant (verifier untouched).
+    eff_executor = eff.granted("executor")
+    # base capabilities are RETAINED (fs.write not silently dropped) ...
+    assert base_executor <= eff_executor
+    # ... and the new grant is added — effective = base ∪ {net.fetch}, exactly.
+    assert eff_executor == base_executor | {Capability.NET_FETCH}
+    # roles not named keep the base grant (verifier untouched).
     assert eff.granted("verifier") == base.granted("verifier")
+
+
+def test_effective_policy_explicit_revocation_scopes_role_down():
+    """policy_revocations is the EXPLICIT way to remove a base capability for THIS
+    workstream (least-privilege scope-down) — applied after the union."""
+    base = load_policy()
+    assert Capability.FS_WRITE in base.granted("executor")
+    cfg = WorkstreamConfig(name="x", policy_revocations={"executor": ["fs.write"]})
+    eff = cfg.effective_policy(base)
+    eff_executor = {c.value for c in eff.granted("executor")}
+    assert "fs.write" not in eff_executor  # deliberately removed
+    assert "fs.read" in eff_executor  # other base grants retained
+    # roles not named are untouched.
+    assert eff.granted("verifier") == base.granted("verifier")
+
+
+def test_effective_policy_revocation_wins_over_grant():
+    """A capability in BOTH policy_grants and policy_revocations is removed
+    (revocation applied last), so removal stays deliberate and unambiguous."""
+    base = load_policy()
+    cfg = WorkstreamConfig(
+        name="x",
+        policy_grants={"executor": ["net.fetch"]},
+        policy_revocations={"executor": ["net.fetch", "fs.write"]},
+    )
+    eff = {c.value for c in cfg.effective_policy(base).granted("executor")}
+    assert "net.fetch" not in eff and "fs.write" not in eff
+    assert "fs.read" in eff  # untouched base grant
+
+
+def test_effective_policy_revocations_only_returns_new_config():
+    """Revocations alone (no grants) still compose — the base is not returned
+    unchanged when only a revocation is present."""
+    base = load_policy()
+    cfg = WorkstreamConfig(name="x", policy_revocations={"executor": ["fs.write"]})
+    eff = cfg.effective_policy(base)
+    assert eff is not base
+    assert Capability.FS_WRITE not in eff.granted("executor")
 
 
 def test_effective_skills_subset_and_fallback():
@@ -299,10 +351,13 @@ def test_unconfigured_workstream_prompt_is_behavior_preserving(tmp_path, monkeyp
 
 
 def test_worker_applies_workstream_policy_grants(tmp_path):
-    """A workstream config that DENIES the executor fs.write makes the executor's
-    write fail through the worker — the config's policy grants actually gate."""
+    """A workstream config that REVOKES the executor's fs.write makes the
+    executor's write fail through the worker — the config's policy scoping (the
+    explicit revocation) actually gates end-to-end."""
     ws_dir = tmp_path / "ws"
-    _write_config(ws_dir, "locked", "name: locked\npolicy_grants:\n  executor: [fs.read]\n")
+    _write_config(
+        ws_dir, "locked", "name: locked\npolicy_revocations:\n  executor: [fs.write]\n"
+    )
 
     sink = MemoryEventSink()
     q = _work_task_queue(sink, "locked", {"goal": "g", "criterion": "c", "marker": "studio-ok:L"})

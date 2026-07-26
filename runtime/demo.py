@@ -279,7 +279,10 @@ def _demonstrate_workstream_config(conn, scratch: str) -> bool:
         "role_overlays:\n"
         "  executor: Record duration_seconds and captions in the clip artifact.\n"
         "budget:\n  cap_usd: 25.0\n  period: monthly\n"
-        "policy_grants:\n  executor: [fs.read, fs.write]\n"
+        # ADDITIVE grant: lists ONLY net.fetch, yet the executor still writes its
+        # artifact below — proving fs.write is RETAINED from the base policy (union,
+        # not REPLACE). A REPLACE would have silently dropped fs.write and failed.
+        "policy_grants:\n  executor: [net.fetch]\n"
         "checkers: [video_audit]\n"
         "memory_seed:\n"
         "  - text: Never publish a clip without captions and a thumbnail.\n"
@@ -331,8 +334,27 @@ def _demonstrate_workstream_config(conn, scratch: str) -> bool:
     overlay_in_prompt = "Record duration_seconds" in captured.get("prompt", "")
     print(f"  role prompt driven by config: charter={charter_in_prompt} overlay={overlay_in_prompt}")
 
+    # 4. Policy grants are ADDITIVE (union over base); a role scopes DOWN only via
+    #    an EXPLICIT revocation — adding one grant never silently drops the base set.
+    from .workstream.config import WorkstreamConfig
+
+    base_pol = load_policy()
+    base_exec = {c.value for c in base_pol.granted("executor")}
+    add_exec = {c.value for c in WorkstreamConfig(
+        name=ws, policy_grants={"executor": ["net.fetch"]}
+    ).effective_policy(base_pol).granted("executor")}
+    rev_exec = {c.value for c in WorkstreamConfig(
+        name=ws, policy_revocations={"executor": ["fs.write"]}
+    ).effective_policy(base_pol).granted("executor")}
+    union_ok = base_exec <= add_exec and add_exec == base_exec | {"net.fetch"}
+    revoke_ok = "fs.write" not in rev_exec and "fs.read" in rev_exec
+    print(f"  policy union:  base executor={sorted(base_exec)}")
+    print(f"                 +grant net.fetch -> {sorted(add_exec)} (base kept) union_ok={union_ok}")
+    print(f"                 -revoke fs.write -> {sorted(rev_exec)} explicit scope-down revoke_ok={revoke_ok}")
+
     return bool(cfg and budget_ok and len(r1.seeds_added) == 1 and r2.seeds_added == []
-                and isolated and charter_in_prompt and overlay_in_prompt)
+                and isolated and charter_in_prompt and overlay_in_prompt
+                and union_ok and revoke_ok)
 
 
 def _demonstrate_failure_analyst(conn, scratch: str) -> bool:
