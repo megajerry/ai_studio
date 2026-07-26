@@ -170,11 +170,14 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
   genuine contradiction on another field → UNVERIFIABLE (misses the strike) but still
   WITHHOLDS the false claim (fails safe); optionally make a real contradiction take
   precedence over a malformed sibling field within one ref.
-- **Test isolation under a polluted shared DB**: several worker/lifecycle tests
-  (e.g. `test_approvals_db` worker-block flow) assume a quiet queue and fail when the
-  shared ephemeral DB has many stray `up_for_grabs` tasks (grab-by-sort claims a
-  cross-workstream task). Product is correct; tests should scope the worker to their
-  own workstream or reset the DB per run. Surfaced 2026-07-23.
+- ✅ **RESOLVED (b867a62)** — Test isolation under a polluted shared DB: the suite
+  already tolerates a polluted queue via per-test unique-workstream scoping (verified
+  888 passing under 5280 stray `up_for_grabs`); 2 genuinely concurrency-flaky
+  `runtime_bridge` tests were hardened to own-scope invariants. An unconditional
+  session-TRUNCATE fixture was evaluated and REJECTED as net-negative on the shared
+  multi-agent DB (clobbers concurrent runs' scoped rows + ACCESS-EXCLUSIVE startup
+  stall). Real per-session schema/DB isolation remains a possible future upgrade if
+  concurrent test runs ever need full independence.
 - `burn_rate` per-minute rate can inflate when seeded `model.call` events share a
   near-zero timestamp span (guard only covers <2 calls); non-blocking, `calls_to_exhaustion` unaffected. (ADR-0022 polish.)
 - Budget pre-spend check runs against the *routed* spec; a Cursor→Opus runtime
