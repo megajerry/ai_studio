@@ -206,16 +206,31 @@ class BudgetStatus:
     warn_frac: Optional[float] = None
     throttle_frac: Optional[float] = None
     reserve_frac: Optional[float] = None
+    #: In-flight reservation cushion (ADR-0016 / this pass): the sum of estimates
+    #: for calls that have passed :func:`enforce` but whose real ``model.call`` has
+    #: not landed yet. Counted toward the gate ALONGSIDE this call's own estimate so
+    #: concurrent pre-checks see each other and can't collectively breach the cap.
+    #: Defaults to ``0`` — a status built outside the enforce lock (``remaining`` /
+    #: ``budget_context`` / the pure-logic tests) carries no cushion, so its verdict
+    #: is exactly the old ``spent + est`` predicate.
+    reserved_usd: float = 0.0
+    reserved_tokens: int = 0
 
     def context(self) -> BudgetContext:
-        """The equivalent :class:`~runtime.policy.BudgetContext` (real spend)."""
+        """The equivalent :class:`~runtime.policy.BudgetContext`.
+
+        The in-flight reservation cushion is folded into the *estimated* component
+        so the shared predicate gates on ``spent + reserved + est`` vs the cap — the
+        old behavior when ``reserved == 0`` (every non-enforce caller), tightened
+        under concurrency when other in-flight calls have reserved.
+        """
         return BudgetContext(
             spent_tokens=self.spent_tokens,
             budget_tokens=self.cap_tokens,
-            estimated_tokens=self.est_tokens,
+            estimated_tokens=self.est_tokens + self.reserved_tokens,
             spent_usd=self.spent_usd,
             budget_usd=self.cap_usd,
-            estimated_usd=self.est_usd,
+            estimated_usd=self.est_usd + self.reserved_usd,
         )
 
     @property
@@ -238,13 +253,23 @@ class BudgetStatus:
     # --- Graduated capacity governance (ADR-0022) ---------------------------
 
     def fraction(self) -> Optional[float]:
-        """Projected spent-fraction ``(spent+est)/cap`` — the MAX across configured
-        caps (the tightest resource), or ``None`` if no cap is set."""
+        """Projected spent-fraction ``(spent+reserved+est)/cap`` — the MAX across
+        configured caps (the tightest resource), or ``None`` if no cap is set.
+
+        The in-flight reservation cushion is included so the zone (ADR-0022) a call
+        lands in reflects OTHER concurrent in-flight calls too; it is ``0`` for any
+        status built outside the enforce lock, so the fraction is the old
+        ``(spent+est)/cap`` there."""
         fracs: list[float] = []
         if self.cap_usd is not None and self.cap_usd > 0:
-            fracs.append((self.spent_usd + self.est_usd) / self.cap_usd)
+            fracs.append(
+                (self.spent_usd + self.reserved_usd + self.est_usd) / self.cap_usd
+            )
         if self.cap_tokens is not None and self.cap_tokens > 0:
-            fracs.append((self.spent_tokens + self.est_tokens) / self.cap_tokens)
+            fracs.append(
+                (self.spent_tokens + self.reserved_tokens + self.est_tokens)
+                / self.cap_tokens
+            )
         return max(fracs) if fracs else None
 
     @property
@@ -792,6 +817,82 @@ def _budget_fingerprint(workstream: str, period: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _spent_in_tx(
+    cur: psycopg.Cursor, workstream: Optional[str], period: str
+) -> Spend:
+    """Real accrued spend for ``workstream`` (or org-wide when ``None``) in
+    ``period``, read on an ALREADY-OPEN cursor WITHOUT committing.
+
+    Same ``model.call`` cost source as :func:`spent` / :func:`org_spent`, but it
+    runs inside the caller's transaction (the enforce row lock) so the spend read
+    and the reservation write are one atomic unit — a separate committing read
+    (like :func:`spent`) would break that transaction. ``workstream=None`` drops
+    the workstream filter for the org ceiling total.
+    """
+    window = _window_clause(period)
+    ws_clause = "" if workstream is None else "AND workstream = %s"
+    params: tuple = () if workstream is None else (workstream,)
+    cur.execute(
+        f"""
+        SELECT
+            COALESCE(sum((payload->>'cost_usd')::numeric), 0) AS cost_usd,
+            COALESCE(sum((payload->>'input_tokens')::bigint
+                       + (payload->>'output_tokens')::bigint), 0) AS tokens,
+            count(*) AS calls
+        FROM events
+        WHERE type = 'model.call' {ws_clause} AND {window}
+        """,
+        params,
+    )
+    row = cur.fetchone()
+    return Spend(
+        cost_usd=float(row["cost_usd"]),
+        tokens=int(row["tokens"]),
+        calls=int(row["calls"]),
+    )
+
+
+def release_reservation(
+    conn: psycopg.Connection,
+    workstream: str,
+    *,
+    est_usd: float = 0.0,
+    est_tokens: int = 0,
+) -> None:
+    """Release an in-flight reservation made by :func:`enforce` (ADR-0016).
+
+    Decrements ``reserved_usd`` / ``reserved_tokens`` by the SAME estimate
+    :func:`enforce` reserved, on the caller's allocation rows AND the org ceiling
+    (the exact set enforce incremented). Call it once the real ``model.call`` spend
+    is recorded — the reservation was only a provisional cushion; real accrued spend
+    is the source of truth — AND on a failed/aborted call, so a call that never
+    lands can't leak a reservation that permanently shrinks the cap.
+
+    ``GREATEST(... , 0)`` floors each column at zero so a double-release (or a
+    reservation whose row appeared/vanished mid-flight) can never drive the cushion
+    negative. A zero estimate is a no-op.
+    """
+    if est_usd == 0.0 and est_tokens == 0:
+        return
+    workstreams = (
+        [workstream]
+        if workstream == ORG_WORKSTREAM
+        else [workstream, ORG_WORKSTREAM]
+    )
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE budgets
+                SET reserved_usd    = GREATEST(reserved_usd - %s, 0),
+                    reserved_tokens = GREATEST(reserved_tokens - %s, 0),
+                    updated_at = now()
+                WHERE workstream = ANY(%s)
+                """,
+                (est_usd, est_tokens, workstreams),
+            )
+
+
 def enforce(
     conn: psycopg.Connection,
     workstream: str,
@@ -826,82 +927,191 @@ def enforce(
     returns ``[]``. A cap-only row (no threshold fractions) has only ``ok`` /
     ``over`` zones, so it behaves exactly as the old hard cap. ``request_approval``
     is injectable for tests; it defaults to the real persisted approval loop.
+
+    **Concurrency (ADR-0016).** The read-then-decide used to be a TOCTOU race: N
+    in-flight calls near the cap all read the same stale accrued spend and all
+    passed, so their combined spend blew past the ceiling. The gate now runs the
+    read + verdict + RESERVATION as one atomic step under ``SELECT ... FOR UPDATE``
+    on the ``(workstream, period)`` budget row(s): each allowed call reserves its
+    estimate before releasing the lock, so a concurrent call SEES it (spent +
+    reserved + est) and is bounded. The reservation is provisional — release it with
+    :func:`release_reservation` once the real ``model.call`` spend is recorded (or
+    the call fails). Only the atomic lock+reserve is in the transaction; the
+    ``budget.*`` events + 🛑 approval are emitted AFTER it commits (so a blocked
+    call's telemetry is never rolled back), exactly as before.
     """
     if purpose not in VALID_PURPOSES:
         raise ValueError(f"invalid purpose {purpose!r} (allowed: {VALID_PURPOSES})")
 
     # Enforceable caps: this workstream's allocation rows + the org ceiling rows
-    # (skip the org lookup when we ARE the org sentinel). Tracking-only rows
-    # (no cap set) constrain nothing and are dropped.
-    budgets = list_budgets(conn, workstream)
-    if workstream != ORG_WORKSTREAM:
-        budgets = budgets + list_budgets(conn, ORG_WORKSTREAM)
-    entries = [
-        status(conn, b, est_usd=est_usd, est_tokens=est_tokens)
-        for b in budgets
-        if not (b.cap_usd is None and b.cap_tokens is None)
-    ]
+    # (skip the org lookup when we ARE the org sentinel).
+    workstreams = (
+        [workstream]
+        if workstream == ORG_WORKSTREAM
+        else [workstream, ORG_WORKSTREAM]
+    )
+
+    # --- Phase 1: lock + decide + reserve, atomically. -----------------------
+    # SELECT ... FOR UPDATE serializes concurrent enforces on the SAME rows, so the
+    # spent+reserved read below and the reservation increment are one indivisible
+    # unit. ORDER BY (workstream, period) gives a stable lock order (deadlock-safe).
+    # We do NOT emit events / raise here: a rollback would erase a blocked call's
+    # telemetry. We compute the verdict, (if allowed) reserve, commit, THEN act.
+    entries: list[BudgetStatus] = []
+    did_reserve = False  # True once the Phase-1 reservation has COMMITTED
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {_BUDGET_COLS}, reserved_usd, reserved_tokens
+                FROM budgets
+                WHERE workstream = ANY(%s)
+                ORDER BY workstream, period
+                FOR UPDATE
+                """,
+                (workstreams,),
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                b = _row_to_budget(row)
+                # Tracking-only rows (no cap set) constrain nothing and are dropped.
+                if b.cap_usd is None and b.cap_tokens is None:
+                    continue
+                is_org = b.workstream == ORG_WORKSTREAM
+                s = _spent_in_tx(cur, None if is_org else b.workstream, b.period)
+                entries.append(
+                    BudgetStatus(
+                        workstream=b.workstream,
+                        period=b.period,
+                        cap_usd=b.cap_usd,
+                        cap_tokens=b.cap_tokens,
+                        spent_usd=s.cost_usd,
+                        spent_tokens=s.tokens,
+                        est_usd=est_usd,
+                        est_tokens=est_tokens,
+                        warn_frac=b.warn_frac,
+                        throttle_frac=b.throttle_frac,
+                        reserve_frac=b.reserve_frac,
+                        reserved_usd=None if row["reserved_usd"] is None
+                        else float(row["reserved_usd"]),
+                        reserved_tokens=int(row["reserved_tokens"] or 0),
+                    )
+                )
+
+            if not entries:
+                # Unconstrained: nothing locked to reserve on; the empty tx commits.
+                over = withheld = None
+            else:
+                # Decide on the caller's own allocation FIRST, then the org ceiling
+                # (preserving the pre-ADR-0016 evaluation order regardless of the
+                # SQL sort used for lock stability).
+                ordered = sorted(
+                    entries, key=lambda st: (st.workstream == ORG_WORKSTREAM, st.period)
+                )
+                over = next((st for st in ordered if st.zone == ZONE_OVER), None)
+                withheld = None
+                if over is None and purpose not in RESERVE_PURPOSES:
+                    withheld = next(
+                        (st for st in ordered if st.zone == ZONE_RESERVE), None
+                    )
+                # Allowed → reserve this call's estimate on every locked cap row so
+                # concurrent enforces see it. Blocked → reserve nothing.
+                if over is None and withheld is None and (est_usd or est_tokens):
+                    cur.execute(
+                        """
+                        UPDATE budgets
+                        SET reserved_usd    = reserved_usd + %s,
+                            reserved_tokens = reserved_tokens + %s,
+                            updated_at = now()
+                        WHERE workstream = ANY(%s)
+                          AND NOT (cap_usd IS NULL AND cap_tokens IS NULL)
+                        """,
+                        (est_usd, est_tokens, workstreams),
+                    )
+                    did_reserve = True
+    # Lock released here; an allowed call's reservation is now durable + visible.
+    # ``did_reserve`` is True ONLY on the allowed path where the UPDATE ran AND the
+    # transaction committed — a Phase-1 failure rolls the tx back (nothing reserved,
+    # flag stays False), so a post-commit release below can never spuriously free a
+    # reservation that another in-flight call holds.
+
     if not entries:
         return []
 
-    # 1. Hard cap (allocation OR org): any 'over' blocks + raises the 🛑 approval.
-    for st in entries:
-        if st.zone == ZONE_OVER:
-            sink.emit(
-                make_event(
-                    workstream=workstream,
-                    type=EVENT_BUDGET_EXCEEDED,
-                    task_id=task_id,
-                    payload={"reason": st.exceed_reason(), **st.to_payload()},
-                )
-            )
-            # 🛑 raising the ceiling is a stakeholder decision (ADR-0006). Idempotent
-            # per (offending scope)+period so repeated blocked calls don't pile up.
-            request_approval(
-                conn,
-                task_id=task_id,
-                role=role,
-                tool="model.call",
-                capabilities=[],
-                tier=RAISE_BUDGET_TIER,
-                reason=(
-                    f"raise budget for {st.workstream} ({st.period}): "
-                    + st.exceed_reason()
-                ),
-                sink=sink,
-                workstream=workstream,
-                fingerprint=_budget_fingerprint(st.workstream, st.period),
-            )
-            raise OverBudget(st)
-
-    # 2. Reserve zone: a 'normal' call is WITHHELD (buffer preserved); wind_down /
-    #    escalation is allowed through. No approval — this is not a ceiling raise.
-    if purpose not in RESERVE_PURPOSES:
-        for st in entries:
-            if st.zone == ZONE_RESERVE:
-                sink.emit(
-                    make_event(
-                        workstream=workstream,
-                        type=EVENT_BUDGET_RESERVE,
-                        task_id=task_id,
-                        payload=st.zone_payload(purpose=purpose),
-                    )
-                )
-                raise OverBudget(st)
-
-    # 3. Allowed: emit each cap's zone event (warn / throttle / reserve-allowed /
-    #    checkpoint) and return the statuses.
-    for st in entries:
-        z = st.zone
-        payload = (
-            st.to_payload() if z == ZONE_OK else st.zone_payload(purpose=purpose)
-        )
+    # --- Phase 2: side effects, AFTER the lock/reservation committed. ---------
+    # 1. Hard cap (allocation OR org): 'over' blocks + raises the 🛑 approval.
+    if over is not None:
         sink.emit(
             make_event(
                 workstream=workstream,
-                type=_ZONE_EVENT[z],
+                type=EVENT_BUDGET_EXCEEDED,
                 task_id=task_id,
-                payload=payload,
+                payload={"reason": over.exceed_reason(), **over.to_payload()},
             )
         )
+        # 🛑 raising the ceiling is a stakeholder decision (ADR-0006). Idempotent
+        # per (offending scope)+period so repeated blocked calls don't pile up.
+        request_approval(
+            conn,
+            task_id=task_id,
+            role=role,
+            tool="model.call",
+            capabilities=[],
+            tier=RAISE_BUDGET_TIER,
+            reason=(
+                f"raise budget for {over.workstream} ({over.period}): "
+                + over.exceed_reason()
+            ),
+            sink=sink,
+            workstream=workstream,
+            fingerprint=_budget_fingerprint(over.workstream, over.period),
+        )
+        raise OverBudget(over)
+
+    # 2. Reserve zone: a 'normal' call is WITHHELD (buffer preserved); wind_down /
+    #    escalation is allowed through. No approval — this is not a ceiling raise.
+    if withheld is not None:
+        sink.emit(
+            make_event(
+                workstream=workstream,
+                type=EVENT_BUDGET_RESERVE,
+                task_id=task_id,
+                payload=withheld.zone_payload(purpose=purpose),
+            )
+        )
+        raise OverBudget(withheld)
+
+    # 3. Allowed: emit each cap's zone event (warn / throttle / reserve-allowed /
+    #    checkpoint) and return the statuses. Emit in allocation-then-org order
+    #    (the pre-ADR-0016 order), independent of the SQL lock sort.
+    #
+    # The reservation is already COMMITTED (Phase 1). If a zone-event emit raises
+    # here — AFTER the commit but BEFORE we return — the caller never learns the
+    # call was allowed, so it can't release the reservation and the cushion would
+    # leak (permanently shrinking the cap). Guard the emit so a post-commit failure
+    # releases THIS call's reservation before re-raising. Uses ``did_reserve`` so it
+    # only ever undoes a reservation this call actually made (never one held by a
+    # concurrent in-flight call).
+    try:
+        for st in sorted(
+            entries, key=lambda s: (s.workstream == ORG_WORKSTREAM, s.period)
+        ):
+            z = st.zone
+            payload = (
+                st.to_payload() if z == ZONE_OK else st.zone_payload(purpose=purpose)
+            )
+            sink.emit(
+                make_event(
+                    workstream=workstream,
+                    type=_ZONE_EVENT[z],
+                    task_id=task_id,
+                    payload=payload,
+                )
+            )
+    except BaseException:
+        if did_reserve:
+            release_reservation(
+                conn, workstream, est_usd=est_usd, est_tokens=est_tokens
+            )
+        raise
     return entries

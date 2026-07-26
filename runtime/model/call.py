@@ -172,60 +172,27 @@ def call_model(
     # 2. budget — gate against the workstream's real accrued spend BEFORE spending.
     #    No-op without a conn or when the workstream has no cap set; over cap it
     #    raises budget.OverBudget + a 🛑 approval (ADR-0006) — the call never runs.
-    if conn is not None:
-        from ..budget import enforce as _enforce_budget
-        from ..budget import estimate_call_io_tokens
-
-        # Price input AND output tokens separately (output usually bills higher):
-        # a pre-call figure that priced the whole token sum at the input rate
-        # systematically under-counted and could let a call slip past a cap.
-        est_input, est_output = estimate_call_io_tokens(messages)
-        est_tokens = est_input + est_output
-        est_usd = cost_usd(
-            spec, Usage(input_tokens=est_input, output_tokens=est_output)
-        )
-        _enforce_budget(
-            conn,
-            workstream,
-            est_usd=est_usd,
-            est_tokens=est_tokens,
-            purpose=purpose,
-            role=role,
-            task_id=task_id,
-            sink=sink,
-        )
-
-    # 3. select provider (dry-run if forced / no adapter / no key).
-    provider = select_provider(spec, force_dry_run=force_dry_run)
-
-    # 4. complete, timing the call for latency telemetry. If the provider signals
-    #    a recoverable failure (ProviderFallback — e.g. the Cursor CLI hangs and
-    #    hits its timeout), walk the routed tier's data-driven chain to the next
-    #    present model (a metered fallback) and retry there ONCE, so coding/agentic
-    #    work is never blocked on the flat-rate substrate. This is pure provider
-    #    dispatch: routing/cost/budget accounting below still use the model that
-    #    actually served the call.
-    start = time.monotonic()
+    #    When it ALLOWS, enforce RESERVES this call's estimate (ADR-0016) so
+    #    concurrent gates see it and can't collectively breach the cap; that
+    #    reservation is provisional and MUST be released once real spend is recorded
+    #    (or the call fails/aborts), so we track every reservation made and release
+    #    them all in the finally below — no leaked reservation shrinks the cap.
+    reservations: list[tuple[float, int]] = []
     try:
-        completion = provider.complete(spec.id, messages, **opts)
-    except ProviderFallback:
-        fallback = next_candidate(registry, spec.tier, spec.id)
-        if fallback is None:
-            raise
-        spec = fallback
-        # Re-gate the retry against the FALLBACK spec's cost before spending on it
-        # (behavior change — see module docstring step 4 / ADR-0022/0006). The
-        # pre-spend enforce above ran against the ROUTED spec; a ProviderFallback
-        # reassigns to a (typically pricier) fallback model, so without re-checking
-        # a fallback that breaches the cap would run and only be accounted after
-        # the fact. Re-running enforce here gates it exactly like a first-choice
-        # over-cap call: it emits budget.exceeded, raises the 🛑 "raise budget"
-        # approval, and raises OverBudget — the retry never runs. A fallback that
-        # is within budget is unaffected (enforce simply returns and it proceeds).
         if conn is not None:
+            from ..budget import enforce as _enforce_budget
+            from ..budget import estimate_call_io_tokens
+
+            # Price input AND output tokens separately (output usually bills higher):
+            # a pre-call figure that priced the whole token sum at the input rate
+            # systematically under-counted and could let a call slip past a cap.
+            est_input, est_output = estimate_call_io_tokens(messages)
+            est_tokens = est_input + est_output
             est_usd = cost_usd(
                 spec, Usage(input_tokens=est_input, output_tokens=est_output)
             )
+            # Raises OverBudget when blocked (nothing reserved → nothing to release);
+            # on ALLOW it reserved (est_usd, est_tokens) — record it for release.
             _enforce_budget(
                 conn,
                 workstream,
@@ -236,52 +203,111 @@ def call_model(
                 task_id=task_id,
                 sink=sink,
             )
+            reservations.append((est_usd, est_tokens))
+
+        # 3. select provider (dry-run if forced / no adapter / no key).
         provider = select_provider(spec, force_dry_run=force_dry_run)
+
+        # 4. complete, timing the call for latency telemetry. If the provider signals
+        #    a recoverable failure (ProviderFallback — e.g. the Cursor CLI hangs and
+        #    hits its timeout), walk the routed tier's data-driven chain to the next
+        #    present model (a metered fallback) and retry there ONCE, so coding/agentic
+        #    work is never blocked on the flat-rate substrate. This is pure provider
+        #    dispatch: routing/cost/budget accounting below still use the model that
+        #    actually served the call.
+        start = time.monotonic()
         try:
             completion = provider.complete(spec.id, messages, **opts)
+        except ProviderFallback:
+            fallback = next_candidate(registry, spec.tier, spec.id)
+            if fallback is None:
+                raise
+            spec = fallback
+            # Re-gate the retry against the FALLBACK spec's cost before spending on it
+            # (behavior change — see module docstring step 4 / ADR-0022/0006). The
+            # pre-spend enforce above ran against the ROUTED spec; a ProviderFallback
+            # reassigns to a (typically pricier) fallback model, so without re-checking
+            # a fallback that breaches the cap would run and only be accounted after
+            # the fact. Re-running enforce here gates it exactly like a first-choice
+            # over-cap call: it emits budget.exceeded, raises the 🛑 "raise budget"
+            # approval, and raises OverBudget — the retry never runs. A fallback that
+            # is within budget is unaffected (enforce simply returns and it proceeds).
+            if conn is not None:
+                est_usd = cost_usd(
+                    spec, Usage(input_tokens=est_input, output_tokens=est_output)
+                )
+                _enforce_budget(
+                    conn,
+                    workstream,
+                    est_usd=est_usd,
+                    est_tokens=est_tokens,
+                    purpose=purpose,
+                    role=role,
+                    task_id=task_id,
+                    sink=sink,
+                )
+                reservations.append((est_usd, est_tokens))
+            provider = select_provider(spec, force_dry_run=force_dry_run)
+            try:
+                completion = provider.complete(spec.id, messages, **opts)
+            except Exception as exc:
+                # The metered fallback also died — attributable telemetry, then re-raise.
+                _emit_call_failed(sink, exc, spec, provider, role, task_type, task_id,
+                                  workstream, trace_id, span_id)
+                raise
         except Exception as exc:
-            # The metered fallback also died — attributable telemetry, then re-raise.
+            # A provider death that is NOT the recoverable ProviderFallback signal: emit
+            # body-free failure telemetry (R3) before re-raising. Success path unchanged.
             _emit_call_failed(sink, exc, spec, provider, role, task_type, task_id,
                               workstream, trace_id, span_id)
             raise
-    except Exception as exc:
-        # A provider death that is NOT the recoverable ProviderFallback signal: emit
-        # body-free failure telemetry (R3) before re-raising. Success path unchanged.
-        _emit_call_failed(sink, exc, spec, provider, role, task_type, task_id,
-                          workstream, trace_id, span_id)
-        raise
-    latency_ms = int((time.monotonic() - start) * 1000)
+        latency_ms = int((time.monotonic() - start) * 1000)
 
-    # 5. cost = tokens × registry price (single source of cost truth).
-    cost = cost_usd(spec, completion.usage)
+        # 5. cost = tokens × registry price (single source of cost truth).
+        cost = cost_usd(spec, completion.usage)
 
-    # 6. emit the model.call event. Only numbers + ids — never prompt/secret text.
-    sink.emit(
-        make_event(
-            workstream=workstream,
-            type=EVENT_MODEL_CALL,
-            task_id=task_id,
-            trace_id=trace_id,
-            span_id=span_id,
-            payload={
-                "model": spec.id,
-                "provider": provider.name,
-                "role": role,
-                "task_type": task_type,
-                "task_id": str(task_id) if task_id else None,
-                "input_tokens": completion.usage.input_tokens,
-                "output_tokens": completion.usage.output_tokens,
-                "cached_tokens": completion.usage.cached_tokens,
-                "cost_usd": cost,
-                "latency_ms": latency_ms,
-            },
+        # 6. emit the model.call event. Only numbers + ids — never prompt/secret text.
+        sink.emit(
+            make_event(
+                workstream=workstream,
+                type=EVENT_MODEL_CALL,
+                task_id=task_id,
+                trace_id=trace_id,
+                span_id=span_id,
+                payload={
+                    "model": spec.id,
+                    "provider": provider.name,
+                    "role": role,
+                    "task_type": task_type,
+                    "task_id": str(task_id) if task_id else None,
+                    "input_tokens": completion.usage.input_tokens,
+                    "output_tokens": completion.usage.output_tokens,
+                    "cached_tokens": completion.usage.cached_tokens,
+                    "cost_usd": cost,
+                    "latency_ms": latency_ms,
+                },
+            )
         )
-    )
 
-    # 7. account: add this call's tokens to the task's running spend (if wired).
-    if conn is not None and task_id is not None:
-        from ..tasks import add_spent_tokens
+        # 7. account: add this call's tokens to the task's running spend (if wired).
+        if conn is not None and task_id is not None:
+            from ..tasks import add_spent_tokens
 
-        add_spent_tokens(conn, task_id, completion.usage.total_tokens)
+            add_spent_tokens(conn, task_id, completion.usage.total_tokens)
 
-    return completion
+        return completion
+    finally:
+        # Release every in-flight reservation this call made (ADR-0016): the real
+        # spend is now recorded in the model.call event (source of truth) — or the
+        # call failed/aborted and never spent. Either way the provisional cushion
+        # must be returned so it doesn't permanently shrink the cap. Runs on the
+        # success path, on OverBudget from the fallback re-gate, and on a provider
+        # death alike. (An OverBudget from the FIRST enforce reserved nothing, so
+        # `reservations` is empty and this is a no-op.)
+        if conn is not None and reservations:
+            from ..budget import release_reservation
+
+            for r_usd, r_tokens in reservations:
+                release_reservation(
+                    conn, workstream, est_usd=r_usd, est_tokens=r_tokens
+                )
