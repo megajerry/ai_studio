@@ -10,6 +10,8 @@ correctness; period windowing; over-cap → the next model call is gated
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import pytest
@@ -775,3 +777,144 @@ def test_fallback_within_budget_still_runs(conn, ws, monkeypatch):
     assert len(served) == 1
     # It accrued (seeded call + this fallback call).
     assert budget.spent(conn, ws).calls == 2
+
+
+# ===========================================================================
+# Concurrency: the enforce() TOCTOU race is closed by an atomic reservation
+# (ADR-0016). Each thread owns its OWN connection (psycopg conns aren't
+# thread-safe); a barrier maximizes the overlap near the cap.
+# ===========================================================================
+
+
+def _reserved(conn, ws, *, period="monthly"):
+    """Read a budget row's in-flight (reserved_usd, reserved_tokens)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT reserved_usd, reserved_tokens FROM budgets "
+            "WHERE workstream = %s AND period = %s",
+            (ws, period),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return (float(row["reserved_usd"]), int(row["reserved_tokens"]))
+
+
+def test_concurrent_enforce_near_cap_is_bounded(conn, ws):
+    """The confirmed defect, now BLOCKED: cap=10000, seeded spend 8000, then 10
+    threads each enforce(est=1500) in lock-step. Pre-fix all 10 passed (stale
+    read) → ~23000 accrued (230% over). Now the atomic reserve-under-row-lock
+    means the ALLOWED count × est + prior spend can NOT exceed the cap; the rest
+    are OverBudget. Proves combined spent+reserved <= cap."""
+    from runtime import budget
+    from runtime.enforce import MemoryEventSink
+
+    CAP, SEED, EST, N = 10_000, 8_000, 1_500, 10
+    _seed_call(conn, ws, cost_usd=float(SEED), input_tokens=SEED, output_tokens=0)
+    budget.set_budget(conn, ws, cap_usd=float(CAP), cap_tokens=CAP)
+    conn.commit()  # publish the seed + cap to the worker connections
+
+    barrier = threading.Barrier(N)
+    lock = threading.Lock()
+    outcomes: list[str] = []
+
+    def worker(_i: int) -> None:
+        wc = db.connect()
+        try:
+            barrier.wait()  # release all threads together → maximal contention
+            try:
+                budget.enforce(
+                    wc, ws, est_usd=float(EST), est_tokens=EST, role="exec",
+                    sink=MemoryEventSink(),
+                    request_approval=lambda *a, **k: None,
+                )
+                res = "ALLOWED"
+            except budget.OverBudget:
+                res = "BLOCKED"
+            with lock:
+                outcomes.append(res)
+        finally:
+            wc.close()
+
+    with ThreadPoolExecutor(max_workers=N) as pool:
+        list(pool.map(worker, range(N)))
+
+    allowed = outcomes.count("ALLOWED")
+    assert allowed + outcomes.count("BLOCKED") == N
+    assert 1 <= allowed < N, f"expected a partial allow, got {allowed}/{N}"
+
+    # The bound: committed spend + all in-flight reservations never exceeds the cap.
+    res_usd, res_tokens = _reserved(conn, ws)
+    assert res_tokens == allowed * EST  # exactly the allowed calls reserved
+    assert SEED + res_tokens <= CAP     # combined spent+reserved within the cap
+    assert SEED + allowed * EST <= CAP  # the same bound stated on the estimate
+
+
+def test_reservation_released_on_completion_frees_capacity(conn, ws, monkeypatch):
+    """A completed call releases its reservation (real spend becomes the source of
+    truth), so the cushion returns to zero and a later call can spend again up to
+    the cap. Proves the reservation is provisional, not a permanent debit."""
+    from runtime import budget
+    from runtime.model.call import call_model
+
+    _keyless(monkeypatch)
+    budget.set_budget(conn, ws, cap_usd=1000.0, cap_tokens=10_000_000)
+    conn.commit()
+
+    assert _reserved(conn, ws) == (0.0, 0)
+    for _ in range(3):
+        call_model(
+            "exec", "execute", [{"role": "user", "content": "do the thing " * 15}],
+            workstream=ws, registry=None, sink=DbEventSink(conn), conn=conn,
+        )
+        # After each completed call the reservation is fully released.
+        assert _reserved(conn, ws) == (0.0, 0)
+
+    # Real accrued spend (the source of truth) grew; reserved is back to zero.
+    assert budget.spent(conn, ws).calls == 3
+    assert _reserved(conn, ws) == (0.0, 0)
+
+
+class _ProviderDies:
+    """A provider whose completion raises a NON-recoverable error (not fallback)."""
+
+    name = "boom"
+
+    def complete(self, model_id, messages, **opts):
+        raise RuntimeError("simulated provider death")
+
+
+def test_no_leaked_reservation_on_failed_call(conn, ws, monkeypatch):
+    """A call that reserves then dies mid-flight must RELEASE its reservation, or the
+    leaked cushion would permanently shrink the cap. After the failure reserved is
+    back to zero and the freed capacity is usable by the next call."""
+    from runtime import budget
+    import runtime.model.call as call_mod
+    from runtime.model.call import call_model
+
+    _keyless(monkeypatch)
+    monkeypatch.setattr(call_mod, "select_provider", lambda *a, **k: _ProviderDies())
+
+    budget.set_budget(conn, ws, cap_usd=1000.0, cap_tokens=10_000_000)
+    conn.commit()
+
+    with pytest.raises(RuntimeError):
+        call_model(
+            "exec", "execute", [{"role": "user", "content": "do the thing " * 15}],
+            workstream=ws, registry=None, sink=DbEventSink(conn), conn=conn,
+        )
+    # The reservation the pre-spend enforce made was released in the finally — no leak.
+    assert _reserved(conn, ws) == (0.0, 0)
+    # No spend accrued (the call never completed) and the cap is intact.
+    assert budget.spent(conn, ws).calls == 0
+
+
+def test_migration_0016_idempotent_and_columns_present(conn):
+    from runtime.migrate import migrate
+
+    assert "0016_budget_reservations.sql" not in migrate(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT reserved_usd, reserved_tokens FROM budgets LIMIT 1"
+        )
+        cur.fetchone()  # columns exist (query would raise otherwise)
+    conn.commit()
