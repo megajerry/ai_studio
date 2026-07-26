@@ -148,8 +148,10 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
 
 ## 🐛 Known follow-up nits (tracked, non-blocking)
 
-- Recall relevance floor (`min_score`) default for lesson injection before real
-  embeddings land.
+- ✅ **RESOLVED (41f9f46)** — Lesson-injection relevance floor: a conservative
+  `min_score=0.2` default now filters clearly-irrelevant lessons before top-N
+  (configurable via param/`AI_STUDIO_LESSON_MIN_SCORE`; explicit `None` disables);
+  to be re-tuned once real embeddings land.
 - `find_grant`/read-path commit coupling on non-autocommit connections (harmless).
 - `state/status.md` should keep an evidence-based (command + count) status line.
 - ✅ **RESOLVED (0586aba)** — Budget pre-call USD estimate now prices output tokens
