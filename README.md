@@ -123,11 +123,18 @@ evaluation, business logic) stays stable even as coding agents come and go.
 
 ## Status
 
-🚧 **Design / bootstrap.** The architecture-of-record and decision log are
-written ([`docs/architecture.md`](docs/architecture.md),
-[`docs/decisions/`](docs/decisions/)); current studio state lives in
-[`state/status.md`](state/status.md). No runtime code yet — **M0 (infra spine)**
-is next.
+✅ **Platform complete & operating end-to-end (keyless / dry-run, on a live
+Postgres).** The architecture-of-record and decision log are written
+([`docs/architecture.md`](docs/architecture.md),
+[`docs/decisions/`](docs/decisions/)), and the runtime — event log + task queue,
+canonical task state machine, policy engine + tools, supervisor + scheduler,
+model router, the role set (PM · Executor · Verifier · Reviewer · Critic · Retro ·
+Researcher · Sourcing · Curator · Capacity Steward · Failure Analyst), memory,
+skills + induction, trajectory observability, capacity governance, Spokesman
+grounding, and an evaluation harness — runs as one loop. The remaining work is at
+the **stakeholder boundary** (model keys, budget ceiling, the first vertical,
+WhatsApp provisioning); everything is dry-run/keyless until those land. Current
+studio state lives in [`state/status.md`](state/status.md).
 
 ## Getting started
 
@@ -150,8 +157,8 @@ python -m runtime.readiness   # or: make readiness  (exits non-zero on FAIL)
 The ordered launch steps, pre-flight checklist, and stakeholder decisions live in
 the [go-live runbook](docs/go-live.md).
 
-M0 (the infra spine) is implemented; the supervisor and agent runtime arrive in
-later milestones. The **Spokesman WhatsApp channel (v1)** is implemented as an
+M0 (the infra spine), the supervisor, and the agent runtime are all implemented
+(see below). The **Spokesman WhatsApp channel (v1)** is implemented as an
 opt-in compose service — see the runbook
 [`docs/spokesman-whatsapp.md`](docs/spokesman-whatsapp.md):
 

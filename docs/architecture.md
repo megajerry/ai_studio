@@ -4,7 +4,7 @@ Canonical description of *what we're building and why*. This is the
 architecture-of-record; changes to it are made via ADRs in
 [`decisions/`](decisions/). It also serves as cross-machine memory (this repo is
 worked on from a remote session while execution happens on a separate host — see
-§10).
+§11).
 
 ## 1. Thesis
 
@@ -33,8 +33,14 @@ The studio is organized into **workstreams**:
   draws on, and it optimizes *across* workstreams by reading their event logs.
 
 **This repository is the Productivity workstream** ([ADR-0002](decisions/0002-productivity-horizontal-platform.md)).
-The capabilities it owns (§4–§9) are the reusable platform; verticals are
+The capabilities it owns (§4–§10) are the reusable platform; verticals are
 instantiated on top later.
+
+**Verticals are config, not code.** A vertical is declared by a
+`workstreams/<name>/config.yaml` that drives its charter, prompt overlays, budget,
+policy, checkers, and memory through the role seams — no per-vertical code fork —
+and each vertical's four kinds of state are isolated by construction
+([ADR-0018](decisions/0018-vertical-isolation.md)).
 
 ## 3. The workstream operating model
 
@@ -50,6 +56,7 @@ observed in mainstream models:
 | Executes before it understands the task | **PM** | A **confidence gate** before execution: restate the requirement, define success criteria, draft a plan, self-score confidence; execution is gated on a threshold — else clarify (ask the stakeholder) or research. |
 | Doesn't learn from mistakes | **Retro + Researcher** | Retro distills lessons into a durable store that is **auto-injected at prompt-assembly time** into future work (so applying a lesson doesn't rely on the model remembering). Researcher mines external best-practice/tools into reusable skills. |
 | Risk of disaster | **Whistle-blower / Reviewer** | Independent reviewer + policy-engine gating of irreversible/costly actions. Real-time guard; retro is the durable improvement. |
+| Confidently wrong — sails through its own confidence gate | **Critic** | A *forward-looking* adversarial partner (distinct from the Reviewer, which guards *finished* work): given a plan/decision/lesson-set it surfaces risks, downsides, missed opportunities, and alternatives *before* commit. The PM drives a bounded **PM↔Critic consensus** (revise or justify), escalating a genuine disagreement to the stakeholder (🛑) — [ADR-0019](decisions/0019-critic-role-and-consensus.md). |
 
 Key properties:
 
@@ -73,9 +80,19 @@ live session.
 Reliability that an agent **cannot** provide for itself is provided by one small
 **non-agent** component: a **supervisor** — a dumb, always-on, non-LLM loop whose
 only job is *"no task is ever silently dropped."* It scans for tasks that are
-in-progress with a stale heartbeat and re-kicks them. This closes the gap where a
+in-progress with a stale heartbeat and recovers them. This closes the gap where a
 PM crashes/hallucinates/runs out of budget *before* it finishes wiring its own
 safety net.
+
+Recovery is a **graduated, progress-aware ladder**, not a binary re-kick
+([ADR-0023](decisions/0023-graduated-recovery.md)): nudge + grace → progress-aware
+re-kick (only when a task is making no forward progress) → early `task.stuck`
+escalation → PM re-decomposition into a smaller DAG of subtasks (bounded, then 🛑)
+→ abandon backstop. A separate, statistically-gated **Failure Analyst**
+(`runtime/roles/failure_analyst.py`) reads failure telemetry, and when *one* kind
+of failure is recurring it *proposes* a durable fix as a reviewable candidate
+(never self-applied) and frames it as an experiment verified on real post-fix
+traffic. The supervisor itself stays strictly non-LLM.
 
 The design axis is **how much non-agent guarantee we want:**
 
@@ -99,7 +116,13 @@ Task Created → Queue → PM (confidence gate) → Executor(s) via Tools
 (supervisor watches heartbeats across all of the above)
 ```
 
-No role mutates state directly; changes flow through **verify → commit**.
+No role mutates state directly; changes flow through **verify → commit**. Every
+task follows one **canonical lifecycle state machine** (`up_for_grabs → claimed →
+in_progress → ready_for_review → approved → merged`, with `blocked` /
+`reviewer_blocked` / `abandoned`) defined in `runtime/task_state.py` and enforced
+by the single guard `runtime.tasks.transition` — there are no ad-hoc status writes
+anywhere ([ADR-0015](decisions/0015-task-lifecycle-state-machine.md),
+[`task-lifecycle.md`](task-lifecycle.md)).
 
 **Lifecycle & genesis.** Only a few processes are always-on singletons (infra, the
 supervisor, a scheduler, the PM pulse, the Spokesman); every role agent is spawned
@@ -128,6 +151,16 @@ Can Read?  Can Write?  Need Approval?  Need Budget?  Need Retry?  Need Human?
 Rules live in this one layer; the agent doesn't know them — it acts, and the
 policy engine allows / gates / escalates. Budget enforcement lives here and in
 the model router (§6).
+
+**Capacity is governed proactively, not just hard-capped**
+([ADR-0022](decisions/0022-capacity-governance.md)). `runtime/budget.py` meters
+each model call against per-workstream ceilings and gates it by **zone**
+(`ok → warn → throttle → reserve → over`): a **reserve buffer** keeps only
+wind-down / escalation spend available near the cap so a workstream can fail
+gracefully instead of being trapped at the wall, and a burn-rate projection flags
+likely exhaustion early. Raising a ceiling stays a 🛑 stakeholder decision. An
+optional, config-driven **Capacity Steward** role reads the same facts to *flag
+and recommend* — it never enforces or raises a ceiling.
 
 ### Action tiers (what agents may do)
 
@@ -159,6 +192,13 @@ Registry changes follow the approval envelope in [ADR-0005](decisions/0005-model
 objective/scope-affecting or budget-increasing changes are 🛑 approval-gated;
 in-band swaps within a cost/quality policy band can be auto-adopted and 📣
 informed.
+
+Providers behind the router include Anthropic / OpenAI / Google plus a
+budget open-weight tier. **Cursor** is wired in as an `agentic`-tier coding
+substrate via its agent-harness CLI (`runtime/model/providers/cursor_cli.py`) —
+there is no raw HTTP inference endpoint, so the adapter drives `cursor-agent` by
+subprocess and is guarded by a hard timeout + fallback to Opus; it is opt-in via
+`CURSOR_API_KEY` and off by default.
 
 ## 7. Memory & search
 
@@ -206,6 +246,28 @@ The starting substrate is deliberately light (see §4):
 - **Observability** — OpenTelemetry + Prometheus + Grafana (from day one). What to
   capture (token usage, cost, sessions, session trajectory, latency, reliability,
   routing, budget) is specified in [ADR-0012](decisions/0012-telemetry-metrics.md).
+
+### Three layers of record: actions, state, and *reasoning*
+
+The event log records **what happened** (actions) and the DB records **state**;
+[ADR-0020](decisions/0020-trajectory-observability.md) adds the missing third
+layer — the ordered causal **trajectory** of *how* a role (above all the PM)
+reached a decision: what it observed, the options it weighed, what it decided and
+*why*, where the Critic pushed back, what it revised, when it escalated.
+Trajectories are first-class, replayable, and **outcome-linkable** (trajectory →
+tasks → outcomes), which is what makes a confidently-wrong PM decision measurable
+after the fact. `runtime/trajectory.py` is the single guarded writer; verbatim
+rationale bodies stay in the local DB (never in events — invariants 5 & 6) and are
+bounded by a verbatim→lean rotation + TTL. A live-session ingest bridge lets
+off-host / uninstrumented agents be measured too.
+
+### DB-outage resilience
+
+The runtime is written to degrade rather than crash when Postgres is briefly
+unavailable, and remote DB access is host-restricted by an allowlist
+([ADR-0017](decisions/0017-db-resilience-and-remote-access.md)); the lifecycle
+state machine (§4) is deliberately DB-free so the fleet still knows the rules
+during an outage.
 - **MinIO** — object storage
 - **Reverse proxy / tunnel** — remote access for the stakeholder channel (§9)
 
@@ -231,7 +293,44 @@ local-hosted **dashboard** (deep, full-state console; remote via tunnel) and
 and maintains the dashboard; stakeholder replies re-enter the system as events/
 tasks.
 
-## 10. Cross-machine state (dev phase)
+### Grounding & accountability — everything told to the human is verified
+
+The Spokesman is a **verify-or-refuse gate**, not a relay
+([ADR-0021](decisions/0021-spokesman-grounding-accountability.md), extending the
+evidence-over-claims doctrine of [ADR-0014](decisions/0014-validation-rigor.md)):
+every human-facing message is decomposed into **claims**, and each factual claim's
+evidence is checked against the source of truth (the live runtime DB) before it is
+sent. A claim that verifies is relayed; one that can't be verified is **withheld**
+and proof is requested from the originating agent; a claim the source of truth
+**contradicts is a fabrication** — the worst offense — and triggers a
+**zero-tolerance** penalty: `runtime/trust.py` (the single guarded writer for the
+trust ledger) permanently revokes that identity's human-relay permission,
+quarantines it, and cascades to its verifier chain. Judgments/recommendations may
+pass but are always labelled, never dressed up as fact. Fabrication-rate telemetry
+carries `n` + a Wilson interval like every other rate (§10).
+
+## 10. Experiments & evaluation — the measurement brain
+
+The studio's job is to *learn what works*, so measurement is a first-class
+subsystem, not an afterthought.
+
+- **The experiment primitive** ([ADR-0016](decisions/0016-experiment-primitive.md))
+  is the venture-studio brain's first object: a hypothesis + a target metric that
+  is confirmed or denied from **facts on real traffic**, never from a claim. The
+  self-healing loop (§4) and skill induction (§12) both frame their proposed
+  changes as experiments verified this way.
+- **The evaluation harness** ([`evaluation.md`](evaluation.md)) grades roles
+  (PM, verifier, grounding, trajectory, capacity) against a **corpus-as-data**
+  (`evals/corpus/*.yaml`) with a **swappable LLM judge** (dry-run → real with no
+  code change, proven by record/replay cassettes) and trajectory-level eval; run
+  it with `python -m evals`.
+- **Statistical honesty is enforced** ([ADR-0014](decisions/0014-validation-rigor.md)):
+  every reported rate carries its sample size `n` + a Wilson 95% confidence
+  interval and is flagged `INSUFFICIENT` below n=30 — a 1.0 on n=5 reads
+  `[0.566, 1.0] INSUFFICIENT`, not "trustworthy." Validators trust evidence
+  (logs / metrics / code / test runs), never claims at face value.
+
+## 11. Cross-machine state (dev phase)
 
 This repo is edited from a **remote session** with no access to the **execution
 host**. Until the host is live, **git is the shared substrate and a low-cost
@@ -257,7 +356,7 @@ review) via `state/offhost/requests/` and collects results from
 `state/offhost/results/`. The host **never blocks on it** — every delegated item
 has a local fallback and a timeout.
 
-## 11. "Assemble, don't build" — candidate components
+## 12. "Assemble, don't build" — candidate components
 
 The moat is *how we define experiments, evaluate signal, allocate resources, and
 close the Builder↔Product loop* — only that top layer is written from scratch.
@@ -285,3 +384,13 @@ Agent Skills open standard ([ADR-0008](decisions/0008-adopt-agent-skills-standar
 e.g. `Validate Startup`, `Find Competitor`, `Generate Steam Capsule`,
 `Publish YouTube`, `Review Architecture` — curated from credible libraries and
 reviewed like code, not ad-hoc prompts.
+
+**The studio induces its own skills** ([ADR-0024](decisions/0024-skill-induction.md)),
+measure-first and review-gated. A **Curator** notices a recurring *and* efficient
+reasoning-trajectory pattern (§8) and *induces* a candidate `SKILL.md`; that joins
+a dual-source review queue (Curator + Researcher, with a Retro hand-off) and a
+🔴 human gate promotes it into the live `skills/` root. Once live, an applied-cohort
+**efficacy** signal (with Wilson CIs, §10) drives keep / tune / retire proposals.
+It is propose-only and statistically gated — no agent self-modifies live config.
+Beyond opencode, **Cursor** is available as an agentic coding substrate (§6),
+still just a replaceable Worker.
