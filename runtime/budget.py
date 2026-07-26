@@ -119,6 +119,11 @@ _ZONE_EVENT = {
 # Which model.call the estimate models — kept consistent with the dry-run
 # provider so a keyless estimate matches the keyless actual cost.
 _CHARS_PER_TOKEN = 4
+#: Synthetic output tokens as a fraction of synthetic input tokens. MUST match
+#: the dry-run provider's ``_OUTPUT_RATIO`` (runtime/model/providers/dryrun.py)
+#: so the keyless pre-call estimate matches the keyless actual usage SHAPE — i.e.
+#: it accounts for output tokens, not input alone.
+_OUTPUT_RATIO = 4
 
 
 class OverBudget(Exception):
@@ -594,14 +599,26 @@ def budget_context(
 #: Default look-back for the recent burn-rate estimate.
 DEFAULT_BURN_WINDOW_MIN = 60.0
 
+#: Minimum observed call span (minutes) the per-minute burn rate will divide by.
+#: Below this the observed calls are effectively simultaneous (a near-zero span),
+#: and dividing spend by ~0 would inflate ``usd_per_min`` / ``tokens_per_min`` to
+#: an absurd value. When the span is below it we fall back to the full look-back
+#: ``window_min`` as the denominator — exactly as we already do for <2 calls — so
+#: the per-minute rate stays finite and conservative. The per-CALL figures
+#: (``usd_per_call`` / ``tokens_per_call``) and ``calls_to_exhaustion`` are
+#: span-independent and are therefore unaffected. ~60 ms.
+MIN_SPAN_MIN = 1e-3
+
 
 @dataclass(frozen=True)
 class BurnRate:
     """Recent spend velocity for a workstream, from the ``model.call`` log.
 
     Rates are per-minute over the observed span of calls inside the look-back
-    window (falling back to the full window when there is <2 calls to span). All
-    fields are numbers — leak-free by construction."""
+    window (falling back to the full window when there is <2 calls to span, or the
+    observed span is below :data:`MIN_SPAN_MIN` — a near-zero span that would
+    otherwise inflate the per-minute rate). All fields are numbers — leak-free by
+    construction."""
 
     workstream: str
     window_min: float
@@ -642,8 +659,9 @@ def burn_rate(
     """Recent USD/token burn rate for ``workstream`` (or org-wide) from ``model.call``.
 
     Sums the last ``window_min`` minutes of ``model.call`` events and divides by
-    the observed span (min-ts→now); with <2 calls the span defaults to the full
-    window so a single call does not project an infinite rate.
+    the observed span (min-ts→now); with <2 calls — or a near-zero span below
+    :data:`MIN_SPAN_MIN` — the span defaults to the full window so a single call
+    (or a burst of near-simultaneous calls) does not project an absurd rate.
     """
     ws_clause = "" if org_wide else "AND workstream = %s"
     params: tuple = () if org_wide else (workstream,)
@@ -668,9 +686,12 @@ def burn_rate(
     calls = int(row["calls"])
     usd = float(row["cost_usd"])
     tokens = int(row["tokens"])
-    # <2 calls can't span an interval → use the full window as the denominator.
+    # <2 calls can't span an interval, and a span below MIN_SPAN_MIN is a
+    # near-zero span (near-simultaneous calls) — in BOTH cases dividing by the
+    # observed span would produce a meaningless/absurd per-minute rate, so we use
+    # the full window as the denominator instead. Per-call figures are unaffected.
     observed = float(row["span_min"]) if row["span_min"] is not None else 0.0
-    span = observed if calls >= 2 and observed > 0 else window_min
+    span = observed if calls >= 2 and observed >= MIN_SPAN_MIN else window_min
     return BurnRate(
         workstream=ORG_WORKSTREAM if org_wide else workstream,
         window_min=window_min,
@@ -731,16 +752,32 @@ def project_exhaustion(
 # --- Estimation + enforcement ----------------------------------------------
 
 
-def estimate_call_tokens(messages: list[dict]) -> int:
-    """A conservative pre-call token estimate for the pending call.
+def estimate_call_io_tokens(messages: list[dict]) -> tuple[int, int]:
+    """A conservative pre-call ``(input_tokens, output_tokens)`` estimate.
 
-    Uses the same chars→tokens basis as the dry-run provider so a keyless
-    estimate matches the keyless actual cost. Input + a small output allowance.
+    Uses the same chars→tokens basis AND output ratio as the dry-run provider so a
+    keyless estimate matches the keyless actual usage shape: ``input`` =
+    ``chars // _CHARS_PER_TOKEN``, ``output`` = ``input // _OUTPUT_RATIO``. Split
+    out (rather than only summed) so the caller can price input and OUTPUT tokens
+    SEPARATELY — output usually bills at a higher rate, so a pre-call figure that
+    prices the whole sum at the input rate systematically under-counts and can let
+    a call slip just past a cap.
     """
     from .model.providers.base import messages_char_len
 
     input_tokens = max(1, messages_char_len(messages) // _CHARS_PER_TOKEN)
-    output_tokens = max(1, input_tokens // _CHARS_PER_TOKEN)
+    output_tokens = max(1, input_tokens // _OUTPUT_RATIO)
+    return input_tokens, output_tokens
+
+
+def estimate_call_tokens(messages: list[dict]) -> int:
+    """A conservative pre-call TOTAL (input + output) token estimate.
+
+    The sum of :func:`estimate_call_io_tokens`; kept for callers that only need
+    the token count (the token-cap side of the budget). For the USD estimate use
+    the split so output tokens are priced at the output rate (see that function).
+    """
+    input_tokens, output_tokens = estimate_call_io_tokens(messages)
     return input_tokens + output_tokens
 
 

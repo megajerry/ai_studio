@@ -11,7 +11,12 @@ ad-hoc call ADR-0012 forbids). One call does, in order:
                 exceed a cap it emits ``budget.exceeded``, raises a 🛑 approval, and
                 raises :class:`~runtime.budget.OverBudget` — the call does NOT run.
     3. select — pick the provider adapter, or dry-run if forced / key absent.
-    4. complete — run the provider (dry-run needs no network/key).
+    4. complete — run the provider (dry-run needs no network/key). If the provider
+                signals a recoverable failure (``ProviderFallback``) we reassign to
+                the next (typically pricier) model in the tier chain and **re-run
+                the step-2 budget gate against that FALLBACK spec** before retrying,
+                so a fallback that would breach the cap is blocked too (not merely
+                accounted post-hoc). An in-budget fallback proceeds unchanged.
     5. cost   — compute cost = tokens × registry price (:func:`registry.cost_usd`).
     6. emit   — a ``model.call`` event: model, provider, role, task_id, in/out/
                 cached tokens, cost_usd, latency_ms.
@@ -169,10 +174,16 @@ def call_model(
     #    raises budget.OverBudget + a 🛑 approval (ADR-0006) — the call never runs.
     if conn is not None:
         from ..budget import enforce as _enforce_budget
-        from ..budget import estimate_call_tokens
+        from ..budget import estimate_call_io_tokens
 
-        est_tokens = estimate_call_tokens(messages)
-        est_usd = cost_usd(spec, Usage(input_tokens=est_tokens))
+        # Price input AND output tokens separately (output usually bills higher):
+        # a pre-call figure that priced the whole token sum at the input rate
+        # systematically under-counted and could let a call slip past a cap.
+        est_input, est_output = estimate_call_io_tokens(messages)
+        est_tokens = est_input + est_output
+        est_usd = cost_usd(
+            spec, Usage(input_tokens=est_input, output_tokens=est_output)
+        )
         _enforce_budget(
             conn,
             workstream,
@@ -202,6 +213,29 @@ def call_model(
         if fallback is None:
             raise
         spec = fallback
+        # Re-gate the retry against the FALLBACK spec's cost before spending on it
+        # (behavior change — see module docstring step 4 / ADR-0022/0006). The
+        # pre-spend enforce above ran against the ROUTED spec; a ProviderFallback
+        # reassigns to a (typically pricier) fallback model, so without re-checking
+        # a fallback that breaches the cap would run and only be accounted after
+        # the fact. Re-running enforce here gates it exactly like a first-choice
+        # over-cap call: it emits budget.exceeded, raises the 🛑 "raise budget"
+        # approval, and raises OverBudget — the retry never runs. A fallback that
+        # is within budget is unaffected (enforce simply returns and it proceeds).
+        if conn is not None:
+            est_usd = cost_usd(
+                spec, Usage(input_tokens=est_input, output_tokens=est_output)
+            )
+            _enforce_budget(
+                conn,
+                workstream,
+                est_usd=est_usd,
+                est_tokens=est_tokens,
+                purpose=purpose,
+                role=role,
+                task_id=task_id,
+                sink=sink,
+            )
         provider = select_provider(spec, force_dry_run=force_dry_run)
         try:
             completion = provider.complete(spec.id, messages, **opts)
@@ -218,10 +252,10 @@ def call_model(
         raise
     latency_ms = int((time.monotonic() - start) * 1000)
 
-    # 4. cost = tokens × registry price (single source of cost truth).
+    # 5. cost = tokens × registry price (single source of cost truth).
     cost = cost_usd(spec, completion.usage)
 
-    # 5. emit the model.call event. Only numbers + ids — never prompt/secret text.
+    # 6. emit the model.call event. Only numbers + ids — never prompt/secret text.
     sink.emit(
         make_event(
             workstream=workstream,
@@ -244,7 +278,7 @@ def call_model(
         )
     )
 
-    # 6. account: add this call's tokens to the task's running spend (if wired).
+    # 7. account: add this call's tokens to the task's running spend (if wired).
     if conn is not None and task_id is not None:
         from ..tasks import add_spent_tokens
 

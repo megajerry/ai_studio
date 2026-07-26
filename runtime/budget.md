@@ -59,10 +59,21 @@ predicate the policy engine uses — `BudgetContext.would_exceed`:
 - **under cap** → emit a `budget.checkpoint` (spend/remaining snapshot) and return.
 
 The pending call's cost is estimated from the message length using the same
-chars→tokens basis as the dry-run provider (`estimate_call_tokens`), priced via
-the routed spec — a conservative guard on top of the exact accrued term. Note
+chars→tokens basis **and output ratio** as the dry-run provider
+(`estimate_call_io_tokens`): input **and** output tokens are priced separately
+via the routed spec, so the estimate accounts for output (which usually bills at
+a higher rate) rather than pricing the whole token sum at the input rate — the
+latter was systematically low and could let a call slip just past a cap. Note
 **dry-run calls accrue cost too** (their `model.call` cost is computed
 identically), so a keyless studio still enforces real budgets.
+
+**Provider fallback is gated too.** If the routed provider raises
+`ProviderFallback` (e.g. the flat-rate coding harness times out), `call_model`
+reassigns to the next model in the tier chain — usually a pricier metered model —
+and **re-runs `enforce` against that fallback spec before retrying**. So a
+fallback that would breach the cap is blocked (`budget.exceeded` + 🛑 approval +
+`OverBudget`), not silently run and only accounted after the fact. An in-budget
+fallback proceeds unchanged.
 
 `OverBudget` here is distinct from `runtime.model.router.OverBudget`: the router's
 is about a *routing tier* with no cheaper fallback; this is the hard
