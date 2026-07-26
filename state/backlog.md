@@ -141,7 +141,7 @@ secrets + ran an agentic harness outside the sandbox, invariants #2/#5): FIXED
 `CURSOR_API_KEY` only, `--network none`, `--cap-drop ALL`, non-root, read-only rootfs),
 fails closed to Opus fallback with no sandbox, no host subprocess remains; adversarially
 verified. Host-safety/sandbox/isolation audit otherwise clean (fs-escape, env-allowlist,
-sandbox-required tools, four-layer memory scope isolation, no SSRF) · **Concurrency audit + fixes** (3rd audit found 3 MEDIUM races): budget over-spend TOCTOU FIXED `cf7de56` (reservation-under-`FOR UPDATE` + Phase-2 leak guard, migration 0016) · `request_decision` open-decision-vs-runnable-task race FIXED `5fd398e` (atomic park-or-abort + `rekick_task` status guard) · event-log `seq` visibility gap for `since_seq` consumers (in progress). Clean bills: no double-claim, no ad-hoc status writes, concurrent transitions serialize, illegal edges guarded) ·
+sandbox-required tools, four-layer memory scope isolation, no SSRF) · **Concurrency audit + fixes** (3rd audit found 3 MEDIUM races): budget over-spend TOCTOU FIXED `cf7de56` (reservation-under-`FOR UPDATE` + Phase-2 leak guard, migration 0016) · `request_decision` open-decision-vs-runnable-task race FIXED `5fd398e` (atomic park-or-abort + `rekick_task` status guard) · event-log `seq` visibility gap FIXED `4f83084` (commit-safe bounded-lookback + idempotency; honest doc corrections). Clean bills: no double-claim, no ad-hoc status writes, concurrent transitions serialize, illegal edges guarded) ·
 **Async open-ended decision primitive** (ADR-0025; migration 0015): the open-ended
 sibling of binary approvals — `runtime/decisions.py` `request_decision` PARKS the
 dependent task (`blocked`) so the worker is FREED (grab-by-sort skips it), Spokesman
@@ -182,6 +182,8 @@ onboarding/secrets · model shortlist + cost model · ADRs 0001–0025.
   not the harness.
 
 ## 🐛 Known follow-up nits (tracked, non-blocking)
+- Spokesman `poll_notifications` is a best-effort `since_seq` consumer (approval/alarm/failed_exhausted) still at `lookback=0` — same out-of-order-commit skip class as the event-log fix (4f83084); at-most-once wording is accurate (no false claim). Harden with the bounded lookback if a missed notification ever matters. (ADR event-log follow-up.)
+- Budget org-gated `enforce` serializes on the `__org__` row while doing a full `model.call` spend-scan under the lock (~325ms/enforce at 16 threads) — throughput, not correctness. (ADR-0022/0016 perf.)
 
 - ✅ **RESOLVED (41f9f46)** — Lesson-injection relevance floor: a conservative
   `min_score=0.2` default now filters clearly-irrelevant lessons before top-N
