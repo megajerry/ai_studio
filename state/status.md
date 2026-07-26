@@ -1,6 +1,6 @@
 # Studio status
 
-_Updated: 2026-07-23. Pointers: **what's left** → [`backlog.md`](backlog.md);
+_Updated: 2026-07-26. Pointers: **what's left** → [`backlog.md`](backlog.md);
 **per-milestone detail + evidence** → `git log`; **design** → `docs/decisions/`._
 
 ## Phase

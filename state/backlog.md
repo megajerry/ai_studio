@@ -4,7 +4,7 @@ _Maintained by the Productivity workstream. Updated as items land. Milestone
 detail + evidence live in `git log` and `state/status.md`; this file is the
 "what's left" list._
 
-_Last updated: 2026-07-23._
+_Last updated: 2026-07-26._
 
 ## ✅ Done (merged to `main`, verified on a live Postgres unless noted)
 
