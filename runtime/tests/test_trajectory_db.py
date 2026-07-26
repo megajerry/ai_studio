@@ -17,6 +17,8 @@ outcome; and the ``tasks.trajectory_id`` outcome-attribution link. Keyless/dry-r
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -171,6 +173,50 @@ def test_seq_no_race_across_concurrent_connections(conn, ws):
         c2.close()
     seqs = sorted(s.seq for s in list_steps(conn, tid))
     assert seqs == list(range(1, 13))                  # 12 steps, gapless, no dup
+
+
+def test_seq_gapless_under_threaded_load(conn, ws):
+    """REAL threaded stress: N worker threads each append M steps to ONE trajectory
+    over SEPARATE connections, released together by a barrier to maximize contention.
+
+    This exercises the ``FOR UPDATE`` lock on the parent trajectory row in
+    :func:`add_step` under genuine parallelism (unlike the sequential-interleaved
+    ``test_seq_no_race_...`` above). The lock serializes ``max(seq)+1`` assignment so
+    the N*M appends land on a gapless, unique ``seq`` 1..N*M with zero errors and zero
+    duplicates. Were the lock removed, concurrent ``max(seq)+1`` reads would collide
+    and either raise on the ``UNIQUE(trajectory_id, seq)`` index or drop rows — this
+    test would then fail (dupes/gaps or a non-empty error list).
+    """
+    N, M = 8, 12                                       # 8 threads * 12 appends = 96
+    tid = start_trajectory(conn, "pm", ws, "threaded appends")
+    conn.commit()                                      # publish the parent to peers
+
+    barrier = threading.Barrier(N)
+    errors: list[Exception] = []
+    errors_lock = threading.Lock()
+
+    def worker(wid: int) -> None:
+        wconn = db.connect()                           # each thread its OWN connection
+        try:
+            barrier.wait()                             # all fire at once → real contention
+            for j in range(M):
+                add_step(wconn, tid, "observe", f"w{wid}-{j}")
+        except Exception as exc:                       # capture, never swallow silently
+            with errors_lock:
+                errors.append(exc)
+        finally:
+            wconn.close()
+
+    with ThreadPoolExecutor(max_workers=N) as pool:
+        list(pool.map(worker, range(N)))
+
+    assert errors == [], f"add_step raised under concurrency: {errors!r}"
+
+    seqs = sorted(s.seq for s in list_steps(conn, tid))
+    # Gapless, unique, complete: exactly 1..N*M with no dup and no gap.
+    assert len(seqs) == N * M, f"expected {N*M} steps, got {len(seqs)}"
+    assert len(set(seqs)) == len(seqs), "duplicate seq assigned under concurrency"
+    assert seqs == list(range(1, N * M + 1)), "seq not gapless 1..N*M under concurrency"
 
 
 # --- event body-free proof --------------------------------------------------

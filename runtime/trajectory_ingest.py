@@ -52,6 +52,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import re
 import sys
 from datetime import datetime
 from typing import Any, Optional
@@ -62,6 +64,8 @@ from pydantic import BaseModel, Field
 
 from .db import DBUnavailable, connect_with_retry
 from .trajectory import add_step, close_trajectory, start_trajectory
+
+log = logging.getLogger("runtime.trajectory_ingest")
 
 
 # --- import format (validated, lenient on optional fields) ------------------
@@ -153,6 +157,61 @@ def ingest_trajectory(
     return tid
 
 
+# --- synthetic / secret-ish scrub guard-rail (CLI warn only) ----------------
+
+#: High-signal heuristics for content that should NOT be in an ingest file — the
+#: bodies are stored VERBATIM in the local DB (invariant 5), so the shipped example
+#: is synthetic. These are guard-rails, NOT enforcement: a hit only WARNS.
+_SENSITIVE_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("private-key-block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("secret-keyword", re.compile(
+        r"(?i)\b(api[_-]?key|secret|password|passwd|access[_-]?token|"
+        r"client[_-]?secret|private[_-]?key)\b")),
+    ("bearer-token", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{12,}")),
+    ("email-address", re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")),
+    ("high-entropy-token", re.compile(r"\b[A-Za-z0-9+/_-]{32,}\b")),
+)
+
+
+def _record_bodies(record: Any) -> list[str]:
+    """The verbatim text fields an ingest record carries (goal/summary/rationale/
+    outcome), which are what land in the local DB and must stay synthetic."""
+    rec = record if isinstance(record, IngestRecord) else IngestRecord.model_validate(record)
+    bodies = [rec.goal, rec.outcome_summary]
+    for step in rec.steps:
+        bodies += [step.summary, step.rationale]
+    return [b for b in bodies if b]
+
+
+def scan_sensitive(record: Any) -> list[str]:
+    """Return the sorted category labels of any secret-ish / PII-ish content found in
+    an ingest record's verbatim bodies (``[]`` = looks clean/synthetic).
+
+    A pure heuristic guard-rail: the documented invariant is that ingest files are
+    synthetic (no real secrets/PII), and this flags likely violations. It NEVER
+    blocks ingestion — callers only warn on a non-empty result."""
+    text = "\n".join(_record_bodies(record))
+    return sorted({label for label, pat in _SENSITIVE_PATTERNS if pat.search(text)})
+
+
+def warn_if_sensitive(record: Any, *, source: str = "<record>") -> list[str]:
+    """Log a WARNING (never raise/block) if an ingest record looks non-synthetic.
+
+    Returns the detected categories (``[]`` when clean). Used by the CLI as a
+    guard-rail before ingestion proceeds — the invariant is documented, this just
+    surfaces a likely breach so a human notices."""
+    hits = scan_sensitive(record)
+    if hits:
+        log.warning(
+            "trajectory_ingest: %s bodies look NON-synthetic (matched: %s); "
+            "ingest files must be synthetic — no real secrets/PII (invariant 5). "
+            "Proceeding anyway (guard-rail, not enforcement).",
+            source, ", ".join(hits),
+        )
+    return hits
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -166,6 +225,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     with open(args.file, "r", encoding="utf-8") as fh:
         record = json.load(fh)
+
+    # Guard-rail (invariant 5): warn — never block — if the bodies look non-synthetic
+    # (secret-ish / PII-ish). Bodies are stored verbatim locally, so surface a likely
+    # breach for a human before it lands.
+    warn_if_sensitive(record, source=args.file)
 
     # DB-outage-safe (ADR-0017): degrade cleanly if the store is unreachable rather
     # than crashing/hanging — the off-host session simply retries later.

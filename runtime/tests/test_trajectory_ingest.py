@@ -156,6 +156,75 @@ def test_cli_ingests_temp_file(conn, ws, tmp_path, capsys):
     assert [s.summary for s in list_steps(conn, tid)] == ["cli-step"]
 
 
+# --- synthetic / secret-ish scrub guard-rail (warn, never block) ------------
+
+
+def test_scan_sensitive_clean_on_synthetic_example():
+    """The SHIPPED synthetic example must scan clean (zero secret-ish/PII hits)."""
+    from pathlib import Path
+
+    example = Path(ti.__file__).with_name("trajectory_ingest.example.json")
+    record = json.loads(example.read_text(encoding="utf-8"))
+    assert ti.scan_sensitive(record) == []
+
+
+def test_scan_sensitive_flags_secret_and_pii():
+    """Secret-ish / PII-ish bodies are flagged by category (heuristic guard-rail)."""
+    record = {
+        "role": "pm", "workstream": "x", "goal": "reach jane.doe@example.com",
+        "steps": [{"step_type": "observe", "summary": "ok",
+                   "rationale": "api_key=AKIAABCDEFGHIJKLMNOP password=hunter2"}],
+    }
+    hits = ti.scan_sensitive(record)
+    assert "email-address" in hits
+    assert "aws-access-key" in hits
+    assert "secret-keyword" in hits
+
+
+def test_warn_if_sensitive_synthetic_is_silent(caplog):
+    record = {"role": "pm", "workstream": "x", "goal": "SYNTHETIC — plan the work",
+              "steps": [{"step_type": "plan", "summary": "SYNTHETIC — split tracks",
+                         "rationale": "No host secrets available off-host."}]}
+    with caplog.at_level("WARNING", logger="runtime.trajectory_ingest"):
+        assert ti.warn_if_sensitive(record) == []
+    assert caplog.records == []                            # clean → no warning
+
+
+def test_warn_if_sensitive_nonsynthetic_warns(caplog):
+    record = {"role": "pm", "workstream": "x", "goal": "email boss@corp.com the plan",
+              "steps": [{"step_type": "observe", "summary": "s",
+                         "rationale": "secret=swordfish"}]}
+    with caplog.at_level("WARNING", logger="runtime.trajectory_ingest"):
+        hits = ti.warn_if_sensitive(record, source="dump.json")
+    assert hits and "email-address" in hits
+    assert len(caplog.records) == 1                        # exactly one warning
+    msg = caplog.records[0].getMessage()
+    assert "NON-synthetic" in msg and "dump.json" in msg
+
+
+@needs_db
+def test_cli_warns_on_secret_but_still_ingests(conn, ws, tmp_path, caplog):
+    """The CLI guard-rail WARNS on non-synthetic bodies but does NOT block: the
+    trajectory is still ingested (guard-rail, not enforcement)."""
+    record = {"role": "pm", "workstream": ws, "goal": "contact admin@example.com",
+              "steps": [{"step_type": "observe", "summary": "leak",
+                         "rationale": "password=hunter2"}]}
+    path = tmp_path / "leaky.json"
+    path.write_text(json.dumps(record))
+
+    with caplog.at_level("WARNING", logger="runtime.trajectory_ingest"):
+        rc = ti.main([str(path)])
+    assert rc == 0                                         # ingestion proceeded
+    assert any("NON-synthetic" in r.getMessage() for r in caplog.records)
+
+    # And the row really landed despite the warning.
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM trajectories WHERE workstream = %s", (ws,))
+        rows = cur.fetchall()
+    conn.commit()
+    assert len(rows) == 1
+
+
 # --- TTL sweep --------------------------------------------------------------
 
 

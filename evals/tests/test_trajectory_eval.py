@@ -16,6 +16,7 @@ from evals.judge import Judge, JudgeVerdict
 from evals.trajectory_eval import (
     TrajectoryEvalResult,
     build_trajectory_item,
+    cleanup_trajectory_shape,
     run_trajectory_eval,
     seed_demo_trajectory,
 )
@@ -67,12 +68,15 @@ def test_passed_gate_real_model_honors_verdict():
 def test_seeded_trajectory_scored_by_dryrun_judge(monkeypatch):
     monkeypatch.setenv("MODELS_DRY_RUN", "1")
     conn = db.connect()
+    # Own throwaway workstream so the seeded episode is cleaned up by prefix (a
+    # passed-in trajectory_id is NOT auto-cleaned by run_trajectory_eval).
+    ws = f"eval-traj-{uuid4().hex[:8]}"
     try:
         from runtime.migrate import migrate
         migrate(conn)
 
         # Seed a real, well-formed PM trajectory into the tables.
-        tid = seed_demo_trajectory(conn)
+        tid = seed_demo_trajectory(conn, workstream=ws)
 
         result = run_trajectory_eval(conn, tid, judge=Judge(force_dry_run=True))
         assert result.trajectory_id == str(tid)
@@ -89,7 +93,16 @@ def test_seeded_trajectory_scored_by_dryrun_judge(monkeypatch):
         assert d["name"] == "pm_trajectory_decision_quality"
         assert d["verdict"]["provider"] == "dryrun"
         assert d["item"]["goal"]  # the goal was projected into the item
+
+        # Throwaway teardown: no rows of this seeder's own prefix survive the test.
+        cleanup_trajectory_shape(conn, ws)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS n FROM trajectories WHERE workstream = %s",
+                        (ws,))
+            assert cur.fetchone()["n"] == 0
+        conn.commit()
     finally:
+        cleanup_trajectory_shape(conn, ws)
         conn.close()
 
 
