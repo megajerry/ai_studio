@@ -958,6 +958,7 @@ def enforce(
     # We do NOT emit events / raise here: a rollback would erase a blocked call's
     # telemetry. We compute the verdict, (if allowed) reserve, commit, THEN act.
     entries: list[BudgetStatus] = []
+    did_reserve = False  # True once the Phase-1 reservation has COMMITTED
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
@@ -1027,7 +1028,12 @@ def enforce(
                         """,
                         (est_usd, est_tokens, workstreams),
                     )
+                    did_reserve = True
     # Lock released here; an allowed call's reservation is now durable + visible.
+    # ``did_reserve`` is True ONLY on the allowed path where the UPDATE ran AND the
+    # transaction committed — a Phase-1 failure rolls the tx back (nothing reserved,
+    # flag stays False), so a post-commit release below can never spuriously free a
+    # reservation that another in-flight call holds.
 
     if not entries:
         return []
@@ -1078,19 +1084,34 @@ def enforce(
     # 3. Allowed: emit each cap's zone event (warn / throttle / reserve-allowed /
     #    checkpoint) and return the statuses. Emit in allocation-then-org order
     #    (the pre-ADR-0016 order), independent of the SQL lock sort.
-    for st in sorted(
-        entries, key=lambda s: (s.workstream == ORG_WORKSTREAM, s.period)
-    ):
-        z = st.zone
-        payload = (
-            st.to_payload() if z == ZONE_OK else st.zone_payload(purpose=purpose)
-        )
-        sink.emit(
-            make_event(
-                workstream=workstream,
-                type=_ZONE_EVENT[z],
-                task_id=task_id,
-                payload=payload,
+    #
+    # The reservation is already COMMITTED (Phase 1). If a zone-event emit raises
+    # here — AFTER the commit but BEFORE we return — the caller never learns the
+    # call was allowed, so it can't release the reservation and the cushion would
+    # leak (permanently shrinking the cap). Guard the emit so a post-commit failure
+    # releases THIS call's reservation before re-raising. Uses ``did_reserve`` so it
+    # only ever undoes a reservation this call actually made (never one held by a
+    # concurrent in-flight call).
+    try:
+        for st in sorted(
+            entries, key=lambda s: (s.workstream == ORG_WORKSTREAM, s.period)
+        ):
+            z = st.zone
+            payload = (
+                st.to_payload() if z == ZONE_OK else st.zone_payload(purpose=purpose)
             )
-        )
+            sink.emit(
+                make_event(
+                    workstream=workstream,
+                    type=_ZONE_EVENT[z],
+                    task_id=task_id,
+                    payload=payload,
+                )
+            )
+    except BaseException:
+        if did_reserve:
+            release_reservation(
+                conn, workstream, est_usd=est_usd, est_tokens=est_tokens
+            )
+        raise
     return entries

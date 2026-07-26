@@ -908,6 +908,47 @@ def test_no_leaked_reservation_on_failed_call(conn, ws, monkeypatch):
     assert budget.spent(conn, ws).calls == 0
 
 
+class _SinkThatRaises:
+    """An EventSink whose emit ALWAYS raises — to simulate a Phase-2 event-write
+    failure AFTER enforce has already committed its reservation."""
+
+    def emit(self, event) -> None:
+        raise RuntimeError("simulated sink.emit failure after reservation commit")
+
+
+def test_no_leaked_reservation_when_phase2_emit_raises(conn, ws):
+    """enforce commits the reservation (Phase 1) THEN emits zone events (Phase 2).
+    If a zone-event emit raises AFTER the commit, the caller never learns the call
+    was allowed and can't release — so enforce must release its OWN reservation
+    before re-raising, or the cushion leaks and permanently shrinks the cap."""
+    from runtime import budget
+
+    budget.set_budget(conn, ws, cap_usd=1000.0, cap_tokens=10_000_000)
+    conn.commit()
+    assert _reserved(conn, ws) == (0.0, 0)
+
+    # Allowed path (well under cap) but the sink blows up on the checkpoint emit.
+    with pytest.raises(RuntimeError, match="sink.emit failure"):
+        budget.enforce(
+            conn, ws, est_usd=1.0, est_tokens=100, role="exec",
+            sink=_SinkThatRaises(),
+        )
+    # The reservation made in Phase 1 was released before the re-raise — no leak.
+    assert _reserved(conn, ws) == (0.0, 0)
+
+    # And the freed capacity is fully usable: a normal allowed call still passes.
+    from runtime.enforce import MemoryEventSink
+
+    out = budget.enforce(
+        conn, ws, est_usd=1.0, est_tokens=100, role="exec", sink=MemoryEventSink()
+    )
+    assert out and out[0].zone == "ok"
+    # That call reserved (it returned normally → caller owns the release).
+    assert _reserved(conn, ws) == (1.0, 100)
+    budget.release_reservation(conn, ws, est_usd=1.0, est_tokens=100)  # tidy up
+    assert _reserved(conn, ws) == (0.0, 0)
+
+
 def test_migration_0016_idempotent_and_columns_present(conn):
     from runtime.migrate import migrate
 
