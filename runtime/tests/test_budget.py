@@ -65,6 +65,21 @@ def test_estimate_call_tokens_matches_dry_run_basis():
     assert estimate_call_tokens([]) >= 1  # never zero
 
 
+def test_estimate_call_io_tokens_splits_input_and_output():
+    """The pre-call estimate exposes input AND output separately (so the USD
+    figure can price output at its own, usually higher, rate) — matching the
+    dry-run provider basis (input = chars/4, output = input/4)."""
+    from runtime.budget import estimate_call_io_tokens, estimate_call_tokens
+
+    msgs = [{"role": "user", "content": "x" * 400}]
+    inp, out = estimate_call_io_tokens(msgs)
+    assert (inp, out) == (100, 25)  # 400//4 input, 100//4 output
+    assert out > 0  # output is accounted for, not dropped
+    assert inp + out == estimate_call_tokens(msgs)  # total stays consistent
+    # Never zero, even for an empty prompt.
+    assert all(t >= 1 for t in estimate_call_io_tokens([]))
+
+
 def test_budget_fingerprint_stable_and_period_scoped():
     from runtime.budget import _budget_fingerprint
 
@@ -598,3 +613,165 @@ def test_invalid_purpose_rejected(conn, ws):
     budget.set_budget(conn, ws, cap_usd=100.0)
     with pytest.raises(ValueError):
         budget.enforce(conn, ws, est_usd=0.01, purpose="bogus", sink=MemoryEventSink())
+
+
+# -- burn_rate near-zero-span guard (accounting accuracy) --
+
+
+def test_burn_rate_near_zero_span_is_not_absurd(conn, ws):
+    """>=2 calls sharing a near-zero timestamp span must NOT inflate the per-minute
+    rate: with an observed span below MIN_SPAN_MIN the denominator falls back to the
+    full look-back window (as for a single call), keeping usd/tokens_per_min finite.
+    Per-call figures and calls_to_exhaustion are span-independent and unaffected."""
+    from runtime import budget
+
+    # Two freshly-appended calls → min(ts)≈now(), so the observed span is a few ms
+    # (< MIN_SPAN_MIN ≈ 60 ms). Divided by ~0 this would explode; the guard uses
+    # window_min instead.
+    _seed_call(conn, ws, cost_usd=3.0, input_tokens=100, output_tokens=100)
+    _seed_call(conn, ws, cost_usd=3.0, input_tokens=100, output_tokens=100)
+
+    br = budget.burn_rate(conn, ws, window_min=60.0)
+    assert br.calls == 2
+    assert br.usd == pytest.approx(6.0)
+    # Guard fired → per-minute rate uses the full window as the denominator, not
+    # the near-zero observed span. (Observed-span division would give ~usd/5e-5 =
+    # tens of thousands per minute — absurd.)
+    assert br.usd_per_min == pytest.approx(br.usd / br.window_min)
+    assert br.tokens_per_min == pytest.approx(br.tokens / br.window_min)
+    assert br.usd_per_min < br.usd  # emphatically not absurd (window_min = 60 > 1)
+    # Per-call figures are span-independent — completely unaffected by the guard.
+    assert br.usd_per_call == pytest.approx(3.0)
+    assert br.tokens_per_call == pytest.approx(200.0)
+
+
+# -- pre-call estimate now prices output (accounting accuracy) --
+
+
+def test_precall_estimate_prices_output_and_gates_near_cap(conn, ws, monkeypatch):
+    """The pre-call USD estimate accounts for OUTPUT tokens (priced at the output
+    rate), not just input. A call whose input-only estimate would have slipped
+    under the cap is now correctly gated once output is priced in."""
+    from runtime import budget
+    from runtime.budget import estimate_call_io_tokens
+    from runtime.events import read_events
+    from runtime.model.call import call_model
+    from runtime.model.registry import Usage, cost_usd, load_registry
+    from runtime.model.router import route_decision
+
+    _keyless(monkeypatch)
+
+    reg = load_registry()
+    # A metered routed model with price_out > price_in so output pricing matters.
+    msgs = [{"role": "user", "content": "estimate the output cost " * 40}]
+    spec = route_decision("plan", "high", registry=reg).model
+    assert spec.price_out > spec.price_in
+
+    inp, out = estimate_call_io_tokens(msgs)
+    old_est = cost_usd(spec, Usage(input_tokens=inp + out))          # the OLD bug:
+    new_est = cost_usd(spec, Usage(input_tokens=inp, output_tokens=out))  # the FIX
+    assert new_est > old_est  # output now costs more than input-only priced it
+
+    # Seed spend and set a USD cap exactly at spent + old (input-only) estimate:
+    # the OLD estimate would have squeaked under (not > cap), the NEW one exceeds.
+    _seed_call(conn, ws, cost_usd=1.0, input_tokens=10, output_tokens=10)
+    budget.set_budget(conn, ws, cap_usd=1.0 + old_est)
+
+    sink = DbEventSink(conn)
+    with pytest.raises(budget.OverBudget):
+        call_model("pm", "plan", msgs, quality="high",
+                   workstream=ws, registry=reg, sink=sink, conn=conn)
+    types = [e.type for e in read_events(conn, workstream=ws)]
+    assert "budget.exceeded" in types
+    # Gated before spending — no model.call emitted (still just the seeded call).
+    assert budget.spent(conn, ws).calls == 1
+
+
+# -- provider fallback is re-gated against the (pricier) fallback spec --
+
+
+class _CursorHangs:
+    """Stand-in for the Cursor CLI hanging: raises ProviderFallback (recoverable)."""
+
+    name = "cursor-cli"
+
+    def complete(self, model_id, messages, **opts):
+        from runtime.model.providers import ProviderFallback
+
+        raise ProviderFallback("simulated cursor-agent -p hang")
+
+
+def _fallback_select(real_select):
+    def _select(spec, *, force_dry_run=False):
+        if spec.id == "cursor-composer":
+            return _CursorHangs()
+        return real_select(spec, force_dry_run=force_dry_run)
+
+    return _select
+
+
+def test_fallback_that_would_breach_cap_is_gated(conn, ws, monkeypatch):
+    """A ProviderFallback reassigns the routed (flat-rate, $0) coding model to a
+    pricier metered fallback (Opus). That retried call must be re-gated against
+    the FALLBACK spec's cost — if it would breach the cap it is blocked, not run
+    and accounted post-hoc."""
+    from runtime import budget
+    from runtime.events import read_events
+    import runtime.model.call as call_mod
+    from runtime.model.call import call_model
+
+    _keyless(monkeypatch)
+    monkeypatch.setattr(
+        call_mod, "select_provider", _fallback_select(call_mod.select_provider)
+    )
+
+    msgs = [{"role": "user", "content": "write the module " * 20}]
+    # cursor-composer routes at $0 (flat rate), so the ROUTED estimate is under any
+    # USD cap. Set the cap exactly at current spend: the $0 routed call passes, but
+    # ANY positive fallback (Opus) estimate breaches → the re-gate must block it.
+    _seed_call(conn, ws, cost_usd=2.0, input_tokens=100, output_tokens=100)
+    budget.set_budget(conn, ws, cap_usd=2.0)
+
+    sink = DbEventSink(conn)
+    with pytest.raises(budget.OverBudget):
+        call_model("builder", "agentic", msgs, quality="high",
+                   workstream=ws, registry=None, sink=sink, conn=conn)
+    types = [e.type for e in read_events(conn, workstream=ws)]
+    assert "budget.exceeded" in types
+    # Blocked before the fallback ran — no model.call, only the seeded event remains.
+    assert budget.spent(conn, ws).calls == 1
+    # The 🛑 raise-budget approval was raised for the fallback breach.
+    assert len(_budget_approvals_for(conn, ws)) == 1
+
+
+def test_fallback_within_budget_still_runs(conn, ws, monkeypatch):
+    """A fallback that stays within the cap is unaffected — it completes and emits
+    its model.call for the model that actually served (Opus), as before."""
+    from runtime import budget
+    from runtime.events import read_events
+    import runtime.model.call as call_mod
+    from runtime.model.call import EVENT_MODEL_CALL, call_model
+
+    _keyless(monkeypatch)
+    monkeypatch.setattr(
+        call_mod, "select_provider", _fallback_select(call_mod.select_provider)
+    )
+
+    msgs = [{"role": "user", "content": "write the module " * 20}]
+    # Generous cap → the (tiny) Opus fallback estimate is well within budget.
+    _seed_call(conn, ws, cost_usd=0.5, input_tokens=100, output_tokens=100)
+    budget.set_budget(conn, ws, cap_usd=1000.0)
+
+    sink = DbEventSink(conn)
+    comp = call_model("builder", "agentic", msgs, quality="high",
+                      workstream=ws, registry=None, sink=sink, conn=conn)
+    assert comp.model_id == "claude-opus-4.8"  # served by the fallback
+    # Exactly one NEW model.call was emitted, accounted to the fallback model that
+    # actually served (the other model.call is the pre-seeded "m" event).
+    served = [
+        e for e in read_events(conn, workstream=ws)
+        if e.type == EVENT_MODEL_CALL and e.payload["model"] == "claude-opus-4.8"
+    ]
+    assert len(served) == 1
+    # It accrued (seeded call + this fallback call).
+    assert budget.spent(conn, ws).calls == 2
