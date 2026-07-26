@@ -141,7 +141,7 @@ secrets + ran an agentic harness outside the sandbox, invariants #2/#5): FIXED
 `CURSOR_API_KEY` only, `--network none`, `--cap-drop ALL`, non-root, read-only rootfs),
 fails closed to Opus fallback with no sandbox, no host subprocess remains; adversarially
 verified. Host-safety/sandbox/isolation audit otherwise clean (fs-escape, env-allowlist,
-sandbox-required tools, four-layer memory scope isolation, no SSRF) ·
+sandbox-required tools, four-layer memory scope isolation, no SSRF) · **Concurrency audit + fixes** (3rd audit found 3 MEDIUM races): budget over-spend TOCTOU FIXED `cf7de56` (reservation-under-`FOR UPDATE` + Phase-2 leak guard, migration 0016) · `request_decision` open-decision-vs-runnable-task race FIXED `5fd398e` (atomic park-or-abort + `rekick_task` status guard) · event-log `seq` visibility gap for `since_seq` consumers (in progress). Clean bills: no double-claim, no ad-hoc status writes, concurrent transitions serialize, illegal edges guarded) ·
 **Async open-ended decision primitive** (ADR-0025; migration 0015): the open-ended
 sibling of binary approvals — `runtime/decisions.py` `request_decision` PARKS the
 dependent task (`blocked`) so the worker is FREED (grab-by-sort skips it), Spokesman
