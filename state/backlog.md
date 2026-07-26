@@ -134,7 +134,22 @@ raw values) — both exploits reproduced then verified CLOSED, args-digest survi
 collision/stability/serialization attacks; also fenced `quarantined` in
 `is_relay_allowed`. Rest of the boundary got a clean bill: fail-closed, true one-shot,
 tier mapping, secret non-leakage, `effective_policy`, revoked-on-grab all verified) ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0024.
+**Audit fix #2 — Cursor host-exec/env-leak** (a 2nd audit found `cursor_cli.py` ran
+cursor-agent as a raw HOST subprocess with NO `env=` → the child inherited ALL host
+secrets + ran an agentic harness outside the sandbox, invariants #2/#5): FIXED
+`5421c5c` — cursor-agent now runs INSIDE the Docker sandbox (env allowlist =
+`CURSOR_API_KEY` only, `--network none`, `--cap-drop ALL`, non-root, read-only rootfs),
+fails closed to Opus fallback with no sandbox, no host subprocess remains; adversarially
+verified. Host-safety/sandbox/isolation audit otherwise clean (fs-escape, env-allowlist,
+sandbox-required tools, four-layer memory scope isolation, no SSRF) ·
+**Async open-ended decision primitive** (ADR-0025; migration 0015): the open-ended
+sibling of binary approvals — `runtime/decisions.py` `request_decision` PARKS the
+dependent task (`blocked`) so the worker is FREED (grab-by-sort skips it), Spokesman
+surfaces it BATCHED/async (ADR-0006, `decide <id> <answer>`), `answer_decision` RESUMES
+it (`blocked→up_for_grabs`) with the answer readable; body-free events; cross-resume
+safety vs approvals proven both directions (distinct `blocked_on_decision` marker). So
+an agent is never stalled waiting on a stakeholder decision ·
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0025.
 
 ## 🔄 In progress
 
