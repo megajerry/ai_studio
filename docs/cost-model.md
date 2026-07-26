@@ -135,9 +135,17 @@ The executor tier is where most volume lands, so its substrate drives ROI:
     raw HTTP inference endpoint** — inference is only reachable via its
     **agent-harness CLI** (`cursor-agent -p <prompt> --output-format json`), which
     is *heavier and slower than a plain completion* (it runs a full planning/tool
-    loop per call). (2) There is a known 2026 bug where `cursor-agent -p` can
-    **hang with no output**, so the adapter enforces a **hard timeout + automatic
-    fallback** to a metered model (never blocks the studio). (3) At $200/mo flat it
+    loop per call). The harness is run **inside the Docker sandbox** (via a
+    `SandboxRunner`, never a raw host subprocess) with an env allowlist that
+    forwards **only** `CURSOR_API_KEY` into the container — every other host secret
+    is withheld (CLAUDE.md invariants 2 & 5); the key rides the sandbox env by
+    name, never the argv. `cursor-agent` needs network egress, so the operator must
+    allow it for the sandbox (`SANDBOX_NETWORK`; the hardened default is `none`).
+    (2) There is a known 2026 bug where `cursor-agent -p` can
+    **hang with no output**, so execution enforces a **hard timeout + automatic
+    fallback** to a metered model (never blocks the studio); it also fails closed
+    to that fallback when no sandbox/Docker is available (never runs on the host).
+    (3) At $200/mo flat it
     **~consumes the entire recommended ~$200/mo cap** on its own — run it as *the*
     coding substrate, not alongside a second full-price executor budget. It
     routes for the `coding` tier only (never cheap/classify/embed).

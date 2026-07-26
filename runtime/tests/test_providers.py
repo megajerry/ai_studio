@@ -156,20 +156,16 @@ def test_cursor_fail_closed_without_sandbox_raises_fallback(monkeypatch):
         CursorCliProvider().complete("cursor-composer", [{"role": "user", "content": "go"}])
 
 
-def test_cursor_sandbox_timeout_raises_provider_fallback():
+def test_cursor_sandbox_timeout_raises_provider_fallback(monkeypatch):
     from runtime.sandbox import TIMEOUT_EXIT_CODE
 
+    monkeypatch.setenv("CURSOR_API_KEY", "cur-not-real")
+    monkeypatch.delenv("MODELS_DRY_RUN", raising=False)
     fake = _FakeSandbox(exit_code=TIMEOUT_EXIT_CODE, stdout="", stderr="killed")
-    import os as _os
-
-    _os.environ["CURSOR_API_KEY"] = "cur-not-real"
-    try:
-        with pytest.raises(ProviderFallback):
-            CursorCliProvider(sandbox=fake, timeout_s=1.0).complete(
-                "cursor-composer", [{"role": "user", "content": "go"}]
-            )
-    finally:
-        _os.environ.pop("CURSOR_API_KEY", None)
+    with pytest.raises(ProviderFallback):
+        CursorCliProvider(sandbox=fake, timeout_s=1.0).complete(
+            "cursor-composer", [{"role": "user", "content": "go"}]
+        )
 
 
 def test_cursor_nonzero_exit_raises_provider_fallback(monkeypatch):
