@@ -212,6 +212,56 @@ def test_verify_wellformed_db_row_contradiction_still_rejected(conn, ws):
     assert verdict.refs[0].contradicted and not verdict.refs[0].malformed
 
 
+def test_verify_db_row_contradiction_beats_malformed_sibling(conn, ws):
+    """Intra-ref precedence (ADR-0021 follow-up): within ONE db_row ref, a genuine
+    contradiction on a well-formed field WINS over a malformed/unknown-column
+    sibling field — the ref is REJECTED (fabrication), not UNVERIFIABLE. Before
+    the fix the resolver short-circuited on `no_such_col` and mis-judged this as
+    unverifiable, letting a lie dodge the strike."""
+    t = _merged_task(conn, ws)  # truly merged
+    claim = Claim(statement="the task was abandoned",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW, locator=f"tasks:{t.id}",
+                                        expected="no_such_col=x,status=abandoned")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "rejected"
+    assert verdict.refs[0].contradicted and not verdict.refs[0].malformed
+
+
+def test_verify_db_row_contradiction_beats_malformed_sibling_field_order(conn, ws):
+    """Same as above but the malformed field comes AFTER the contradicting one —
+    the verdict must be identical (field-order independence)."""
+    t = _merged_task(conn, ws)  # truly merged
+    claim = Claim(statement="the task was abandoned",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW, locator=f"tasks:{t.id}",
+                                        expected="status=abandoned,no_such_col=x")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "rejected"
+    assert verdict.refs[0].contradicted and not verdict.refs[0].malformed
+
+
+def test_verify_db_row_all_malformed_fields_still_unverifiable(conn, ws):
+    """A ref whose fields are ALL malformed (no genuine contradiction) is STILL
+    UNVERIFIABLE — the honest mis-format fix is preserved, no strike."""
+    t = _merged_task(conn, ws)
+    claim = Claim(statement="row state",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW, locator=f"tasks:{t.id}",
+                                        expected="no_such_col=x,also_bogus=y")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "unverifiable"
+    assert verdict.refs[0].malformed is True and not verdict.refs[0].contradicted
+
+
+def test_verify_db_row_all_matching_fields_is_verified(conn, ws):
+    """All well-formed fields on existing columns that match → VERIFIED."""
+    t = _merged_task(conn, ws)
+    claim = Claim(statement="task merged in its workstream",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW, locator=f"tasks:{t.id}",
+                                        expected=f"status=merged,workstream={ws}")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "verified"
+    assert verdict.refs[0].resolved and not verdict.refs[0].contradicted
+
+
 def test_verify_malformed_metric_expected_is_unverifiable(conn):
     """A non-numeric `expected` on a count metric is malformed → unverifiable."""
     claim = Claim(statement="there are many tasks",
@@ -352,6 +402,55 @@ def test_malformed_metric_expected_is_withheld_not_a_fabrication(conn, ident):
     assert result["relayed"] == [] and result.get("fabrication", False) is False
     assert result["claims"][0]["status"] == "unverifiable"
     assert get_trust(conn, ident).strikes == 0
+    assert is_relay_allowed(conn, ident) is True
+
+
+def test_db_row_bundled_lie_is_rejected_revoked_and_escalated(conn, ws, ident):
+    """Loophole closed (ADR-0021 follow-up): a db_row claim that bundles a bogus
+    column with a genuine lie (`no_such_col=x,status=abandoned`) on a MERGED task
+    is a fabrication — the contradiction on `status` wins over the malformed
+    `no_such_col`, so the originator IS struck + revoked (it cannot dodge the
+    strike by hiding behind a bogus field)."""
+    assert is_relay_allowed(conn, ident) is True
+    t = _merged_task(conn, ws)  # truly merged
+    notifier, client = _notifier()
+    claim = Claim(statement="the task was abandoned and lost",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW, locator=f"tasks:{t.id}",
+                                        expected="no_such_col=x,status=abandoned")])
+    result = relay_claims(conn, notifier, kind="inform",
+                          originating_identity=ident, claims=[claim])
+
+    assert result["blocked"] is True and result["fabrication"] is True
+    assert result["relayed"] == []
+    rec = get_trust(conn, ident)
+    assert rec.trust_state == TRUST_REVOKED and rec.human_relay_allowed is False
+    assert is_relay_allowed(conn, ident) is False
+    assert client.sent and "\U0001F6A8" in client.sent[0]
+    cid = result["claims"][0]["claim_id"]
+    assert any(e.type == EVENT_COMMS_FABRICATION_DETECTED
+               for e in _events_for_claim(conn, cid))
+
+
+def test_db_row_only_malformed_is_withheld_not_a_fabrication(conn, ws, ident):
+    """Preserves the honest-mis-format fix: a db_row ref with ONLY a malformed
+    field (`no_such_col=x`, no genuine contradiction) → UNVERIFIABLE + proof
+    requested, NO strike, NO revocation."""
+    assert is_relay_allowed(conn, ident) is True
+    t = _merged_task(conn, ws)
+    notifier, client = _notifier()
+    claim = Claim(statement="row state",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW, locator=f"tasks:{t.id}",
+                                        expected="no_such_col=x")])
+    result = relay_claims(conn, notifier, kind="inform",
+                          originating_identity=ident, claims=[claim])
+
+    assert result["relayed"] == [] and result.get("fabrication", False) is False
+    assert result["claims"][0]["status"] == "unverifiable"
+    assert result["claims"][0].get("proof_requested") is True
+    assert client.sent == []  # no escalation
+    rec = get_trust(conn, ident)
+    assert rec.strikes == 0
+    assert rec.trust_state != TRUST_REVOKED and rec.human_relay_allowed is True
     assert is_relay_allowed(conn, ident) is True
 
 
