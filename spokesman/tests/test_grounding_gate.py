@@ -140,6 +140,101 @@ def test_verify_contradiction_is_rejected(conn, ws):
     assert verdict.refs[0].resolved and verdict.refs[0].contradicted
 
 
+# --- ill-formed `expected` is UNVERIFIABLE, never fabrication (ADR-0021 follow-up) ---
+
+
+def test_verify_malformed_task_expected_is_unverifiable_not_contradiction(conn, ws):
+    """A `task` ref whose `expected` is a db_row-style `status=merged` (not a bare
+    status) is UNINTERPRETABLE → UNVERIFIABLE, NOT a contradiction — even though
+    the resolved actual status `merged` != the literal string `status=merged`."""
+    t = _merged_task(conn, ws)  # actually merged
+    claim = Claim(statement="the task is merged",
+                  evidence=[EvidenceRef(kind=EvidenceKind.TASK,
+                                        locator=f"task:{t.id}", expected="status=merged")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "unverifiable"
+    ref = verdict.refs[0]
+    assert ref.malformed is True
+    assert ref.contradicted is False and ref.resolved is False
+
+
+def test_verify_garbage_task_expected_is_unverifiable(conn, ws):
+    t = _merged_task(conn, ws)
+    claim = Claim(statement="the task is done",
+                  evidence=[EvidenceRef(kind=EvidenceKind.TASK,
+                                        locator=f"task:{t.id}", expected="totally-bogus")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "unverifiable"
+    assert verdict.refs[0].malformed is True and not verdict.refs[0].contradicted
+
+
+def test_verify_wellformed_task_contradiction_still_rejected(conn, ws):
+    """A WELL-FORMED bare status that genuinely differs is STILL a contradiction."""
+    t = _merged_task(conn, ws)  # merged; claim asserts a valid-but-wrong status
+    claim = Claim(statement="task abandoned",
+                  evidence=[EvidenceRef(kind=EvidenceKind.TASK,
+                                        locator=f"task:{t.id}", expected="abandoned")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "rejected"
+    assert verdict.refs[0].contradicted and not verdict.refs[0].malformed
+
+
+def test_verify_malformed_db_row_expected_is_unverifiable(conn, ws):
+    """A `db_row` `expected` with no `col=val` syntax is malformed → unverifiable."""
+    t = _merged_task(conn, ws)
+    claim = Claim(statement="row exists",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW,
+                                        locator=f"tasks:{t.id}", expected="merged")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "unverifiable"
+    assert verdict.refs[0].malformed is True and not verdict.refs[0].contradicted
+
+
+def test_verify_unknown_db_row_column_is_unverifiable(conn, ws):
+    """An `expected` referencing a column that does not exist is malformed."""
+    t = _merged_task(conn, ws)
+    claim = Claim(statement="row state",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW,
+                                        locator=f"tasks:{t.id}", expected="no_such_col=x")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "unverifiable"
+    assert verdict.refs[0].malformed is True and not verdict.refs[0].contradicted
+
+
+def test_verify_wellformed_db_row_contradiction_still_rejected(conn, ws):
+    """A well-formed `col=val` on an existing column that differs is a contradiction."""
+    t = _merged_task(conn, ws)  # status is merged
+    claim = Claim(statement="task is abandoned",
+                  evidence=[EvidenceRef(kind=EvidenceKind.DB_ROW,
+                                        locator=f"tasks:{t.id}", expected="status=abandoned")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "rejected"
+    assert verdict.refs[0].contradicted and not verdict.refs[0].malformed
+
+
+def test_verify_malformed_metric_expected_is_unverifiable(conn):
+    """A non-numeric `expected` on a count metric is malformed → unverifiable."""
+    claim = Claim(statement="there are many tasks",
+                  evidence=[EvidenceRef(kind=EvidenceKind.METRIC,
+                                        locator="tasks_total", expected="lots")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "unverifiable"
+    assert verdict.refs[0].malformed is True and not verdict.refs[0].contradicted
+
+
+def test_verify_malformed_file_expected_is_unverifiable(conn, tmp_path):
+    """A non-sha256 `expected` on a `file` is malformed → unverifiable (not silently
+    passed, not a contradiction)."""
+    p = tmp_path / "artifact.txt"
+    p.write_text("hello", "utf-8")
+    claim = Claim(statement="the file says hello",
+                  evidence=[EvidenceRef(kind=EvidenceKind.FILE,
+                                        locator=str(p), expected="hello")])
+    verdict = verify_claim(conn, claim)
+    assert verdict.status == "unverifiable"
+    assert verdict.refs[0].malformed is True and not verdict.refs[0].contradicted
+
+
 # --- relay decision ---------------------------------------------------------
 
 
@@ -206,6 +301,58 @@ def test_fabricated_claim_is_rejected_revoked_and_escalated(conn, ws, ident):
     cid = result["claims"][0]["claim_id"]
     assert any(e.type == EVENT_COMMS_FABRICATION_DETECTED
                for e in _events_for_claim(conn, cid))
+
+
+def test_malformed_expected_is_withheld_not_a_fabrication(conn, ws, ident):
+    """CORE REGRESSION (ADR-0021 follow-up): an honest agent that MIS-FORMATS its
+    evidence spec must NOT be branded a fabricator. A `task` ref with a malformed
+    `expected` (`status=merged` instead of a bare status) on a task that is
+    actually `merged` → UNVERIFIABLE (withheld + proof requested), NO strike, NO
+    revocation, relay still allowed. (Before the fix this wrongly REJECTED it as a
+    fabrication and permanently revoked the identity.)"""
+    assert is_relay_allowed(conn, ident) is True
+    t = _merged_task(conn, ws)  # truly merged
+    notifier, client = _notifier()
+    claim = Claim(statement="the task is merged",
+                  evidence=[EvidenceRef(kind=EvidenceKind.TASK,
+                                        locator=f"task:{t.id}", expected="status=merged")])
+    result = relay_claims(conn, notifier, kind="inform",
+                          originating_identity=ident, claims=[claim])
+
+    # Withheld as unverifiable — NOT sent, NOT a fabrication.
+    assert result["relayed"] == []
+    assert result.get("fabrication", False) is False
+    assert result["claims"][0]["status"] == "unverifiable"
+    assert result["claims"][0].get("proof_requested") is True
+    assert notifier.pending_count == 0
+    assert client.sent == []  # no 🚨 escalation
+
+    cid = result["claims"][0]["claim_id"]
+    events = _events_for_claim(conn, cid)
+    assert any(e.type == EVENT_COMMS_PROOF_REQUESTED for e in events)
+    assert not any(e.type == EVENT_COMMS_FABRICATION_DETECTED for e in events)
+
+    # Identity is UNHARMED: no strike, not revoked, still allowed to relay.
+    rec = get_trust(conn, ident)
+    assert rec.strikes == 0
+    assert rec.trust_state != TRUST_REVOKED and rec.human_relay_allowed is True
+    assert is_relay_allowed(conn, ident) is True
+
+
+def test_malformed_metric_expected_is_withheld_not_a_fabrication(conn, ident):
+    """Same principle for a `metric`: a non-numeric `expected` is a mis-formatted
+    spec → UNVERIFIABLE + proof requested, never a fabrication/strike."""
+    assert is_relay_allowed(conn, ident) is True
+    notifier, client = _notifier()
+    claim = Claim(statement="there are exactly this many tasks",
+                  evidence=[EvidenceRef(kind=EvidenceKind.METRIC,
+                                        locator="tasks_total", expected="a bunch")])
+    result = relay_claims(conn, notifier, kind="inform",
+                          originating_identity=ident, claims=[claim])
+    assert result["relayed"] == [] and result.get("fabrication", False) is False
+    assert result["claims"][0]["status"] == "unverifiable"
+    assert get_trust(conn, ident).strikes == 0
+    assert is_relay_allowed(conn, ident) is True
 
 
 def test_verifier_chain_cascade_strikes_the_approver(conn, ws, ident):
