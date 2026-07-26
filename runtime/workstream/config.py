@@ -29,9 +29,14 @@ Fields (all optional except ``name``):
   Capacity Steward role (ADR-0022 C2). OFF by default (PM is the accountable
   steward); enabling it activates a monitor that FLAGS budget breaches early +
   RECOMMENDS actions (:func:`runtime.roles.capacity_steward.capacity_steward_enabled`).
-- ``policy_grants`` — role→capabilities for THIS workstream, merged over the base
-  policy (:meth:`effective_policy`) so a vertical can grant e.g. its ``operator``
-  a publish 🔴 tool without editing the shared policy file.
+- ``policy_grants`` — role→capabilities ADDED for THIS workstream, **unioned onto**
+  the base policy (:meth:`effective_policy`) so a vertical can grant e.g. its
+  ``operator`` a publish 🔴 tool without editing the shared policy file — and
+  WITHOUT silently dropping the role's base capabilities (additive, never REPLACE).
+- ``policy_revocations`` — role→capabilities REMOVED for THIS workstream, the
+  EXPLICIT way to scope a role DOWN (least privilege) after the union. Removal is
+  deliberate here, never a silent side effect of adding a grant. Applied after the
+  union, so a cap in both is removed (revocation wins).
 - ``skills`` — the skill ``names`` (a subset of the shared corpus) and/or a
   workstream-local ``dir`` this vertical's roles draw on.
 - ``checkers`` — which built-in domain verify-checkers to register on top of the
@@ -180,6 +185,7 @@ class WorkstreamConfig(BaseModel):
     budget: Optional[BudgetSpec] = None
     capacity_steward: Optional[CapacityStewardSpec] = None
     policy_grants: dict[str, list[str]] = Field(default_factory=dict)
+    policy_revocations: dict[str, list[str]] = Field(default_factory=dict)
     skills: Optional[SkillsSpec] = None
     checkers: list[str] = Field(default_factory=list)
     memory_seed: list[MemorySeedItem] = Field(default_factory=list)
@@ -206,9 +212,12 @@ class WorkstreamConfig(BaseModel):
             self.objective = self.charter
         return self
 
-    @field_validator("policy_grants")
+    @field_validator("policy_grants", "policy_revocations")
     @classmethod
-    def _valid_capabilities(cls, grants: dict[str, list[str]]) -> dict[str, list[str]]:
+    def _valid_capabilities(
+        cls, grants: dict[str, list[str]], info
+    ) -> dict[str, list[str]]:
+        field = info.field_name
         for role, caps in grants.items():
             for cap in caps:
                 try:
@@ -216,7 +225,7 @@ class WorkstreamConfig(BaseModel):
                 except ValueError as exc:
                     valid = sorted(c.value for c in Capability)
                     raise ValueError(
-                        f"policy_grants[{role!r}] has unknown capability {cap!r}; "
+                        f"{field}[{role!r}] has unknown capability {cap!r}; "
                         f"valid: {valid}"
                     ) from exc
         return grants
@@ -255,18 +264,44 @@ class WorkstreamConfig(BaseModel):
         return reg
 
     def effective_policy(self, base: PolicyConfig) -> PolicyConfig:
-        """``base`` policy with this workstream's ``policy_grants`` merged over it.
+        """``base`` policy with this workstream's grants **unioned on** and its
+        revocations removed.
 
-        A role named in ``policy_grants`` gets exactly those capabilities for THIS
-        workstream (replacing the base grant for that role); roles not named keep
-        the base grant. With no ``policy_grants`` the base is returned unchanged
-        (behavior-preserving). Tier overrides are inherited from the base.
+        Composition (decided deliberately — see below):
+
+            effective[role] = (base[role] ∪ policy_grants[role]) − policy_revocations[role]
+
+        - ``policy_grants`` is **ADDITIVE**: a role named there KEEPS all its base
+          capabilities and gains the listed ones. Adding one grant never silently
+          drops the base set (that would be a least-privilege footgun — a role
+          could lose a capability it needs while the config author only meant to
+          add one). This is a union, **not** a REPLACE.
+        - ``policy_revocations`` is the EXPLICIT, deliberate way to scope a role
+          DOWN. It is applied AFTER the union, so a capability listed in both is
+          removed (revocation wins). Removing a capability the role doesn't have
+          is a harmless no-op.
+
+        Roles named in neither keep their base grant. With no grants AND no
+        revocations the base is returned unchanged (behavior-preserving). Tier
+        overrides are always inherited from the base.
+
+        Decision (locked by tests): earlier this method REPLACED a role's grant
+        set with the workstream list, which forced a config author to re-list
+        every base capability just to add one (see the old example config) and
+        risked silently dropping a base capability on drift. Union-plus-explicit-
+        revocation preserves both directions of least-privilege — a vertical can
+        still scope a role down — while making removal deliberate, not accidental.
         """
-        if not self.policy_grants:
+        if not self.policy_grants and not self.policy_revocations:
             return base
         roles = dict(base.roles)
         for role, caps in self.policy_grants.items():
-            roles[role] = frozenset(Capability(c) for c in caps)
+            additions = frozenset(Capability(c) for c in caps)
+            roles[role] = roles.get(role, frozenset()) | additions
+        for role, caps in self.policy_revocations.items():
+            removals = frozenset(Capability(c) for c in caps)
+            if role in roles and removals:
+                roles[role] = roles[role] - removals
         return PolicyConfig(roles=roles, tier_overrides=dict(base.tier_overrides))
 
     def effective_skills(

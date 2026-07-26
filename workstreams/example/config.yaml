@@ -57,16 +57,23 @@ budget:
 #   # window_min: 60      # burn-rate look-back (optional)
 #   # horizon_min: 1440   # override period-end projection horizon (optional)
 
-# Workstream-specific capability grants, merged OVER the base policy. Here the
-# channel's `operator` role may spend money to PUBLISH (spend.money is 🔴, so a
-# publish still requires human approval — this only makes it reachable at all).
+# Workstream-specific capability grants, ADDED (unioned) onto the base policy —
+# the role KEEPS all its base capabilities and gains these (never a REPLACE, so
+# adding one grant can't silently drop the base set). Here the channel's
+# `operator` gains fs.write on top of its base grants (fs.read, net.fetch,
+# secret.use, spend.money). spend.money is already 🔴, so a publish still requires
+# human approval — the base already makes it reachable; this only adds fs.write.
+# To scope a role DOWN, use `policy_revocations` (below) — removal is explicit,
+# never a side effect of a grant.
 policy_grants:
   operator:
-    - fs.read
     - fs.write
-    - net.fetch
-    - secret.use
-    - spend.money
+
+# Explicit, deliberate least-privilege scoping DOWN (applied after the union).
+# Uncomment to REMOVE a base capability from a role for THIS workstream, e.g.:
+# policy_revocations:
+#   operator:
+#     - spend.money   # this vertical never spends, even though base grants it
 
 # The skills this vertical's roles draw on (a subset of the shared corpus).
 skills:
