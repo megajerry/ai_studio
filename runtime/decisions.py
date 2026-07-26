@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -51,6 +51,19 @@ STATUS_WITHDRAWN = "withdrawn"
 BLOCKED_ON_DECISION = "blocked_on_decision"
 #: The reason recorded on the park transition (a short CODE, never body text).
 PARK_REASON = "awaiting_decision"
+
+
+class DecisionParkError(RuntimeError):
+    """A decision's dependent task could NOT be parked, so no decision was created.
+
+    Raised by :func:`request_decision` when the park (``in_progress → blocked``)
+    is a guarded no-op — the task already left ``in_progress`` in the window (e.g.
+    a supervisor re-kick did ``in_progress → up_for_grabs``). Park and record are
+    ATOMIC (one transaction, park FIRST): on this failure the whole operation is
+    rolled back, so NO orphan ``open`` decision is ever committed against a task
+    that is still runnable. The caller must treat this as "the decision was not
+    raised" and retry / handle it (never assume the task is parked).
+    """
 
 _COLUMNS = (
     "id, workstream, question, options, status, answer, answered_by, "
@@ -142,19 +155,54 @@ def request_decision(
     workstream / seq / has_options — NOT the question text). ``now`` is injectable
     for deterministic tests (defaults to the DB clock). Returns the created
     :class:`Decision` (its ``.id`` is the decision id).
+
+    **Atomicity (park-then-record).** Park and record run in ONE transaction, park
+    FIRST: when a ``dependent_task_id`` is given the task is PARKED via the single
+    guarded :func:`runtime.tasks.transition` and its return is CHECKED; only if the
+    park SUCCEEDED is the ``open`` decision row INSERTed. If the park is a guarded
+    no-op (the task already left ``in_progress`` in the window — e.g. a supervisor
+    re-kick did ``in_progress → up_for_grabs``) the whole operation ABORTS with
+    :class:`DecisionParkError` and rolls back, so an ``open`` decision is NEVER
+    committed against a still-runnable task (which would bypass the decision gate
+    and silently discard the human's answer when the later resume no-ops).
     """
     opts = list(options) if options is not None else None
+    # Pre-generate the id so the park can stamp `blocked_on_decision` BEFORE the row
+    # exists — park-first means a failed park never even reaches the INSERT.
+    decision_id = uuid4()
     with conn.transaction():
+        # Park the dependent task FIRST so the worker moves on to other work, and
+        # CHECK the return. Reuses the guarded in_progress→blocked edge (like
+        # runtime.tasks.block_task); guarded to in_progress. A None return means the
+        # task is no longer in_progress (raced by a re-kick / other move): ABORT the
+        # whole request — raising rolls back this transaction so no `open` decision
+        # is left paired with a runnable task.
+        if dependent_task_id is not None:
+            parked = transition(
+                conn, dependent_task_id, TaskStatus.BLOCKED,
+                expected_from=TaskStatus.IN_PROGRESS,
+                result={
+                    BLOCKED_ON_DECISION: str(decision_id),
+                    "reason": PARK_REASON,
+                },
+            )
+            if parked is None:
+                raise DecisionParkError(
+                    f"cannot park task {dependent_task_id} for a decision: it is not "
+                    "in_progress (likely re-kicked or already moved); no decision created"
+                )
+
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 INSERT INTO decisions
-                    (workstream, question, options, dependent_task_id,
+                    (id, workstream, question, options, dependent_task_id,
                      default_choice, status, created_at)
-                VALUES (%s, %s, %s, %s, %s, 'open', COALESCE(%s, now()))
+                VALUES (%s, %s, %s, %s, %s, %s, 'open', COALESCE(%s, now()))
                 RETURNING {_COLUMNS}
                 """,
                 (
+                    decision_id,
                     workstream,
                     question,
                     Jsonb(opts) if opts is not None else None,
@@ -164,19 +212,6 @@ def request_decision(
                 ),
             )
             decision = Decision.model_validate(cur.fetchone())
-
-        # Park the dependent task so the worker moves on to other work. Reuses the
-        # guarded in_progress→blocked edge (like runtime.tasks.block_task); guarded
-        # to in_progress, so a task in any other state is left untouched.
-        if dependent_task_id is not None:
-            transition(
-                conn, dependent_task_id, TaskStatus.BLOCKED,
-                expected_from=TaskStatus.IN_PROGRESS,
-                result={
-                    BLOCKED_ON_DECISION: str(decision.id),
-                    "reason": PARK_REASON,
-                },
-            )
 
         _emit(sink, type=EVENT_DECISION_REQUESTED, decision=decision, workstream=workstream)
     return decision
