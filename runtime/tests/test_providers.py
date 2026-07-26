@@ -75,8 +75,23 @@ def test_adapter_registry_maps_known_providers_only():
 
 
 # --------------------------------------------------------------------------- #
-# Cursor CLI adapter — agent-harness subprocess, guarded, keyless-safe
+# Cursor CLI adapter — agent-harness run INSIDE the Docker sandbox, keyless-safe
 # --------------------------------------------------------------------------- #
+
+
+class _FakeSandbox:
+    """A stand-in :class:`SandboxRunner` that records the command it was asked to
+    run and returns a canned ``(exit_code, stdout, stderr)`` — no Docker, no host
+    process. Injected into the provider so tests never launch a real container."""
+
+    def __init__(self, *, exit_code: int = 0, stdout: str = '{"result": "ok"}', stderr: str = ""):
+        self.calls: list[str] = []
+        self._exit, self._stdout, self._stderr = exit_code, stdout, stderr
+
+    def run(self, command: str, **kwargs):  # matches SandboxRunner protocol
+        self.calls.append(command)
+        return self._exit, self._stdout, self._stderr
+
 
 def test_cursor_available_reflects_env_key(monkeypatch):
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
@@ -85,102 +100,144 @@ def test_cursor_available_reflects_env_key(monkeypatch):
     assert CursorCliProvider().available() is True
 
 
-def test_cursor_dryrun_stub_without_key_never_shells_out(monkeypatch):
-    # No CURSOR_API_KEY -> deterministic stub, NO subprocess (keyless-green).
+def test_cursor_dryrun_stub_without_key_never_runs_sandbox(monkeypatch):
+    # No CURSOR_API_KEY -> deterministic stub, sandbox is never touched (keyless).
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     monkeypatch.delenv("MODELS_DRY_RUN", raising=False)
 
-    def boom(*a, **k):  # pragma: no cover - only fires on an accidental shell-out
-        raise AssertionError("cursor-agent was launched in a test")
-
-    monkeypatch.setattr(cursor_mod.subprocess, "run", boom)
-    p = CursorCliProvider()
+    fake = _FakeSandbox()
+    p = CursorCliProvider(sandbox=fake)
     msgs = [{"role": "user", "content": "x" * 400}]
     a = p.complete("cursor-composer", msgs)
     b = p.complete("cursor-composer", msgs)
     assert a.text == b.text  # deterministic, exactly like DryRunProvider
     assert a.provider == "cursor-cli"
     assert a.usage.input_tokens >= 1
+    assert fake.calls == []  # keyless path never reaches the sandbox
 
 
-def test_cursor_dryrun_mode_never_shells_out_even_with_key(monkeypatch):
+def test_cursor_dryrun_mode_never_runs_sandbox_even_with_key(monkeypatch):
     monkeypatch.setenv("CURSOR_API_KEY", "cur-not-real")
     monkeypatch.setenv("MODELS_DRY_RUN", "1")
-    monkeypatch.setattr(
-        cursor_mod.subprocess, "run",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("shelled out in dry-run")),
+    fake = _FakeSandbox()
+    comp = CursorCliProvider(sandbox=fake).complete(
+        "cursor-composer", [{"role": "user", "content": "hi"}]
     )
-    comp = CursorCliProvider().complete("cursor-composer", [{"role": "user", "content": "hi"}])
     assert comp.provider == "cursor-cli"
+    assert fake.calls == []  # dry-run short-circuits before the sandbox
 
 
-def test_cursor_timeout_raises_provider_fallback(monkeypatch):
+def test_cursor_never_runs_a_host_subprocess(monkeypatch):
+    # SECURITY: with a key present the provider must go through the injected
+    # sandbox, never a raw host subprocess. Blow up if ANY host process spawns.
     import subprocess as _sp
 
     monkeypatch.setenv("CURSOR_API_KEY", "cur-not-real")
     monkeypatch.delenv("MODELS_DRY_RUN", raising=False)
+    monkeypatch.setattr(
+        _sp, "run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("host subprocess spawned")),
+    )
+    fake = _FakeSandbox(stdout='{"result": "sandboxed reply"}')
+    comp = CursorCliProvider(sandbox=fake).complete(
+        "cursor-composer", [{"role": "user", "content": "go"}]
+    )
+    assert comp.text == "sandboxed reply"
+    assert len(fake.calls) == 1  # ran once, in the sandbox
 
-    def hang(*a, **k):
-        raise _sp.TimeoutExpired(cmd="cursor-agent", timeout=1.0)
 
-    monkeypatch.setattr(cursor_mod.subprocess, "run", hang)
+def test_cursor_fail_closed_without_sandbox_raises_fallback(monkeypatch):
+    # Key present but no sandbox injected AND Docker absent -> ProviderFallback,
+    # NOT a host execution (fail-closed).
+    monkeypatch.setenv("CURSOR_API_KEY", "cur-not-real")
+    monkeypatch.delenv("MODELS_DRY_RUN", raising=False)
+    monkeypatch.setattr(cursor_mod, "_build_default_sandbox", lambda timeout_s: None)
     with pytest.raises(ProviderFallback):
-        CursorCliProvider(timeout_s=1.0).complete("cursor-composer", [{"role": "user", "content": "go"}])
+        CursorCliProvider().complete("cursor-composer", [{"role": "user", "content": "go"}])
+
+
+def test_cursor_sandbox_timeout_raises_provider_fallback(monkeypatch):
+    from runtime.sandbox import TIMEOUT_EXIT_CODE
+
+    monkeypatch.setenv("CURSOR_API_KEY", "cur-not-real")
+    monkeypatch.delenv("MODELS_DRY_RUN", raising=False)
+    fake = _FakeSandbox(exit_code=TIMEOUT_EXIT_CODE, stdout="", stderr="killed")
+    with pytest.raises(ProviderFallback):
+        CursorCliProvider(sandbox=fake, timeout_s=1.0).complete(
+            "cursor-composer", [{"role": "user", "content": "go"}]
+        )
 
 
 def test_cursor_nonzero_exit_raises_provider_fallback(monkeypatch):
     monkeypatch.setenv("CURSOR_API_KEY", "cur-not-real")
     monkeypatch.delenv("MODELS_DRY_RUN", raising=False)
-
-    class _Proc:
-        returncode = 2
-        stdout = ""
-        stderr = "boom"
-
-    monkeypatch.setattr(cursor_mod.subprocess, "run", lambda *a, **k: _Proc())
+    fake = _FakeSandbox(exit_code=2, stdout="", stderr="boom")
     with pytest.raises(ProviderFallback):
-        CursorCliProvider().complete("cursor-composer", [{"role": "user", "content": "go"}])
+        CursorCliProvider(sandbox=fake).complete(
+            "cursor-composer", [{"role": "user", "content": "go"}]
+        )
 
 
 def test_cursor_unparseable_output_raises_provider_fallback(monkeypatch):
     monkeypatch.setenv("CURSOR_API_KEY", "cur-not-real")
     monkeypatch.delenv("MODELS_DRY_RUN", raising=False)
-
-    class _Proc:
-        returncode = 0
-        stdout = "not json at all"
-        stderr = ""
-
-    monkeypatch.setattr(cursor_mod.subprocess, "run", lambda *a, **k: _Proc())
+    fake = _FakeSandbox(exit_code=0, stdout="not json at all", stderr="")
     with pytest.raises(ProviderFallback):
-        CursorCliProvider().complete("cursor-composer", [{"role": "user", "content": "go"}])
+        CursorCliProvider(sandbox=fake).complete(
+            "cursor-composer", [{"role": "user", "content": "go"}]
+        )
 
 
 def test_cursor_parses_result_field_on_success(monkeypatch):
     import json as _json
 
     monkeypatch.setenv("CURSOR_API_KEY", "cur-not-real")
+    monkeypatch.setenv("CURSOR_MODEL", "some-model")
     monkeypatch.delenv("MODELS_DRY_RUN", raising=False)
-    captured = {}
-
-    class _Proc:
-        returncode = 0
-        stdout = _json.dumps({"result": "the assistant reply"})
-        stderr = ""
-
-    def _run(argv, **k):
-        captured["argv"] = argv
-        return _Proc()
-
-    monkeypatch.setattr(cursor_mod.subprocess, "run", _run)
-    comp = CursorCliProvider().complete("cursor-composer", [{"role": "user", "content": "go"}])
+    fake = _FakeSandbox(stdout=_json.dumps({"result": "the assistant reply"}))
+    comp = CursorCliProvider(sandbox=fake).complete(
+        "cursor-composer", [{"role": "user", "content": "go"}]
+    )
     assert comp.text == "the assistant reply"
     assert comp.provider == "cursor-cli"
     # The agent-harness CLI shape: -p <prompt> --output-format json. The API key
-    # is NEVER on the argv (forwarded via the child's environment, by name).
-    assert "-p" in captured["argv"] and "--output-format" in captured["argv"]
-    assert "json" in captured["argv"]
-    assert "cur-not-real" not in " ".join(captured["argv"])
+    # is NEVER in the command (it rides the sandbox env allowlist, by name).
+    command = fake.calls[0]
+    assert "-p" in command and "--output-format json" in command
+    assert "--model some-model" in command
+    assert "cur-not-real" not in command
+
+
+def test_cursor_sandbox_forwards_only_allowlist_not_host_secrets(monkeypatch):
+    # SECURITY (invariant 5): the sandbox the provider builds forwards ONLY
+    # CURSOR_API_KEY into the container; every other host secret is withheld.
+    from runtime.sandbox import DockerSandboxRunner
+
+    host_env = {
+        "OPENAI_API_KEY": "sk-HOST",
+        "ANTHROPIC_API_KEY": "sk-ant-HOST",
+        "DATABASE_URL": "postgresql://secret@host/db",
+        "CURSOR_API_KEY": "cur-not-real",
+        "PATH": "/usr/bin",
+    }
+    runner = DockerSandboxRunner(
+        allowed_env=cursor_mod._SANDBOX_ALLOWED_ENV, env=host_env
+    )
+    argv, cli_env = runner.build_invocation(
+        "cursor-agent -p x --output-format json", "aistudio-sbx-test"
+    )
+    joined = " ".join(argv)
+    # The key is forwarded by NAME only (never its value on the argv/ps list).
+    assert "-e" in argv and "CURSOR_API_KEY" in argv
+    assert "cur-not-real" not in joined
+    # Host secrets are absent from both the argv AND the docker-client env.
+    for secret_name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DATABASE_URL"):
+        assert secret_name not in argv
+        assert secret_name not in cli_env
+    for secret_val in ("sk-HOST", "sk-ant-HOST"):
+        assert secret_val not in joined
+    # Only the allowlisted key's value reaches the docker client (for -e resolve).
+    assert cli_env.get("CURSOR_API_KEY") == "cur-not-real"
 
 
 def test_adapter_complete_refuses_without_key(monkeypatch):
