@@ -107,6 +107,27 @@ def test_get_trust_auto_creates_trusted_row(conn, ident):
     assert is_relay_allowed(conn, ident) is True
 
 
+def test_quarantined_identity_may_not_relay(conn, ident):
+    """A ``quarantined`` identity is barred from relaying, symmetric with grab_task.
+
+    ``runtime.tasks.grab_task`` already fences BOTH ``revoked`` and ``quarantined``
+    from claiming work (ADR-0021); relay must be symmetric so a quarantined identity
+    can neither claim work nor speak to the human. (Latent-defense fix: nothing sets
+    ``quarantined`` today, so this closes the asymmetry without changing behavior.)
+    """
+    get_trust(conn, ident)  # auto-create a trusted row
+    assert is_relay_allowed(conn, ident) is True
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE identity_trust SET trust_state = 'quarantined' WHERE identity = %s",
+            (ident,),
+        )
+    conn.commit()
+    # human_relay_allowed is still true, but the quarantined state fences relay.
+    assert get_trust(conn, ident).human_relay_allowed is True
+    assert is_relay_allowed(conn, ident) is False
+
+
 # --- zero-tolerance fabrication penalty -------------------------------------
 
 
