@@ -1,11 +1,22 @@
--- 0004 — events.seq: a monotonic append-order key (ADR-0004, ADR-0012).
+-- 0004 — events.seq: a strictly-increasing INSERT-order key (ADR-0004, ADR-0012).
 --
 -- `ts` defaults to now(), which in Postgres is the *transaction* start time, so
 -- multiple events appended within one transaction share an identical timestamp
 -- and their read-back order under `ORDER BY ts` is non-deterministic. An
--- append-only log must replay in true insertion order, so we add a gapless,
--- strictly-increasing identity column and order reads by it. `ts` is retained
--- for time-window filtering and telemetry; `seq` is the canonical order.
+-- append-only log needs a stable order key, so we add a strictly-increasing
+-- identity column and order reads by it. `ts` is retained for time-window
+-- filtering and telemetry; `seq` is the canonical order.
+--
+-- HONEST GUARANTEE (do not overstate this — see runtime/events.py module docstring):
+--   * `seq` is INSERT-order, NOT commit-order. The value is drawn at INSERT but
+--     only becomes visible to other sessions at COMMIT, so a lower seq can appear
+--     (commit) *after* a higher one. A plain `since_seq > cursor` incremental read
+--     is therefore best-effort — it can permanently skip a seq that commits after
+--     its cursor has advanced. Use a bounded lookback overlap + idempotency for a
+--     commit-safe incremental consumer; a full replay (since_seq=0) is complete.
+--   * `seq` is NOT gapless. Identity values are consumed eagerly and are BURNED on
+--     rollback, so the live log legitimately contains holes. Never assume
+--     contiguity (e.g. `max(seq) == count(*)`).
 --
 -- Forward-only and idempotent: ADD COLUMN IF NOT EXISTS is a no-op if the column
 -- already exists (and the migration runner skips already-applied files anyway).

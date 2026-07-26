@@ -27,7 +27,7 @@ import psycopg
 
 from .db import connect
 from .event_types import EVENT_TASK_STUCK
-from .events import read_events
+from .events import DEFAULT_LOOKBACK, read_events
 from .models import Event, Task
 from .roles.pm import REPLAN_TASK_TYPE
 from .tasks import enqueue_task
@@ -94,10 +94,18 @@ def tick_once(
 #
 # The queue consumer that turns the supervisor's ``task.stuck`` SIGNAL into work
 # WITHOUT any agent-to-agent call (CLAUDE.md invariant 1): it scans NEW
-# ``task.stuck`` events past a monotonic ``seq`` cursor and enqueues ONE ``replan``
-# task per stuck task, which the worker dispatches to :func:`runtime.roles.pm.run_pm_replan`.
+# ``task.stuck`` events past a ``seq`` cursor and enqueues ONE ``replan`` task per
+# stuck task, which the worker dispatches to :func:`runtime.roles.pm.run_pm_replan`.
 # Idempotent: a stuck task that already has a replan task is skipped, so a cursor
 # reset (process restart) never double-enqueues.
+#
+# COMMIT-SAFETY: ``events.seq`` is insert-order, not commit-order (see
+# runtime/events.py), so a ``task.stuck`` that commits *after* the cursor advanced
+# past its seq would be lost to a plain ``since_seq`` read — a stuck task that
+# never gets re-decomposed. We read with a bounded ``lookback`` overlap so such a
+# late-committed signal is re-observed on a subsequent pass, and the existing
+# ``_has_replan_task`` idempotency drops the duplicate. This recovers any stuck
+# signal whose transaction commits within ``lookback`` seqs of the cursor.
 
 
 def _has_replan_task(conn: psycopg.Connection, stuck_task_id: object) -> bool:
@@ -117,6 +125,7 @@ def dispatch_replans(
     conn: psycopg.Connection,
     *,
     since_seq: int = 0,
+    lookback: int = 0,
     limit: int = REPLAN_DISPATCH_LIMIT,
     read: EventReader = read_events,
     has_replan: ReplanExistsCheck = _has_replan_task,
@@ -124,16 +133,29 @@ def dispatch_replans(
 ) -> tuple[int, list[str]]:
     """Enqueue one PM ``replan`` task per NEW ``task.stuck`` event (queue-only).
 
-    Scans ``task.stuck`` events with ``seq > since_seq`` (ascending, bounded by
-    ``limit``) and, for each stuck task that does not already have a replan, enqueues
-    a ``replan`` task in the stuck task's workstream carrying its ``stuck_task_id``.
+    Scans ``task.stuck`` events with a bounded ``lookback`` overlap behind
+    ``since_seq`` (effective lower bound ``since_seq - lookback``, ascending,
+    bounded by ``limit`` — which applies *after* the ``task.stuck`` type filter, so
+    the sparse re-scan is cheap) and, for each stuck task that does not already have
+    a replan, enqueues a ``replan`` task in the stuck task's workstream carrying its
+    ``stuck_task_id``. The overlap makes this **commit-safe**: a ``task.stuck`` that
+    commits out-of-order (after the cursor advanced past its seq) is re-observed and
+    dispatched rather than lost — ``_has_replan_task`` idempotency drops any
+    duplicate re-scan.
+
+    ``lookback`` defaults to ``0`` (the classic exclusive ``seq > since_seq`` read);
+    the long-running :func:`run` loop passes :data:`~runtime.events.DEFAULT_LOOKBACK`
+    to get commit-safety in production.
+
     Returns ``(new_cursor, [replan_task_ids])`` — the new cursor is the high-water
-    ``seq`` of every event *scanned* (advanced past skipped/duplicate ones too), so a
-    caller persists it and never re-scans. Every seam is injectable so the consumer
-    is unit-testable with no database.
+    ``seq`` scanned, never below the incoming ``since_seq`` (the overlap re-scans
+    lower seqs but never drags the cursor backwards). Every seam is injectable so
+    the consumer is unit-testable with no database.
     """
-    events: list[Event] = read(conn, type=EVENT_TASK_STUCK, since_seq=since_seq, limit=limit)
-    cursor = since_seq
+    events: list[Event] = read(
+        conn, type=EVENT_TASK_STUCK, since_seq=since_seq, lookback=lookback, limit=limit
+    )
+    cursor = since_seq  # the overlap re-scans lower seqs but never rewinds the cursor
     replan_ids: list[str] = []
     for ev in events:
         cursor = max(cursor, ev.seq or 0)
@@ -189,7 +211,12 @@ def run(
                 conn = connect()
             tick_once(conn, workstream)
             # Turn any new task.stuck signal into a PM replan task (queue-only).
-            replan_cursor, _ = dispatch_replans(conn, since_seq=replan_cursor)
+            # Commit-safe: a bounded lookback overlap re-observes a task.stuck that
+            # committed out-of-order (below the cursor), and _has_replan_task drops
+            # the duplicate — so a late-committed stall signal is never lost.
+            replan_cursor, _ = dispatch_replans(
+                conn, since_seq=replan_cursor, lookback=DEFAULT_LOOKBACK
+            )
         except Exception:
             log.exception("scheduler tick failed; will retry after interval")
             conn = _safe_close(conn)
