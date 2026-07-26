@@ -229,33 +229,54 @@ def _resolve_task(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
 
 def _parse_expected_fields(
     expected: Optional[str],
-) -> tuple[list[tuple[str, str]], Optional[str]]:
+) -> tuple[list[tuple[str, str]], list[str]]:
     """Parse a ``db_row`` ``expected`` of ``"col=val[,col2=val2...]"`` into pairs.
 
-    Returns ``(fields, error)``. ``error`` is a non-None note when ``expected`` is
-    *malformed* (a segment without ``=``, or a segment with an empty column name);
-    such an ``expected`` cannot be interpreted as a column assertion, so the
-    caller routes it to UNVERIFIABLE rather than treating it as a contradiction.
-    Does NOT raise (ADR-0021 follow-up: mis-formatting is not fabrication)."""
+    Returns ``(fields, malformed_notes)``. Each comma-separated segment is parsed
+    INDEPENDENTLY: a *malformed* segment (no ``=``, or an empty column name) is
+    recorded as a note and skipped, while the well-formed ``col=val`` pairs beside
+    it are still returned for checking. Parsing NEVER discards a valid field just
+    because a sibling segment is malformed — that lets :func:`_resolve_db_row` give
+    a genuine contradiction on a well-formed field precedence over any malformed
+    sibling (ADR-0021 intra-ref precedence), so a lie cannot hide behind a bogus
+    field in the same ref. A ref whose fields are ALL malformed yields an empty
+    ``fields`` + non-empty ``malformed_notes`` → UNVERIFIABLE (honest mis-format,
+    no strike). Does NOT raise (ADR-0021 follow-up: mis-formatting is not
+    fabrication)."""
     out: list[tuple[str, str]] = []
+    malformed: list[str] = []
     if not expected:
-        return out, None
+        return out, malformed
     for part in expected.split(","):
         if "=" not in part:
-            return [], f"db_row expected must be col=val, got {part.strip()!r}"
+            malformed.append(f"db_row expected must be col=val, got {part.strip()!r}")
+            continue
         col, _, val = part.partition("=")
         col = col.strip()
         if not col:
-            return [], f"db_row expected has an empty column name in {part.strip()!r}"
+            malformed.append(f"db_row expected has an empty column name in {part.strip()!r}")
+            continue
         out.append((col, val.strip()))
-    return out, None
+    return out, malformed
 
 
 def _resolve_db_row(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution:
     """``db_row`` — a row at ``table:pk`` exists; if ``expected`` (``col=val,...``)
     is given, every named column must match. Locator: ``table:<pkval>`` or
     ``table:<pkcol>=<pkval>`` (pk column defaults to ``id``). ``table`` is
-    allowlist-validated before interpolation; every value is a bound parameter."""
+    allowlist-validated before interpolation; every value is a bound parameter.
+
+    Intra-ref precedence (ADR-0021 follow-up): ALL ``col=val`` fields are
+    evaluated — the resolver does NOT short-circuit on the first malformed /
+    unknown-column field. **Contradiction wins**: if ANY well-formed field on an
+    existing column differs from the actual value, the ref is ``contradicted``
+    (→ REJECTED fabrication) regardless of any malformed sibling field in the same
+    ref, and this is independent of field order. Only if NO field contradicts AND
+    at least one field is malformed (bad syntax / empty col / unknown column) is
+    the ref ``malformed`` (→ UNVERIFIABLE, no strike). This mirrors, at the
+    per-field level, the cross-ref rule that a contradiction anywhere beats an
+    unverifiable elsewhere — so a lie cannot dodge the strike by bundling a bogus
+    column with it. All fields resolve + match → resolved (verified)."""
     table, _, rest = ref.locator.strip().partition(":")
     table = table.strip()
     if table not in _READABLE_TABLES:
@@ -278,20 +299,23 @@ def _resolve_db_row(conn: psycopg.Connection, ref: EvidenceRef) -> RefResolution
     if row is None:
         return RefResolution(ref.kind.value, ref.locator, resolved=False,
                              note="no such row")
-    fields, parse_error = _parse_expected_fields(ref.expected)
-    if parse_error is not None:  # ill-formed spec → unverifiable, not fabrication
-        return RefResolution(ref.kind.value, ref.locator, resolved=False,
-                             malformed=True, note=parse_error)
+    fields, malformed_notes = _parse_expected_fields(ref.expected)
+    malformed_notes = list(malformed_notes)  # copy; we may append unknown-column notes
     for col, want in fields:
         if col not in row:  # references a column that doesn't exist → uninterpretable
-            return RefResolution(ref.kind.value, ref.locator, resolved=False,
-                                 malformed=True,
-                                 note=f"db_row expected references unknown column {col!r}")
+            malformed_notes.append(
+                f"db_row expected references unknown column {col!r}")
+            continue  # keep scanning: a genuine contradiction elsewhere must still win
         got = row[col]
         if str(got) != want:
+            # Contradiction on a well-formed field WINS over any malformed sibling
+            # (and is field-order independent): return the fabrication signal now.
             return RefResolution(ref.kind.value, ref.locator, resolved=True,
                                  contradicted=True, actual=f"{col}={got}",
                                  note=f"{col} is {got!r}, expected {want!r}")
+    if malformed_notes:  # no contradiction, but some field ill-formed → unverifiable
+        return RefResolution(ref.kind.value, ref.locator, resolved=False,
+                             malformed=True, note="; ".join(malformed_notes))
     return RefResolution(ref.kind.value, ref.locator, resolved=True)
 
 
