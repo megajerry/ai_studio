@@ -66,6 +66,14 @@ log = logging.getLogger("runtime.roles.capacity_steward")
 #: optional dedicated one.
 ROLE = "capacity_steward"
 
+#: The queue task type(s) the worker dispatches to :func:`run_capacity_steward`
+#: (ADR-0031). Unlike the other roles this one had no producer AND no dispatcher
+#: (it was only ever a callable); the PM now enqueues a ``capacity.review`` by
+#: judgment (never a cron) when it wants a dedicated burn-rate review of a
+#: workstream — the worker routes that type here.
+CAPACITY_REVIEW_TYPE = "capacity.review"
+CAPACITY_REVIEW_TASK_TYPES = (CAPACITY_REVIEW_TYPE,)
+
 #: Recommended actions the steward can surface — a closed, leak-free vocabulary
 #: (reviewable output, never enforcement). All map to something a role/PM can DO
 #: BEFORE the engine has to block a call:

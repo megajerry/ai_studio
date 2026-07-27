@@ -46,6 +46,7 @@ import logging
 import os
 import tempfile
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from uuid import UUID, uuid4
 
@@ -71,6 +72,10 @@ from .event_types import (
 )
 from .models import Assignee, Task, TaskStatus, make_event
 from .policy import PolicyConfig, load_policy
+from .roles.capacity_steward import (
+    CAPACITY_REVIEW_TASK_TYPES,
+    run_capacity_steward as run_capacity_default,
+)
 from .roles.checkers import DEFAULT_REGISTRY, CheckerRegistry
 from .roles.curator import (
     CURATOR_TASK_TYPES,
@@ -164,7 +169,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "curator" | "skill_lifecycle" | "triage" | "unknown"
+    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "curator" | "skill_lifecycle" | "capacity" | "spokesman_prep" | "triage" | "unknown"
     kind: str
     #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
@@ -1029,6 +1034,382 @@ def _handle_feature_request(
     )
 
 
+def _handle_spokesman_prep(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+) -> RunResult:
+    """Dispatch a ``spokesman.prep`` task: refresh the Spokesman's anticipatory
+    context cache (ADR-0026). A single loop-free pass — heartbeat, refresh, commit.
+    Import is deferred (the ``spokesman`` package is not a hard worker dependency)."""
+    from spokesman.converse import run_prep_task
+
+    heartbeat(conn, task.id, worker_id)
+    result = run_prep_task(conn, task, sink)
+    complete(conn, task.id, result=result, status=TaskStatus.MERGED)
+    return RunResult(
+        task_id=str(task.id),
+        task_type=task.type,
+        kind="spokesman_prep",
+        outcome="done",
+        detail=f"prep refreshed ({result.get('n_questions', 0)} question(s))",
+    )
+
+
+def _handle_capacity(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    heartbeat: Heartbeater,
+    complete: Completer,
+    worker_id: str,
+    run_capacity: Callable[..., Any],
+) -> RunResult:
+    """Dispatch a ``capacity.review`` task: the dedicated Capacity Steward pass (ADR-0022 C2).
+
+    The steward reads the SAME live budget facts the engine reads for the claimed
+    task's workstream, FLAGS caps heading for trouble, and RECOMMENDS an early action
+    (compact / reallocate / pivot / escalate) via body-free ``capacity.*`` events. It
+    changes nothing — it never enforces and never raises a ceiling. Its entrypoint
+    (:func:`runtime.roles.capacity_steward.run_capacity_steward`) does NOT own task
+    lifecycle, so — like the other read-only proposer roles — this handler wraps it
+    minimally: heartbeat → run → heartbeat → commit MERGED. It enqueues NOTHING (no
+    ``enqueue`` seam is threaded here), so a capacity task cannot spawn another (no loop).
+    """
+    heartbeat(conn, task.id, worker_id)
+    report = run_capacity(conn, sink, workstream=task.workstream, task_id=task.id)
+    heartbeat(conn, task.id, worker_id)
+    complete(conn, task.id, result=report.model_dump(), status=TaskStatus.MERGED)
+    if report.flags:
+        actions = [f"{f.workstream}/{f.period}:{f.zone}->{f.action}" for f in report.flags]
+        detail = (
+            f"flagged {report.flagged_count} cap(s) across {report.workstreams_checked} "
+            f"workstream(s) {actions}; NO enforcement / ceiling change"
+        )
+    else:
+        detail = (
+            f"checked {report.workstreams_checked} workstream(s); no capacity concern "
+            "(nothing flagged)"
+        )
+    return RunResult(
+        task_id=str(task.id), task_type=task.type, kind="capacity",
+        outcome="done", detail=detail,
+    )
+
+
+# ===========================================================================
+# Role-agnostic dispatch registry (ADR-0031)
+# ===========================================================================
+#
+# A single task_type → handler REGISTRY replaces the bespoke if/elif chain that
+# `run_once` used to resolve a handler. The goal (stakeholder direction 2026-07-27)
+# is that the worker's dispatch is ROLE-AGNOSTIC: adding/registering a role is a
+# one-line registry entry, not a new hand-written branch — so a role can never
+# again have a handler but silently fail to dispatch.
+#
+# Resolution order is IDENTICAL to the old chain (a behavior-preserving refactor):
+#   1. exact task_type match in `_EXACT_HANDLERS` (this includes the coding types
+#      `work.code` / `prototype`, so the loop-free coding path still wins over the
+#      generic `work.` prefix — §14);
+#   2. else a `work.`-prefixed type → the unified dev/review work loop;
+#   3. else unknown → the explicit abandoned fallback (never a silent drop).
+# Every registered exact type is disjoint from every other and from the `work.`
+# prefix except the coding types, which the exact map resolves first — so the
+# specific-before-prefix invariant holds.
+#
+# Each entry is a thin ADAPTER: it pulls what its handler needs out of the shared
+# `DispatchContext` (which carries every value + seam `run_once` computed) and calls
+# the SAME `_handle_*` with the SAME arguments the old branch did — so behavior is
+# byte-identical per type. Context construction (workstream config → charter /
+# overlays / effective policy+skills, resolved modes) stays in `run_once`.
+
+
+@dataclass
+class DispatchContext:
+    """Everything a handler adapter might need for one claimed task.
+
+    Bundles the claimed task + all injectable seams + the resolved workstream
+    config (charter / overlays / effective policy + skills) + the resolved
+    orchestration modes, so a registry adapter is a pure function of this context.
+    """
+
+    conn: Any
+    task: Task
+    sink: EventSink
+    worker_id: str
+    registry: ToolRegistry
+    model_registry: Any
+    eff_config: Optional[PolicyConfig]
+    eff_skills: Optional[SkillRegistry]
+    wcfg: Optional[WorkstreamConfig]
+    # Seams (defaults resolved in run_once; identical to the old branch args).
+    heartbeat: Heartbeater
+    complete: Completer
+    transition: Transitioner
+    enqueue: Enqueuer
+    block: Blocker
+    run_pm: Callable[..., Any]
+    run_replan: Callable[..., Any]
+    run_exec: Callable[..., Any]
+    run_verify: Callable[..., Any]
+    run_retro: Callable[..., Any]
+    run_review: Callable[..., Any]
+    run_research: Callable[..., Any]
+    run_sourcing: Callable[..., Any]
+    run_failure_analysis: Callable[..., Any]
+    run_curator: Callable[..., Any]
+    run_skill_lifecycle: Callable[..., Any]
+    run_triage: Callable[..., Any]
+    run_capacity: Callable[..., Any]
+    resolve_intensity: IntensityResolver
+    # Resolved orchestration knobs.
+    retro_mode: str
+    review_mode: str
+    max_attempts: int
+
+    @property
+    def charter(self) -> Optional[str]:
+        return self.wcfg.charter if self.wcfg else None
+
+    def overlay_for(self, role: str) -> Optional[str]:
+        return self.wcfg.overlay_for(role) if self.wcfg else None
+
+    def checker_registry(self) -> CheckerRegistry:
+        return self.wcfg.checker_registry() if self.wcfg else DEFAULT_REGISTRY
+
+
+Handler = Callable[[DispatchContext], RunResult]
+
+
+def _dispatch_pm_tick(ctx: DispatchContext) -> RunResult:
+    return _handle_pm_tick(
+        ctx.conn, ctx.task, ctx.sink,
+        model_registry=ctx.model_registry, enqueue=ctx.enqueue,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_pm=ctx.run_pm, skills=ctx.eff_skills,
+        charter=ctx.charter, overlay=ctx.overlay_for("pm"),
+    )
+
+
+def _dispatch_spokesman_prep(ctx: DispatchContext) -> RunResult:
+    return _handle_spokesman_prep(
+        ctx.conn, ctx.task, ctx.sink,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+    )
+
+
+def _dispatch_replan(ctx: DispatchContext) -> RunResult:
+    # A stuck task's re-decomposition (ADR-0023, R2). The PM breaks the superseded
+    # original into SMALLER subtasks (or escalates at the depth cap). It enqueues
+    # only work.* subtasks (never another replan), so no loop.
+    return _handle_replan(
+        ctx.conn, ctx.task, ctx.sink,
+        model_registry=ctx.model_registry, enqueue=ctx.enqueue,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_replan=ctx.run_replan, skills=ctx.eff_skills,
+        charter=ctx.charter, overlay=ctx.overlay_for("pm"),
+    )
+
+
+def _dispatch_retro(ctx: DispatchContext) -> RunResult:
+    # A retro distills lessons from a finished episode. It may enqueue ONE `curate`
+    # task (the dual-source handoff, ADR-0024 P3) — never another retro/work — so
+    # there is no retro-of-a-retro loop.
+    return _handle_retro(
+        ctx.conn, ctx.task, ctx.sink,
+        model_registry=ctx.model_registry,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, enqueue=ctx.enqueue,
+        worker_id=ctx.worker_id, run_retro=ctx.run_retro,
+    )
+
+
+def _dispatch_research(ctx: DispatchContext) -> RunResult:
+    # The Researcher mines external best-practice into Knowledge lessons via the
+    # policy-gated cached search gateway. It enqueues NOTHING — no research-loop.
+    return _handle_research(
+        ctx.conn, ctx.task, ctx.sink,
+        registry=ctx.registry, config=ctx.eff_config, model_registry=ctx.model_registry,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_research=ctx.run_research,
+    )
+
+
+def _dispatch_sourcing(ctx: DispatchContext) -> RunResult:
+    # The Sourcing agent researches models/pricing and proposes a reviewable
+    # candidate registry update + the ADR-0005 approval envelope. Never mutates the
+    # live registry, enqueues NOTHING — no sourcing-loop.
+    return _handle_sourcing(
+        ctx.conn, ctx.task, ctx.sink,
+        registry=ctx.registry, config=ctx.eff_config, model_registry=ctx.model_registry,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_sourcing=ctx.run_sourcing,
+    )
+
+
+def _dispatch_failure_analysis(ctx: DispatchContext) -> RunResult:
+    # The Failure-pattern analyst recognizes a RECURRING failure, writes a reviewable
+    # durable-fix candidate + registers an experiment.proposed. NEVER applies a fix,
+    # NEVER starts the experiment, enqueues NOTHING — no loop.
+    return _handle_failure_analysis(
+        ctx.conn, ctx.task, ctx.sink,
+        registry=ctx.registry, config=ctx.eff_config,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_failure_analysis=ctx.run_failure_analysis,
+    )
+
+
+def _dispatch_curator(ctx: DispatchContext) -> RunResult:
+    # The Skill Curator (ADR-0024 P2) induces a reviewed:false candidate SKILL.md
+    # from recurring + mature + efficient clusters. NEVER auto-adopts, enqueues
+    # NOTHING — no loop.
+    return _handle_curator(
+        ctx.conn, ctx.task, ctx.sink,
+        registry=ctx.registry, config=ctx.eff_config,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_curator=ctx.run_curator,
+    )
+
+
+def _dispatch_skill_lifecycle(ctx: DispatchContext) -> RunResult:
+    # The Skill-lifecycle role (ADR-0024 P4) proposes a human-gated deprecation/
+    # revision for a LIVE skill that isn't helping. NEVER auto-retires, enqueues
+    # NOTHING — no loop. eff_skills tells it which skills are LIVE.
+    return _handle_skill_lifecycle(
+        ctx.conn, ctx.task, ctx.sink,
+        registry=ctx.registry, config=ctx.eff_config,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_skill_lifecycle=ctx.run_skill_lifecycle, skills=ctx.eff_skills,
+    )
+
+
+def _dispatch_review(ctx: DispatchContext) -> RunResult:
+    # The independent Reviewer/Whistle-blower guard over a finished episode. Never
+    # enqueues another task, so a review triggers neither another review nor a retro.
+    return _handle_review(
+        ctx.conn, ctx.task, ctx.sink,
+        registry=ctx.registry, config=ctx.eff_config, model_registry=ctx.model_registry,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_review=ctx.run_review, skills=ctx.eff_skills,
+    )
+
+
+def _dispatch_capacity(ctx: DispatchContext) -> RunResult:
+    # The dedicated Capacity Steward (ADR-0022 C2): FLAG + RECOMMEND early on budget
+    # burn; changes nothing, enqueues NOTHING — no loop.
+    return _handle_capacity(
+        ctx.conn, ctx.task, ctx.sink,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, worker_id=ctx.worker_id,
+        run_capacity=ctx.run_capacity,
+    )
+
+
+def _dispatch_feature_request(ctx: DispatchContext) -> RunResult:
+    # A cross-workstream request (ADR-0018) routed to the receiving PM's intake
+    # (pm.triage_request). triage_request owns all transitions + request.* events and
+    # enqueues only up_for_grabs work.* items on accept — so intake cannot loop.
+    return _handle_feature_request(
+        ctx.conn, ctx.task, ctx.sink,
+        heartbeat=ctx.heartbeat, worker_id=ctx.worker_id, run_triage=ctx.run_triage,
+    )
+
+
+def _dispatch_code(ctx: DispatchContext) -> RunResult:
+    # "Need Prototype" → the coding worker (opencode) dispatch, run inside the sandbox
+    # via the policy-gated `coding` tool. Registered as an EXACT type so `work.code`
+    # takes this loop-free coding path before the generic `work.` prefix (§14).
+    return _handle_code(
+        ctx.conn, ctx.task, ctx.sink,
+        registry=ctx.registry, config=ctx.eff_config,
+        heartbeat=ctx.heartbeat, complete=ctx.complete, block=ctx.block,
+        worker_id=ctx.worker_id,
+    )
+
+
+def _dispatch_work(ctx: DispatchContext) -> RunResult:
+    # The generic `work.*` dev/review loop (Executor → Verifier → commit/fail).
+    # Reached only via the `work.` prefix (after the exact map, so `work.code` never
+    # lands here). Adaptive orchestration intensity (ADR-0003) scales the base
+    # review/retro modes by the workstream's recent error rate + budget headroom;
+    # off by default → the base (static) modes pass through unchanged.
+    task = ctx.task
+    decision = ctx.resolve_intensity(
+        ctx.conn, task.workstream,
+        base_review=ctx.review_mode, base_retro=ctx.retro_mode,
+    )
+    if decision.adaptive and (
+        decision.review != ctx.review_mode or decision.retro != ctx.retro_mode
+    ):
+        log.info(
+            "adaptive intensity ws=%s error_rate=%.2f budget_frac=%s activity=%d: "
+            "review %s->%s retro %s->%s",
+            task.workstream, decision.error_rate,
+            ("%.2f" % decision.budget_fraction) if decision.budget_fraction is not None else "n/a",
+            decision.activity,
+            ctx.review_mode, decision.review,
+            ctx.retro_mode, decision.retro,
+        )
+    return _handle_work(
+        ctx.conn, task, ctx.sink,
+        registry=ctx.registry, config=ctx.eff_config, model_registry=ctx.model_registry,
+        heartbeat=ctx.heartbeat, transition=ctx.transition, enqueue=ctx.enqueue, block=ctx.block,
+        worker_id=ctx.worker_id, max_attempts=ctx.max_attempts,
+        run_exec=ctx.run_exec, run_verify=ctx.run_verify, skills=ctx.eff_skills,
+        retro_mode=decision.retro, review_mode=decision.review,
+        charter=ctx.charter,
+        exec_overlay=ctx.overlay_for("executor"),
+        verify_overlay=ctx.overlay_for("verifier"),
+        checkers=ctx.checker_registry(),
+    )
+
+
+#: The role-agnostic dispatch table. Exact task_type → adapter. Every role's task
+#: type(s) live here (expanded from the role's own task-type constant), so a role
+#: dispatches iff it is registered — the single source of truth for "what the worker
+#: can run". `work.code`/`prototype` are exact entries so the coding path wins over
+#: the `work.` prefix (§14). ADD A ROLE = add a row here (+ a producer that enqueues
+#: its type), never a new hand-written branch.
+_EXACT_HANDLERS: dict[str, Handler] = {
+    PM_TICK_TYPE: _dispatch_pm_tick,
+    SPOKESMAN_PREP_TYPE: _dispatch_spokesman_prep,
+    REPLAN_TASK_TYPE: _dispatch_replan,
+    RETRO_TASK_TYPE: _dispatch_retro,
+    RESEARCH_TASK_TYPE: _dispatch_research,
+    REVIEW_TASK_TYPE: _dispatch_review,
+    FEATURE_REQUEST_TYPE: _dispatch_feature_request,
+    **{t: _dispatch_sourcing for t in SOURCING_TASK_TYPES},
+    **{t: _dispatch_failure_analysis for t in FAILURE_ANALYST_TASK_TYPES},
+    **{t: _dispatch_curator for t in CURATOR_TASK_TYPES},
+    **{t: _dispatch_skill_lifecycle for t in SKILL_LIFECYCLE_TASK_TYPES},
+    **{t: _dispatch_capacity for t in CAPACITY_REVIEW_TASK_TYPES},
+    **{t: _dispatch_code for t in CODE_TASK_TYPES},
+}
+
+#: The `work.`-prefix fallback (the unified dev/review loop). Resolved only AFTER
+#: the exact map, preserving the specific-before-prefix invariant (§14).
+WORK_TASK_PREFIX = "work."
+
+
+def resolve_handler(task_type: str) -> Optional[Handler]:
+    """Resolve a task_type to its dispatch adapter (ADR-0031), or ``None`` if unknown.
+
+    Match order is identical to the historical if/elif chain: an EXACT registry hit
+    first (which includes the coding types), then the ``work.`` prefix → the work
+    loop, else ``None`` (the caller applies the abandoned fallback). Pure + trivially
+    testable.
+    """
+    handler = _EXACT_HANDLERS.get(task_type)
+    if handler is not None:
+        return handler
+    if task_type.startswith(WORK_TASK_PREFIX):
+        return _dispatch_work
+    return None
+
+
 def run_once(
     conn: Any,
     worker_id: str,
@@ -1061,6 +1442,7 @@ def run_once(
     run_curator: Callable[..., Any] = run_curator_default,
     run_skill_lifecycle: Callable[..., Any] = run_skill_lifecycle_default,
     run_triage: Callable[..., Any] = triage_request,
+    run_capacity: Callable[..., Any] = run_capacity_default,
     resolve_config: Callable[[Optional[str]], Optional[WorkstreamConfig]] = resolve_workstream_config,
     resolve_intensity: IntensityResolver = _resolve_intensity_default,
 ) -> Optional[RunResult]:
@@ -1098,203 +1480,40 @@ def run_once(
     eff_config = wcfg.effective_policy(config) if (wcfg and config is not None) else config
     eff_skills = wcfg.effective_skills(skills) if wcfg else skills
 
-    if task.type == PM_TICK_TYPE:
-        return _handle_pm_tick(
-            conn, task, sink,
-            model_registry=model_registry, enqueue=enqueue,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id, run_pm=run_pm,
-            skills=eff_skills,
-            charter=(wcfg.charter if wcfg else None),
-            overlay=(wcfg.overlay_for("pm") if wcfg else None),
+    # Role-agnostic dispatch (ADR-0031): resolve the handler from the single registry
+    # (exact task_type first — including the coding types — then the `work.` prefix),
+    # then call it with the shared context. An unregistered type resolves to None →
+    # the explicit abandoned fallback (never a silent drop). This replaces the old
+    # hand-written if/elif chain with identical resolution + per-type behavior.
+    handler = resolve_handler(task.type)
+    if handler is None:
+        # Unknown task type — fail it explicitly rather than silently dropping it.
+        complete(
+            conn, task.id,
+            result={"error": f"no handler for task type {task.type!r}"},
+            status=TaskStatus.ABANDONED,
         )
-
-    if task.type == SPOKESMAN_PREP_TYPE:
-        from spokesman.converse import run_prep_task
-
-        heartbeat(conn, task.id, worker_id)
-        result = run_prep_task(conn, task, sink)
-        complete(conn, task.id, result=result, status=TaskStatus.MERGED)
         return RunResult(
-            task_id=str(task.id),
-            task_type=task.type,
-            kind="spokesman_prep",
-            outcome="done",
-            detail=f"prep refreshed ({result.get('n_questions', 0)} question(s))",
+            task_id=str(task.id), task_type=task.type, kind="unknown",
+            outcome="failed", detail="no handler for task type",
         )
 
-    if task.type == REPLAN_TASK_TYPE:
-        # A stuck task's re-decomposition (ADR-0023, R2). The PM breaks the
-        # superseded original into SMALLER subtasks (or escalates at the depth cap).
-        # It enqueues only work.* subtasks (never another replan), so no loop.
-        return _handle_replan(
-            conn, task, sink,
-            model_registry=model_registry, enqueue=enqueue,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
-            run_replan=run_replan, skills=eff_skills,
-            charter=(wcfg.charter if wcfg else None),
-            overlay=(wcfg.overlay_for("pm") if wcfg else None),
-        )
-
-    if task.type == RETRO_TASK_TYPE:
-        # A retro distills lessons from a finished episode. It may enqueue ONE
-        # `curate` task (the dual-source handoff, ADR-0024 P3) nominating a clean
-        # first-pass WORK success to the Curator — never another retro/work — so
-        # pm.tick / retro still never trigger a retro (no retro-of-a-retro loop).
-        return _handle_retro(
-            conn, task, sink,
-            model_registry=model_registry,
-            heartbeat=heartbeat, complete=complete, enqueue=enqueue, worker_id=worker_id,
-            run_retro=run_retro,
-        )
-
-    if task.type == RESEARCH_TASK_TYPE:
-        # The Researcher mines external best-practice into Knowledge lessons via the
-        # policy-gated cached search gateway. It enqueues NOTHING (no enqueue seam
-        # threaded), so a research task cannot spawn another — no research-loop.
-        return _handle_research(
-            conn, task, sink,
-            registry=registry, config=eff_config, model_registry=model_registry,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
-            run_research=run_research,
-        )
-
-    if task.type in SOURCING_TASK_TYPES:
-        # The Sourcing agent researches models/pricing via the policy-gated cached
-        # search gateway and proposes a reviewable candidate registry update + the
-        # ADR-0005 approval envelope (🛑 for a new provider / budget change, auto +
-        # 📣 for an in-band swap). It never mutates the live registry and enqueues
-        # NOTHING (no enqueue seam threaded) — no sourcing-loop.
-        return _handle_sourcing(
-            conn, task, sink,
-            registry=registry, config=eff_config, model_registry=model_registry,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
-            run_sourcing=run_sourcing,
-        )
-
-    if task.type in FAILURE_ANALYST_TASK_TYPES:
-        # The Failure-pattern analyst reads the append-only event log, recognizes a
-        # RECURRING failure, writes a reviewable durable-fix candidate via the
-        # policy-gated filesystem tool + registers an experiment.proposed framing the
-        # bet, and emits failure.pattern_detected / fix.proposed. It NEVER applies a
-        # fix, NEVER starts the experiment, and enqueues NOTHING (no enqueue seam
-        # threaded) — so a failure-analysis task cannot spawn another (no loop).
-        return _handle_failure_analysis(
-            conn, task, sink,
-            registry=registry, config=eff_config,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
-            run_failure_analysis=run_failure_analysis,
-        )
-
-    if task.type in CURATOR_TASK_TYPES:
-        # The Skill Curator (ADR-0024 P2) reads CLOSED trajectories + the event log,
-        # clusters them by step-type signature + task_type family, and for each
-        # recurring + mature + efficient cluster writes a reviewed:false candidate
-        # SKILL.md via the policy-gated filesystem tool + emits body-free
-        # skill.proposed. It NEVER auto-adopts / flips reviewed:true, NEVER touches the
-        # live skills/ root, and enqueues NOTHING (no enqueue seam threaded) — so a
-        # curation task cannot spawn another (no loop).
-        return _handle_curator(
-            conn, task, sink,
-            registry=registry, config=eff_config,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
-            run_curator=run_curator,
-        )
-
-    if task.type in SKILL_LIFECYCLE_TASK_TYPES:
-        # The Skill-lifecycle role (ADR-0024 P4) reads the P1 efficacy report + verdict
-        # and, for a LIVE (reviewed:true) skill that isn't helping (no benefit / a
-        # confident degradation vs baseline, judged at n >= floor with the Wilson CI),
-        # writes a REVIEWABLE deprecation/revision proposal via the policy-gated
-        # filesystem tool + emits body-free skill.deprecation_proposed /
-        # skill.revision_proposed. It NEVER auto-retires / edits / removes a live skill
-        # and enqueues NOTHING (no enqueue seam threaded) — so a lifecycle task cannot
-        # spawn another (no loop). eff_skills tells it which skills are LIVE.
-        return _handle_skill_lifecycle(
-            conn, task, sink,
-            registry=registry, config=eff_config,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
-            run_skill_lifecycle=run_skill_lifecycle, skills=eff_skills,
-        )
-
-    if task.type == REVIEW_TASK_TYPE:
-        # The independent Reviewer/Whistle-blower guard over a finished episode. It
-        # never enqueues another task (no enqueue seam threaded), so a review can
-        # trigger neither another review nor a retro (no loop).
-        return _handle_review(
-            conn, task, sink,
-            registry=registry, config=eff_config, model_registry=model_registry,
-            heartbeat=heartbeat, complete=complete, worker_id=worker_id,
-            run_review=run_review, skills=eff_skills,
-        )
-
-    if task.type == FEATURE_REQUEST_TYPE:
-        # A cross-workstream request filed onto this workstream's board (ADR-0018):
-        # route it to the receiving PM's intake (pm.triage_request), which decides
-        # accept/decline/clarify/escalate through its own success lens and drives the
-        # request task to a legal terminal/next state. Without this branch it fell to
-        # the "unknown task type" arm below and was ABANDONED. triage_request owns all
-        # transitions + request.* events and enqueues only up_for_grabs work.* items on
-        # accept — never another feature_request — so intake cannot loop.
-        return _handle_feature_request(
-            conn, task, sink,
-            heartbeat=heartbeat, worker_id=worker_id, run_triage=run_triage,
-        )
-
-    if task.type in CODE_TASK_TYPES:
-        # "Need Prototype" → the coding worker (opencode) dispatch, run inside the
-        # sandbox via the policy-gated `coding` tool. Checked BEFORE the generic
-        # `work.*` branch so `work.code` takes the loop-free coding path (§14).
-        return _handle_code(
-            conn, task, sink,
-            registry=registry, config=eff_config,
-            heartbeat=heartbeat, complete=complete, block=block,
-            worker_id=worker_id,
-        )
-
-    if task.type.startswith("work."):
-        # Adaptive orchestration intensity (ADR-0003): scale the base review/retro
-        # modes by this workstream's recent error rate + budget headroom. Off by
-        # default → the base (static) modes pass through unchanged (and no
-        # telemetry/budget is read), so behavior is preserved.
-        decision = resolve_intensity(
-            conn, task.workstream,
-            base_review=resolved_review_mode, base_retro=resolved_retro_mode,
-        )
-        if decision.adaptive and (
-            decision.review != resolved_review_mode or decision.retro != resolved_retro_mode
-        ):
-            log.info(
-                "adaptive intensity ws=%s error_rate=%.2f budget_frac=%s activity=%d: "
-                "review %s->%s retro %s->%s",
-                task.workstream, decision.error_rate,
-                ("%.2f" % decision.budget_fraction) if decision.budget_fraction is not None else "n/a",
-                decision.activity,
-                resolved_review_mode, decision.review,
-                resolved_retro_mode, decision.retro,
-            )
-        return _handle_work(
-            conn, task, sink,
-            registry=registry, config=eff_config, model_registry=model_registry,
-            heartbeat=heartbeat, transition=transition, enqueue=enqueue, block=block,
-            worker_id=worker_id, max_attempts=max_attempts,
-            run_exec=run_exec, run_verify=run_verify, skills=eff_skills,
-            retro_mode=decision.retro, review_mode=decision.review,
-            charter=(wcfg.charter if wcfg else None),
-            exec_overlay=(wcfg.overlay_for("executor") if wcfg else None),
-            verify_overlay=(wcfg.overlay_for("verifier") if wcfg else None),
-            checkers=(wcfg.checker_registry() if wcfg else DEFAULT_REGISTRY),
-        )
-
-    # Unknown task type — fail it explicitly rather than silently dropping it.
-    complete(
-        conn, task.id,
-        result={"error": f"no handler for task type {task.type!r}"},
-        status=TaskStatus.ABANDONED,
+    ctx = DispatchContext(
+        conn=conn, task=task, sink=sink, worker_id=worker_id,
+        registry=registry, model_registry=model_registry,
+        eff_config=eff_config, eff_skills=eff_skills, wcfg=wcfg,
+        heartbeat=heartbeat, complete=complete, transition=transition,
+        enqueue=enqueue, block=block,
+        run_pm=run_pm, run_replan=run_replan, run_exec=run_exec, run_verify=run_verify,
+        run_retro=run_retro, run_review=run_review, run_research=run_research,
+        run_sourcing=run_sourcing, run_failure_analysis=run_failure_analysis,
+        run_curator=run_curator, run_skill_lifecycle=run_skill_lifecycle,
+        run_triage=run_triage, run_capacity=run_capacity,
+        resolve_intensity=resolve_intensity,
+        retro_mode=resolved_retro_mode, review_mode=resolved_review_mode,
+        max_attempts=max_attempts,
     )
-    return RunResult(
-        task_id=str(task.id), task_type=task.type, kind="unknown",
-        outcome="failed", detail="no handler for task type",
-    )
+    return handler(ctx)
 
 
 class ResumeResult(BaseModel):

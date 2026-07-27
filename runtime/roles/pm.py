@@ -76,9 +76,13 @@ from ..models import Task, TaskStatus, make_event
 from ..skills import SkillRegistry, emit_skill_applied
 from ..task_state import assert_acyclic
 from ..trajectory import add_step, close_trajectory, start_trajectory
+from .capacity_steward import CAPACITY_REVIEW_TYPE
 from .critic import CRITIC_ESCALATE, CRITIC_REVISE, Critique
+from .failure_analyst import FAILURE_ANALYST_TASK_TYPES
 from .lessons import recall_lesson_texts
 from .prompt import compose_role_prompt
+from .skill_lifecycle import SKILL_LIFECYCLE_TASK_TYPES
+from .sourcing import SOURCING_TASK_TYPES
 
 log = logging.getLogger("runtime.roles.pm")
 
@@ -247,6 +251,92 @@ def _max_replan_depth() -> int:
         return DEFAULT_MAX_REPLAN_DEPTH
 
 
+# --- PM exposes + commissions the specialist roles (ADR-0031) ----------------
+#
+# Several specialist roles (Sourcing, Failure-pattern analyst, Skill-lifecycle,
+# Capacity Steward) have worker handlers but historically NO producer — nothing ever
+# enqueued their task type, so they never ran. The stakeholder direction (2026-07-27)
+# is that all roles are EXPOSED to the PM and the PM can ENQUEUE tasks for them. The
+# worker's dispatch is now role-agnostic (ADR-0031); this is the producer half: the
+# PM knows the roles exist (they are listed in its plan prompt via role_catalog_note)
+# and commissions one by JUDGMENT (never a cron) via enqueue_role_task. Coordination
+# stays queue-only (invariant 1) — the PM drops a task; the worker claims + dispatches.
+
+#: The specialist role task types the PM may commission by judgment (ADR-0031), each
+#: mapped to a one-line "when to use it" note. This is the SINGLE catalog the PM
+#: exposes: it drives both the plan-prompt role menu (:func:`role_catalog_note`) and
+#: the enqueue helper's validation (:func:`enqueue_role_task`). Adding a
+#: PM-commissionable role is a one-line entry here. These are NOT on autonomous crons —
+#: the PM enqueues one only when its judgment says the studio would benefit (the
+#: human/PM stays in the loop; the workstream is not self-sufficient yet).
+PM_ROLE_TASK_TYPES: dict[str, str] = {
+    SOURCING_TASK_TYPES[0]:
+        "Sourcing — research/refresh the model catalog + pricing and propose a "
+        "reviewable registry update (ADR-0005). Commission when models look stale or "
+        "a cheaper/better option may exist.",
+    FAILURE_ANALYST_TASK_TYPES[0]:
+        "Failure-pattern analyst — detect a RECURRING failure in the event log and "
+        "propose a durable fix framed as an experiment (ADR-0023 R3). Commission when "
+        "you see repeated errors/stalls on a workstream.",
+    SKILL_LIFECYCLE_TASK_TYPES[0]:
+        "Skill-lifecycle — judge LIVE skills' efficacy and propose a human-gated "
+        "deprecation/revision for underperformers (ADR-0024 P4). Commission "
+        "periodically once skills have accrued applied usage.",
+    CAPACITY_REVIEW_TYPE:
+        "Capacity Steward — review a workstream's budget burn and flag + recommend "
+        "an early action before the engine has to block (ADR-0022 C2). Commission "
+        "when a workstream is burning hot or nearing its ceiling.",
+}
+
+
+def role_catalog_note() -> str:
+    """The bulleted role-commissioning menu injected into the PM plan prompt (ADR-0031).
+
+    One line per :data:`PM_ROLE_TASK_TYPES` entry (``- `type` — when to use it``).
+    Pure text; it EXPOSES the specialist roles to the PM so the planner knows they
+    exist and can enqueue them by judgment. Kept in sync with the catalog by
+    construction (no drift).
+    """
+    return "\n".join(f"- `{t}` — {note}" for t, note in PM_ROLE_TASK_TYPES.items())
+
+
+def enqueue_role_task(
+    conn: Any,
+    *,
+    workstream: str,
+    task_type: str,
+    enqueue: Callable[..., Task] = None,  # type: ignore[assignment]
+    payload: Optional[dict] = None,
+    priority: int = 0,
+) -> Task:
+    """Commission ONE specialist role by enqueuing a task of its type (ADR-0031).
+
+    The PM's bounded seam for "enqueue a task for any role": it validates ``task_type``
+    against :data:`PM_ROLE_TASK_TYPES` (an unknown/unsupported type raises
+    ``ValueError`` rather than dropping a task the worker would only abandon) and
+    enqueues ONE ``up_for_grabs`` task through the same guarded ``enqueue`` seam the PM
+    uses everywhere. Coordination stays queue-only (CLAUDE.md invariant 1): the PM
+    never calls the role — it drops a task the worker later claims + dispatches via the
+    role-agnostic registry (:func:`runtime.worker.resolve_handler`). Enqueues exactly
+    one task and returns it (no loop). ``enqueue`` is injectable for tests.
+    """
+    if task_type not in PM_ROLE_TASK_TYPES:
+        raise ValueError(
+            f"{task_type!r} is not a PM-commissionable role task type "
+            f"(one of {sorted(PM_ROLE_TASK_TYPES)})"
+        )
+    if enqueue is None:  # deferred default to avoid an import cycle at module load
+        from ..tasks import enqueue_task
+        enqueue = enqueue_task
+    return enqueue(
+        conn,
+        workstream=workstream,
+        type=task_type,
+        payload=payload or {},
+        priority=priority,
+    )
+
+
 def _compose_plan_prompt(
     goal: str,
     skills: Optional[SkillRegistry],
@@ -272,6 +362,10 @@ def _compose_plan_prompt(
         skills=selected,
         lessons=lessons,
         budget_aware=True,
+        # ADR-0031: EXPOSE the specialist roles the PM can commission by judgment
+        # (Sourcing / Failure-analyst / Skill-lifecycle / Capacity Steward), so the
+        # planner knows they exist and when to enqueue one (via enqueue_role_task).
+        role_catalog=role_catalog_note(),
         # The PM owns the build-vs-buy / agile-adoption operating principle
         # (ADR-0027): it weighs building in-house vs adopting a mature component
         # and stays flexible about a better paradigm/tech, changing only on clear
