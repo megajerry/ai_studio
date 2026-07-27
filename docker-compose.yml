@@ -155,6 +155,16 @@ services:
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
       TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
       TWILIO_TO_NUMBER: ${TWILIO_TO_NUMBER:-}
+      # Model-provider keys — the Spokesman is model-first (ADR-0026): it calls
+      # `converse` (routed to the mid tier: claude-sonnet-5 → gemini-3.5-flash →
+      # deepseek). Without these IN THE CONTAINER, AnthropicAdapter.available() is
+      # False and select_provider() silently falls back to the dry-run REGEX stub
+      # — so the chat "agent" can't actually converse even with a key in .env.
+      # (openweight/deepseek needs no key.) MODELS_DRY_RUN forces the stub when set.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MODELS_DRY_RUN: ${MODELS_DRY_RUN:-}
       # Runtime bridge reads the live event log / approvals (compose DNS name).
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
