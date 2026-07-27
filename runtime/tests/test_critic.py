@@ -334,7 +334,10 @@ def test_pm_consensus_event_carries_no_plan_body():
         critic=run_critic, critic_rounds=2,
     )
     ev = [e for e in sink.events if e.type == EVENT_PM_CONSENSUS][0]
-    assert set(ev.payload) == {"goal", "rounds", "outcome", "concern_count"}
+    # The free-text goal is now relocated to the free-form training store (ADR-0032);
+    # the event payload stays body-free (counts only, no goal/reason/work-item text).
+    assert set(ev.payload) == {"rounds", "outcome", "concern_count"}
+    assert "goal" not in json.dumps(ev.payload)
     assert "work_items" not in json.dumps(ev.payload)
     assert "criterion" not in json.dumps(ev.payload)
 

@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 from ..enforce import EventSink, NullEventSink
 from ..event_types import EVENT_VERIFY_FAILED, EVENT_VERIFY_PASSED
+from ..free_form import record_free_form
 from ..model.call import call_model
 from ..model.registry import Registry
 from ..models import Task, make_event
@@ -161,12 +162,18 @@ def verify(
 
     verdict = _check(conn, task, result, marker, sink, registry, config, checkers)
 
+    etype = EVENT_VERIFY_PASSED if verdict.passed else EVENT_VERIFY_FAILED
+    # The verdict reason is MODEL-authored prose — relocate it to the local
+    # training-data store (ADR-0032); the event payload stays body-free (the
+    # pass/fail flag only). Body-free retains the outcome signal quality.py counts.
+    record_free_form(conn, kind="rationale", content=verdict.reason,
+                      event_type=etype, workstream=task.workstream, task_id=task.id)
     sink.emit(
         make_event(
             workstream=task.workstream,
-            type=EVENT_VERIFY_PASSED if verdict.passed else EVENT_VERIFY_FAILED,
+            type=etype,
             task_id=task.id,
-            payload={"passed": verdict.passed, "reason": verdict.reason},
+            payload={"passed": verdict.passed},
         )
     )
     return verdict
