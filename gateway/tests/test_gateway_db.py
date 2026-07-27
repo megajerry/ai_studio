@@ -342,16 +342,34 @@ def test_list_limit_is_clamped(conn, ws) -> None:
     assert resp.json()["count"] == 2
 
 
-def test_a_quarantined_identity_cannot_claim(client, conn, ws) -> None:
-    """ADR-0021's trust fence covers remotes for free (identity == worker_id)."""
-    from runtime.trust import quarantine_identity
+def test_a_revoked_identity_cannot_claim(client, conn, ws) -> None:
+    """ADR-0021's trust fence covers remotes for free (identity == worker_id).
 
+    Revocation is therefore a kill switch for a leaked token that takes effect
+    before the token is even rotated out of ``TASK_GATEWAY_TOKENS``.
+    """
+    from runtime.trust import record_strike
+
+    # A throwaway identity, so the shared dev ledger keeps no permanent scar.
+    revoked_identity = f"offhost-revoked-{uuid4().hex[:8]}"
+    revoked_secret = f"secret-{uuid4().hex}"
+    revoked_client = TestClient(
+        create_app(
+            make_settings(tokens=TokenRegistry([
+                Token(identity=revoked_identity, scopes=_ALL,
+                      digest=token_digest(revoked_secret)),
+            ])),
+            connect=db.connect,
+        )
+    )
     enqueue_task(conn, workstream=ws, type="work.remote")
-    quarantine_identity(conn, OTHER_IDENTITY, reason="test")
-    resp = client.post("/v1/tasks/claim", json={"workstream": ws},
-                       headers=bearer(OTHER_SECRET))
+    record_strike(conn, revoked_identity, detail="test fixture")
+
+    resp = revoked_client.post(
+        "/v1/tasks/claim", json={"workstream": ws}, headers=bearer(revoked_secret)
+    )
     assert resp.status_code == 200 and resp.json()["task"] is None
-    # …while a trusted identity still claims the same task.
+    # …while a trusted identity still claims the very same task.
     ok = client.post("/v1/tasks/claim", json={"workstream": ws},
                      headers=bearer(REMOTE_SECRET))
     assert ok.json()["task"] is not None
