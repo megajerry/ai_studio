@@ -61,6 +61,7 @@ from ..crossworkstream import (
     set_request_status,
 )
 from ..enforce import EventSink, NullEventSink
+from ..free_form import record_free_form
 from ..event_types import (
     EVENT_PM_CONSENSUS,
     EVENT_PM_NEEDS_CLARIFICATION,
@@ -950,16 +951,20 @@ def run_pm_tick(
             options_considered=["decompose", "clarify", "pushback"],
             choice="pushback", confidence=plan.confidence,
         )
+        # Relocate the free-text goal + reason to the local training-data store
+        # (ADR-0032); the event payload stays body-free (confidence only).
+        record_free_form(conn, kind="goal", content=goal, event_type=EVENT_PM_PUSHBACK,
+                          workstream=task.workstream, task_id=task.id, trajectory_id=tid)
+        record_free_form(conn, kind="reason",
+                         content=plan.reason or "requirement judged infeasible",
+                         event_type=EVENT_PM_PUSHBACK, workstream=task.workstream,
+                         task_id=task.id, trajectory_id=tid)
         sink.emit(
             make_event(
                 workstream=task.workstream,
                 type=EVENT_PM_PUSHBACK,
                 task_id=task.id,
-                payload={
-                    "goal": goal,
-                    "confidence": plan.confidence,
-                    "reason": plan.reason or "requirement judged infeasible",
-                },
+                payload={"confidence": plan.confidence},
             )
         )
         approval = request_approval(
@@ -995,16 +1000,22 @@ def run_pm_tick(
             if not plan.work_items
             else f"confidence {plan.confidence:.2f} below threshold {threshold:.2f}"
         )
+        # Relocate the free-text goal + reason (ADR-0032); payload stays body-free
+        # (confidence + threshold counts only).
+        record_free_form(conn, kind="goal", content=goal,
+                          event_type=EVENT_PM_NEEDS_CLARIFICATION,
+                          workstream=task.workstream, task_id=task.id, trajectory_id=tid)
+        record_free_form(conn, kind="reason", content=reason,
+                          event_type=EVENT_PM_NEEDS_CLARIFICATION,
+                          workstream=task.workstream, task_id=task.id, trajectory_id=tid)
         sink.emit(
             make_event(
                 workstream=task.workstream,
                 type=EVENT_PM_NEEDS_CLARIFICATION,
                 task_id=task.id,
                 payload={
-                    "goal": goal,
                     "confidence": plan.confidence,
                     "threshold": threshold,
-                    "reason": reason,
                 },
             )
         )
@@ -1049,13 +1060,15 @@ def run_pm_tick(
             registry=registry, skills=skills, charter=charter, overlay=overlay,
             tid=tid,
         )
+        # Relocate the free-text goal (ADR-0032); payload stays body-free (counts only).
+        record_free_form(conn, kind="goal", content=goal, event_type=EVENT_PM_CONSENSUS,
+                          workstream=task.workstream, task_id=task.id, trajectory_id=tid)
         sink.emit(
             make_event(
                 workstream=task.workstream,
                 type=EVENT_PM_CONSENSUS,
                 task_id=task.id,
                 payload={
-                    "goal": goal,
                     "rounds": rounds_run,
                     "outcome": outcome,
                     "concern_count": concern_count,
@@ -1067,12 +1080,19 @@ def run_pm_tick(
                 "PM↔Critic could not reach consensus after "
                 f"{rounds_run} round(s); escalating a genuine disagreement"
             )
+            # Relocate the free-text goal + reason (ADR-0032); payload body-free.
+            record_free_form(conn, kind="goal", content=goal,
+                              event_type=EVENT_PM_PUSHBACK, workstream=task.workstream,
+                              task_id=task.id, trajectory_id=tid)
+            record_free_form(conn, kind="reason", content=reason,
+                              event_type=EVENT_PM_PUSHBACK, workstream=task.workstream,
+                              task_id=task.id, trajectory_id=tid)
             sink.emit(
                 make_event(
                     workstream=task.workstream,
                     type=EVENT_PM_PUSHBACK,
                     task_id=task.id,
-                    payload={"goal": goal, "confidence": plan.confidence, "reason": reason},
+                    payload={"confidence": plan.confidence},
                 )
             )
             approval = request_approval(
@@ -1159,13 +1179,16 @@ def run_pm_tick(
         refs={"task_ids": work_task_ids, "item_count": n},
     )
 
+    # Relocate the free-text goal (ADR-0032); payload stays body-free (confidence +
+    # ids/counts only — the work_task_ids are ids, not prose).
+    record_free_form(conn, kind="goal", content=goal, event_type=EVENT_PM_PLANNED,
+                      workstream=task.workstream, task_id=task.id, trajectory_id=tid)
     sink.emit(
         make_event(
             workstream=task.workstream,
             type=EVENT_PM_PLANNED,
             task_id=task.id,
             payload={
-                "goal": goal,
                 "confidence": plan.confidence,
                 "work_item_count": len(work_task_ids),
                 "work_task_ids": work_task_ids,

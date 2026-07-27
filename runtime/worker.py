@@ -64,6 +64,7 @@ from .budget import remaining as budget_remaining
 from .crossworkstream import FEATURE_REQUEST_TYPE, STATUS_ESCALATED
 from .db import connect
 from .enforce import DbEventSink, EventSink, InvokeStatus, NullEventSink, invoke
+from .free_form import record_free_form
 from .event_types import (
     EVENT_APPROVAL_RESUMED,
     EVENT_RETRO_TRIGGERED,
@@ -585,12 +586,18 @@ def _handle_work(
         if attempt < max_attempts:
             transition(conn, task.id, TaskStatus.IN_PROGRESS,
                        agent_id=worker_id, agent_type="executor")
+            # verdict.reason is MODEL-authored prose — relocate it to the local
+            # training-data store (ADR-0032); the event stays body-free (attempt
+            # count only).
+            record_free_form(conn, kind="rationale", content=verdict.reason,
+                              event_type=EVENT_WORK_RETRY, workstream=task.workstream,
+                              task_id=task.id)
             sink.emit(
                 make_event(
                     workstream=task.workstream,
                     type=EVENT_WORK_RETRY,
                     task_id=task.id,
-                    payload={"attempt": attempt, "reason": verdict.reason},
+                    payload={"attempt": attempt},
                 )
             )
             continue
