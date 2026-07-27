@@ -25,6 +25,7 @@ def test_render_dashboard_includes_task_and_agent_stats() -> None:
         open_trajectories=1,
         closed_trajectories=2,
         pending_approval_ids=["11111111-1111-1111-1111-111111111111"],
+        noise_hidden=5400,
     )
     html = render_dashboard(snap, dry_run=True)
     assert "AI Studio" in html
@@ -32,6 +33,8 @@ def test_render_dashboard_includes_task_and_agent_stats() -> None:
     assert "executor" in html
     assert "DRY-RUN" in html
     assert "11111111-1111-1111-1111-111111111111" in html
+    assert "5,400 task rows hidden" in html
+    assert "Test/demo noise filtered out" in html
 
 
 def test_dashboard_requires_token(tmp_path) -> None:

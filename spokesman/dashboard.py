@@ -48,6 +48,12 @@ def render_dashboard(
         if snap.pending_approval_ids
         else '<p class="empty">No pending approvals.</p>'
     )
+    noise_note = (
+        f'<p class="note">Test/demo noise filtered out '
+        f'({snap.noise_hidden:,} task rows hidden).</p>'
+        if snap.noise_hidden
+        else ""
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -76,6 +82,7 @@ def render_dashboard(
     }}
     .badge.live {{ background: #163528; color: var(--ok); }}
     .badge.dry {{ background: #3a2a12; color: var(--warn); }}
+    .note {{ color: var(--muted); font-size: .8rem; margin: .5rem 0 0; }}
     .grid {{
       display: grid; gap: .75rem;
       grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
@@ -116,6 +123,7 @@ def render_dashboard(
       · refreshed { _esc(now) } · auto every 30s
     </div>
     <div class="nav"><a href="{chat_href}">Open chat</a></div>
+    {noise_note}
   </header>
 
   <div class="grid">

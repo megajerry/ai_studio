@@ -32,7 +32,7 @@ from uuid import UUID
 
 import psycopg
 
-from runtime.approvals import STATUS_APPROVED, STATUS_DENIED, pending_approvals
+from runtime.approvals import STATUS_APPROVED, STATUS_DENIED
 from runtime.decisions import get_decision
 from runtime.enforce import DbEventSink
 from runtime.event_types import (
@@ -336,13 +336,20 @@ def studio_status(conn: psycopg.Connection) -> StudioStatus:
     One grouped scan of ``tasks`` (counts + summed ``spent_tokens`` per status)
     plus the pending-approval count. Read-only; carries only aggregates — no task
     payloads, arg values, or secrets.
+
+    **Test/demo noise is excluded** (ephemeral pytest workstreams, ``work.demo``,
+    …) so stakeholder ``status`` / chat tools match the dashboard. See
+    :mod:`spokesman.noise`.
     """
+    from .noise import REAL_TASK_SQL
+
     counts: dict[str, int] = {}
     spent = 0
     with conn.cursor() as cur:
         cur.execute(
             "SELECT status, count(*) AS n, "
-            "COALESCE(sum(spent_tokens), 0) AS tokens FROM tasks GROUP BY status"
+            "COALESCE(sum(spent_tokens), 0) AS tokens FROM tasks "
+            f"WHERE {REAL_TASK_SQL} GROUP BY status"
         )
         for row in cur.fetchall():
             counts[row["status"]] = int(row["n"])
@@ -365,9 +372,25 @@ def studio_status(conn: psycopg.Connection) -> StudioStatus:
         blocked=counts.get("blocked", 0),
         done=counts.get("merged", 0),
         failed=counts.get("abandoned", 0),
-        pending_approvals=len(pending_approvals(conn)),
+        pending_approvals=len(_pending_approvals_real(conn)),
         spent_tokens=spent,
     )
+
+
+def _pending_approvals_real(conn: psycopg.Connection):
+    """Pending approvals whose linked task is real (not test/demo noise)."""
+    from .noise import real_task_sql
+
+    # Approvals without a task_id cannot be proven real — omit from stakeholder feed.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT a.id FROM approvals a "
+            "JOIN tasks t ON t.id = a.task_id "
+            f"WHERE a.status = 'pending' AND ({real_task_sql('t')}) "
+            "ORDER BY a.created_at ASC"
+        )
+        return list(cur.fetchall())
+
 
 
 @dataclass(frozen=True)
@@ -375,7 +398,8 @@ class DashboardSnapshot:
     """Stakeholder-facing aggregates for the mobile / browser status page.
 
     Bodies and arg values stay out — ids, counts, statuses, role/agent labels only
-    (CLAUDE.md invariants 5 & 6).
+    (CLAUDE.md invariants 5 & 6). Counts exclude test/demo noise
+    (:mod:`spokesman.noise`); ``noise_hidden`` is how many task rows were omitted.
     """
 
     status: StudioStatus
@@ -387,10 +411,17 @@ class DashboardSnapshot:
     open_trajectories: int
     closed_trajectories: int
     pending_approval_ids: list[str]
+    noise_hidden: int = 0
 
 
 def dashboard_snapshot(conn: psycopg.Connection) -> DashboardSnapshot:
-    """Richer read-only snapshot for the HTML dashboard (extends :func:`studio_status`)."""
+    """Richer read-only snapshot for the HTML dashboard (extends :func:`studio_status`).
+
+    Aggregates only **real** tasks (excludes pytest / demo workstreams and demo
+    types). Recent events are likewise limited to non-noise workstreams.
+    """
+    from .noise import REAL_TASK_SQL
+
     status = studio_status(conn)
     by_status: dict[str, int] = {}
     by_agent_type: dict[str, int] = {}
@@ -399,37 +430,53 @@ def dashboard_snapshot(conn: psycopg.Connection) -> DashboardSnapshot:
     recent_event_types: dict[str, int] = {}
     open_traj = 0
     closed_traj = 0
+    noise_hidden = 0
 
     with conn.cursor() as cur:
-        cur.execute("SELECT status, count(*) AS n FROM tasks GROUP BY status")
+        cur.execute(
+            f"SELECT count(*) AS n FROM tasks WHERE NOT ({REAL_TASK_SQL})"
+        )
+        noise_hidden = int(cur.fetchone()["n"] or 0)
+
+        cur.execute(
+            f"SELECT status, count(*) AS n FROM tasks WHERE {REAL_TASK_SQL} "
+            "GROUP BY status"
+        )
         for row in cur.fetchall():
             by_status[str(row["status"])] = int(row["n"])
 
         cur.execute(
             "SELECT COALESCE(agent_type, '(unclaimed)') AS agent_type, count(*) AS n "
-            "FROM tasks GROUP BY 1 ORDER BY n DESC"
+            f"FROM tasks WHERE {REAL_TASK_SQL} GROUP BY 1 ORDER BY n DESC"
         )
         for row in cur.fetchall():
             by_agent_type[str(row["agent_type"])] = int(row["n"])
 
         cur.execute(
             "SELECT COALESCE(assignee, '(any)') AS assignee, count(*) AS n "
-            "FROM tasks GROUP BY 1 ORDER BY n DESC"
+            f"FROM tasks WHERE {REAL_TASK_SQL} GROUP BY 1 ORDER BY n DESC"
         )
         for row in cur.fetchall():
             by_assignee[str(row["assignee"])] = int(row["n"])
 
         cur.execute(
-            "SELECT workstream, count(*) AS n FROM tasks GROUP BY workstream "
-            "ORDER BY n DESC"
+            f"SELECT workstream, count(*) AS n FROM tasks WHERE {REAL_TASK_SQL} "
+            "GROUP BY workstream ORDER BY n DESC"
         )
         for row in cur.fetchall():
             by_workstream[str(row["workstream"])] = int(row["n"])
 
-        # Last ~200 events by type — cheap pulse of what the studio has been doing.
+        # Last ~200 *real* events by type — skip pytest workstream churn.
         cur.execute(
             "SELECT type, count(*) AS n FROM ("
-            "  SELECT type FROM events ORDER BY seq DESC NULLS LAST LIMIT 200"
+            "  SELECT type FROM events "
+            "  WHERE workstream IS NOT NULL"
+            "    AND lower(workstream) <> 'test'"
+            "    AND workstream !~* '^(test[-_]|test-spk-|skilllc-|curate-|pm-research-|"
+            "traj-|grnd-|lesson-|boot-|glob-|race-|gw-|cap-|fail-|worker-|quality-|"
+            "dec-|spk-|gate-|cleanup-)'"
+            "    AND workstream !~* '(^|[_-])[0-9a-f]{6,}(-other)?$'"
+            "  ORDER BY seq DESC NULLS LAST LIMIT 200"
             ") recent GROUP BY type ORDER BY n DESC"
         )
         for row in cur.fetchall():
@@ -442,7 +489,13 @@ def dashboard_snapshot(conn: psycopg.Connection) -> DashboardSnapshot:
                 "SELECT "
                 "count(*) FILTER (WHERE ended_at IS NULL) AS open, "
                 "count(*) FILTER (WHERE ended_at IS NOT NULL) AS closed "
-                "FROM trajectories"
+                "FROM trajectories "
+                "WHERE workstream IS NOT NULL"
+                "  AND lower(workstream) <> 'test'"
+                "  AND workstream !~* '^(test[-_]|test-spk-|skilllc-|curate-|pm-research-|"
+                "traj-|grnd-|lesson-|boot-|glob-|race-|gw-|cap-|fail-|worker-|quality-|"
+                "dec-|spk-|gate-|cleanup-)'"
+                "  AND workstream !~* '(^|[_-])[0-9a-f]{6,}(-other)?$'"
             )
             row = cur.fetchone()
             open_traj = int(row["open"] or 0)
@@ -451,7 +504,7 @@ def dashboard_snapshot(conn: psycopg.Connection) -> DashboardSnapshot:
     if not conn.autocommit:
         conn.commit()
 
-    pending_ids = [str(a.id) for a in pending_approvals(conn)]
+    pending_ids = [str(r["id"]) for r in _pending_approvals_real(conn)]
     return DashboardSnapshot(
         status=status,
         by_status=by_status,
@@ -462,6 +515,7 @@ def dashboard_snapshot(conn: psycopg.Connection) -> DashboardSnapshot:
         open_trajectories=open_traj,
         closed_trajectories=closed_traj,
         pending_approval_ids=pending_ids,
+        noise_hidden=noise_hidden,
     )
 
 
