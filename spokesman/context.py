@@ -26,6 +26,58 @@ logger = logging.getLogger(__name__)
 CACHE_KEY_STUDIO = "studio_context"
 SPOKESMAN_PREP_TYPE = "spokesman.prep"
 
+#: (task_type, quality) the Spokesman converse loop routes on (ADR-0026). Kept in
+#: sync with :func:`spokesman.converse` so the mode probe reports the SAME model a
+#: real turn would use.
+_CONVERSE_TASK = "converse"
+_CONVERSE_QUALITY = "standard"
+
+
+def spokesman_model_mode() -> dict[str, Any]:
+    """Report the Spokesman's MODEL mode WITHOUT making a model call (ADR-0026).
+
+    The Spokesman is a model-first agent: its converse loop calls a real provider
+    when a key is present and silently degrades to the keyless dry-run stub
+    otherwise (``runtime.model.call.select_provider``). That degradation used to be
+    invisible — the channel banner could say "LIVE" while the *brain* was a stub.
+    This resolves the model the converse turn WOULD use (same ``task_type`` /
+    ``quality`` as :func:`spokesman.converse`) via the registry + router, then asks
+    ``select_provider`` which provider would serve it, and reports:
+
+        {"task": "converse", "provider": <name>, "model": <model_id>, "dry_run": <bool>}
+
+    ``dry_run`` is True when the resolved provider is the dry-run stub — i.e.
+    ``MODELS_DRY_RUN`` is set, no adapter is wired for the model's provider, or the
+    adapter's key is absent. Makes NO network call and returns only NON-SECRET data
+    (provider name + model id — NEVER a key). Robust: any resolution failure returns
+    a safe dry-run fallback rather than raising, so a status probe can't crash.
+    """
+    try:
+        from runtime.model.call import select_provider
+        from runtime.model.providers import DryRunProvider
+        from runtime.model.registry import load_registry
+        from runtime.model.router import route_decision
+
+        decision = route_decision(
+            _CONVERSE_TASK, _CONVERSE_QUALITY, registry=load_registry()
+        )
+        spec = decision.model
+        provider = select_provider(spec)
+        return {
+            "task": _CONVERSE_TASK,
+            "provider": provider.name,
+            "model": spec.id,
+            "dry_run": provider.name == DryRunProvider.name,
+        }
+    except Exception:  # noqa: BLE001 - a status probe must never crash the caller
+        logger.warning("spokesman_model_mode resolution failed; reporting safe dry-run")
+        return {
+            "task": _CONVERSE_TASK,
+            "provider": "unknown",
+            "model": None,
+            "dry_run": True,
+        }
+
 
 @dataclass(frozen=True)
 class StudioContext:
