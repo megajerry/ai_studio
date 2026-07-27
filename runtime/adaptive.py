@@ -124,6 +124,15 @@ class AdaptiveConfig:
     velocity_window_hours: int = 24
     #: Recent WORK episodes in the velocity window >= this → "fast-moving" domain.
     high_activity: int = 8
+    #: FASTEST studio-level external-research cadence (hours between scans) — used
+    #: with ample budget headroom (~daily). This is the interval FLOOR: the baseline
+    #: scan is never faster than this.
+    research_baseline_min_hours: float = 24.0
+    #: SLOWEST studio-level external-research cadence (hours between scans) — used
+    #: under a tight budget (~weekly). This is the interval CEILING and the guaranteed
+    #: NON-ZERO baseline: even when starved the PM still scans at least this often
+    #: (never off), so the studio never stops learning from external developments.
+    research_baseline_max_hours: float = 168.0
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "AdaptiveConfig":
@@ -139,6 +148,12 @@ class AdaptiveConfig:
                 1, _env_int(e, "ADAPTIVE_VELOCITY_WINDOW_HOURS", cls.velocity_window_hours)
             ),
             high_activity=max(1, _env_int(e, "ADAPTIVE_HIGH_ACTIVITY", cls.high_activity)),
+            research_baseline_min_hours=max(
+                1.0, _env_float(e, "ADAPTIVE_RESEARCH_MIN_HOURS", cls.research_baseline_min_hours)
+            ),
+            research_baseline_max_hours=max(
+                1.0, _env_float(e, "ADAPTIVE_RESEARCH_MAX_HOURS", cls.research_baseline_max_hours)
+            ),
         )
 
 
@@ -442,6 +457,41 @@ def research_cadence(
     activity = recent_activity(conn, workstream, config=cfg)
     frac = budget_fraction(budget_remaining)
     return _scale_research(base_cadence, rate, activity, frac, cfg)
+
+
+def pm_research_interval_hours(
+    budget_remaining: Any = None,
+    *,
+    config: Optional[AdaptiveConfig] = None,
+) -> float:
+    """The PM's budget-tuned baseline external-research cadence, in HOURS (ADR-0026).
+
+    This is the studio-level "keep learning the latest industrial developments"
+    knob the PM owns — a *higher-level principle*, NOT a hard-coded schedule. It is
+    a **pure, deterministic** function of budget headroom only (same input → same
+    interval), and is bounded to ``[research_baseline_min_hours,
+    research_baseline_max_hours]``:
+
+    - ample headroom (``budget_remaining`` uncapped/unknown → ``None``, or a full
+      fraction) → the FASTEST cadence (min hours, ~daily);
+    - a starved budget (fraction → 0) → the SLOWEST cadence (max hours, ~weekly).
+
+    Crucially it is **never zero / never "off"**: the result is always a finite
+    interval ``>= 1h`` and ``<= max_hours``, so the studio-level external scan
+    ALWAYS runs at least minimally. (This differs from :func:`research_cadence`,
+    the per-workstream *episode* eagerness, which MAY be ``off``.) It is
+    independent of the ``ADAPTIVE_INTENSITY`` master switch — the baseline cadence
+    is a PM principle, not an opt-in escalation.
+    """
+    cfg = config or AdaptiveConfig.from_env()
+    lo = max(1.0, cfg.research_baseline_min_hours)
+    hi = max(lo, cfg.research_baseline_max_hours)
+    frac = budget_fraction(budget_remaining)
+    if frac is None:  # uncapped / unknown → treat as ample → fastest baseline
+        return lo
+    # frac==1.0 → lo (fastest); frac==0.0 → hi (slowest). Linear, clamped to [lo, hi].
+    interval = hi - (hi - lo) * _clamp01(frac)
+    return min(hi, max(lo, interval))
 
 
 @dataclass(frozen=True)

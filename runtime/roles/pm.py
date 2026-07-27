@@ -36,11 +36,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .. import adaptive
 from ..approvals import request_approval as _request_approval
 from ..crossworkstream import (
     EVENT_REQUEST_ACCEPTED,
@@ -270,6 +272,11 @@ def _compose_plan_prompt(
         skills=selected,
         lessons=lessons,
         budget_aware=True,
+        # The PM owns the build-vs-buy / agile-adoption operating principle
+        # (ADR-0026): it weighs building in-house vs adopting a mature component
+        # and stays flexible about a better paradigm/tech, changing only on clear
+        # evidence (no churn). Injected into every PM plan prompt.
+        strategy_aware=True,
     )
 
 
@@ -328,6 +335,147 @@ class PlanResult(BaseModel):
     work_item_count: int = 0
     work_task_ids: list[str] = Field(default_factory=list)
     approval_id: Optional[str] = None
+    #: Id of the external-research scan this tick commissioned (ADR-0026), if the
+    #: PM's budget-tuned baseline cadence said one was due; ``None`` otherwise.
+    research_task_id: Optional[str] = None
+
+
+# --- PM operating principle: build vs buy/borrow + agile adoption (ADR-0026) --
+#
+# A higher-level principle the PM OWNS — NOT a hard-coded cron. To hedge building
+# in-house against buying/borrowing and stay agile about a better paradigm/tech,
+# the studio must keep learning the latest industrial developments. The PM realizes
+# that by owning a slow, BUDGET-TUNED BASELINE cadence of external-research scans
+# (:func:`runtime.adaptive.pm_research_interval_hours`): faster with budget headroom,
+# slower (but NEVER off) when starved. On each ``pm.tick`` the PM checks the cadence
+# and, when a scan is DUE, commissions EXACTLY ONE bounded ``research`` task (the
+# worker dispatches it to :func:`runtime.roles.researcher.run_research`).
+#
+# Guardrails (no churn / no loop): at most one scan per due-window — a recent scan
+# (pending OR finished) suppresses a new one, so scans never STACK; a ``research``
+# task enqueues nothing (no research-of-research loop, enforced in the Researcher);
+# findings are ``reviewed: false`` proposals only, so adoption stays a deliberate,
+# evidence-gated decision (never auto-adopt, ADR-0008). Keyless/dry-run safe and
+# DB-outage safe: any failure SKIPS the pulse and NEVER crashes the tick (ADR-0017).
+
+#: Payload marker identifying a PM-commissioned studio-level external scan.
+RESEARCH_ORIGIN_EXTERNAL_SCAN = "pm_external_scan"
+
+#: The goal/topic carried by a commissioned external-research scan.
+EXTERNAL_RESEARCH_GOAL = (
+    "Scan the latest industrial developments (tools, frameworks, paradigms, "
+    "best practices) relevant to the studio; propose reviewable candidates to "
+    "adopt or borrow. Weigh build vs. buy/borrow; do not auto-adopt."
+)
+
+
+def _as_aware(dt: datetime) -> datetime:
+    """Treat a naive timestamp as UTC so interval math is tz-safe."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _last_research_at(conn: Any, workstream: str) -> Optional[datetime]:
+    """Most recent ``research`` task creation time for the workstream, or ``None``.
+
+    Counts ANY research task (pending or finished) so a scan already in flight still
+    suppresses a duplicate (the 'don't stack' guardrail).
+    """
+    from .researcher import RESEARCH_TASK_TYPE  # local: avoid an import cycle
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT max(created_at) AS t FROM tasks WHERE workstream = %s AND type = %s",
+            (workstream, RESEARCH_TASK_TYPE),
+        )
+        row = cur.fetchone()
+    if not getattr(conn, "autocommit", True):
+        conn.commit()
+    return row["t"] if row else None
+
+
+def _workstream_started_at(conn: Any, workstream: str) -> Optional[datetime]:
+    """Earliest task creation time for the workstream (its activity start), or ``None``."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT min(created_at) AS t FROM tasks WHERE workstream = %s",
+            (workstream,),
+        )
+        row = cur.fetchone()
+    if not getattr(conn, "autocommit", True):
+        conn.commit()
+    return row["t"] if row else None
+
+
+def _maybe_commission_research(
+    conn: Any,
+    task: Task,
+    *,
+    enqueue: Callable[..., Task],
+    now: Optional[datetime] = None,
+    interval_hours: Optional[float] = None,
+) -> Optional[str]:
+    """Commission ONE external-research scan iff the PM's cadence says it's DUE (ADR-0026).
+
+    Returns the new ``research`` task id when one is enqueued, else ``None``. Pure
+    orchestration side-action of a ``pm.tick`` — it is NOT recorded as a plan
+    reasoning step. NEVER raises: with no ``conn`` (fake-queue unit paths) or on any
+    failure (DB down, budget read error) it logs + returns ``None`` so the pm.tick
+    core (plan → gate → decompose) is never blocked or crashed (ADR-0017).
+
+    Dueness: the interval is the budget-tuned baseline cadence (hours; faster with
+    headroom, slower — never off — when starved). A scan is due when a full interval
+    has elapsed since the last scan; if the workstream has NEVER been scanned it is
+    due once the workstream has been active for a full interval (a warm-up so a
+    brand-new workstream isn't scanned on its very first tick). ``now`` /
+    ``interval_hours`` are injectable for tests.
+    """
+    if conn is None:
+        return None
+    try:
+        from .researcher import RESEARCH_TASK_TYPE  # local: avoid an import cycle
+
+        ref_now = _as_aware(now or datetime.now(timezone.utc))
+        if interval_hours is None:
+            # Budget is advisory here; a read failure → uncapped → fastest baseline.
+            try:
+                from ..budget import remaining as _budget_remaining
+                headroom = _budget_remaining(conn, task.workstream)
+            except Exception:
+                headroom = None
+            interval_hours = adaptive.pm_research_interval_hours(headroom)
+        interval = timedelta(hours=max(1.0, float(interval_hours)))
+
+        last = _last_research_at(conn, task.workstream)
+        if last is not None:
+            if ref_now - _as_aware(last) < interval:
+                return None  # a recent scan exists → not due (don't stack)
+        else:
+            started = _workstream_started_at(conn, task.workstream)
+            if started is None or (ref_now - _as_aware(started) < interval):
+                return None  # never scanned, but not warmed up a full interval yet
+
+        research = enqueue(
+            conn,
+            workstream=task.workstream,
+            type=RESEARCH_TASK_TYPE,
+            payload={
+                "goal": EXTERNAL_RESEARCH_GOAL,
+                "topic": EXTERNAL_RESEARCH_GOAL,
+                "origin": RESEARCH_ORIGIN_EXTERNAL_SCAN,
+                "commissioned_by": "pm",
+            },
+            priority=task.priority,
+        )
+        log.info(
+            "PM commissioned external-research scan %s for %s (baseline cadence %.0fh)",
+            research.id, task.workstream, float(interval_hours),
+        )
+        return str(research.id)
+    except Exception:  # pragma: no cover - defensive: the pulse is never load-bearing
+        log.warning(
+            "PM research commission skipped (degraded); pm.tick continues", exc_info=True
+        )
+        return None
 
 
 def _topo_order(edges: dict[int, list[int]]) -> list[int]:
@@ -621,6 +769,14 @@ def run_pm_tick(
     sink = sink or NullEventSink()
     goal = _resolve_goal(task)
 
+    # PM operating principle (ADR-0026): keep the studio learning the latest
+    # industrial developments so it can hedge build vs buy/borrow and stay agile
+    # about a better paradigm/tech. On this pulse, commission ONE external-research
+    # scan IFF the PM's budget-tuned baseline cadence says one is due. This is a
+    # side-action of the tick (not a plan step) and is degrade-safe: with no conn /
+    # on any failure it is a no-op and the plan → gate → decompose core is untouched.
+    research_task_id = _maybe_commission_research(conn, task, enqueue=enqueue)
+
     # Open ONE reasoning trajectory for this pm.tick (ADR-0020). Observe-only +
     # DB-outage-safe: with no conn / on failure `tid` is None and every _traj_*
     # below is a no-op, so the PM behaves exactly as before (behavior-preserving).
@@ -711,7 +867,7 @@ def run_pm_tick(
         return PlanResult(
             goal=goal, decision="pushback", restated_goal=plan.restated_goal,
             confidence=plan.confidence, feasible=False, reason=plan.reason,
-            approval_id=approval_id,
+            approval_id=approval_id, research_task_id=research_task_id,
         )
 
     # 2. Below threshold (or nothing to decompose) → clarify instead of executing.
@@ -746,6 +902,7 @@ def run_pm_tick(
         return PlanResult(
             goal=goal, decision="needs_clarification", restated_goal=plan.restated_goal,
             confidence=plan.confidence, feasible=True, reason=reason,
+            research_task_id=research_task_id,
         )
 
     # Gate opened: the plan is feasible + confident enough to commit to.
@@ -824,7 +981,7 @@ def run_pm_tick(
             return PlanResult(
                 goal=goal, decision="pushback", restated_goal=plan.restated_goal,
                 confidence=plan.confidence, feasible=True, reason=reason,
-                approval_id=approval_id,
+                approval_id=approval_id, research_task_id=research_task_id,
             )
 
     # 3. Decompose → enqueue ONE work task per work item, each carrying its own
@@ -912,6 +1069,7 @@ def run_pm_tick(
         goal=goal, decision="planned", restated_goal=plan.restated_goal,
         confidence=plan.confidence, feasible=True, reason=plan.reason,
         work_item_count=len(work_task_ids), work_task_ids=work_task_ids,
+        research_task_id=research_task_id,
     )
 
 

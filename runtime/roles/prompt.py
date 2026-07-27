@@ -82,6 +82,36 @@ _BUDGET_BODY = (
 )
 
 
+#: Build-vs-buy & agile-adoption operating principle (ADR-0026). Additive, bounded
+#: guidance layered so a planning/deciding role continuously HEDGES building
+#: in-house against buying/borrowing a mature component, and stays FLEXIBLE about
+#: adopting a better paradigm/tech — changing only on clear evidence (no churn). It
+#: is behavior text only; adoption stays a deliberate, review-gated decision (never
+#: auto-adopt, ADR-0008). Off by default (behavior-preserving); the PM opts in via
+#: ``strategy_aware=True``.
+_STRATEGY_HEADER = "### Build vs. buy & agile adoption (weigh this on every plan / retro / major decision — ADR-0026)"
+_STRATEGY_NOTE = (
+    "The studio continuously learns from the latest industrial developments and "
+    "hedges how it builds. Keep this principle in mind whenever you plan, run a "
+    "retro, or make a major technical decision."
+)
+_STRATEGY_BODY = (
+    "- Build vs. buy/borrow: do NOT reinvent what a mature open-source component, "
+    "service, or standard already does well (CLAUDE.md: assemble mature components). "
+    "Prefer adopting/integrating over building in-house unless building is clearly "
+    "justified (fit, cost, lock-in, a real moat).\n"
+    "- Stay agile about paradigms/tech: treat the current stack as replaceable and "
+    "watch for a materially better paradigm, framework, or tool.\n"
+    "- Change only on clear evidence — NO churn: switch an approach or adopt a new "
+    "paradigm only when the evidence is clear and the win outweighs the migration "
+    "cost. Do not thrash between options or chase novelty; when evidence is weak, "
+    "keep what works.\n"
+    "- Adoption is deliberate and review-gated: surface a build-vs-buy or "
+    "paradigm-change call as a reviewable proposal (ADR-0008) — never silently "
+    "self-adopt an unreviewed change."
+)
+
+
 def _section(prompt: str, header: str, note: str, body: str) -> str:
     """Append one bounded, clearly-delimited section to ``prompt``.
 
@@ -104,6 +134,7 @@ def compose_role_prompt(
     lessons: Optional[Sequence[str]] = None,
     task: Optional[str] = None,
     budget_aware: bool = False,
+    strategy_aware: bool = False,
     allow_unreviewed: bool = False,
 ) -> str:
     """Assemble a role's full prompt from its layers (see the module docstring).
@@ -130,6 +161,8 @@ def compose_role_prompt(
     prompt = _section(prompt, _OVERLAY_HEADER, _OVERLAY_NOTE, role_overlay or "")
     if budget_aware:
         prompt = _section(prompt, _BUDGET_HEADER, _BUDGET_NOTE, _BUDGET_BODY)
+    if strategy_aware:
+        prompt = _section(prompt, _STRATEGY_HEADER, _STRATEGY_NOTE, _STRATEGY_BODY)
     if skills:
         prompt = compose_prompt(prompt, list(skills), allow_unreviewed=allow_unreviewed)
     if lessons:
