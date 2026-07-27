@@ -104,16 +104,17 @@ def test_browser_flow_extract_token_then_post(tmp_path: Path) -> None:
     assert res2.json()["ok"] is True
 
 
-def test_chat_message_unknown_command(tmp_path: Path) -> None:
+def test_chat_message_free_text_converses(tmp_path: Path) -> None:
     client = _client(tmp_path)
     res = client.post(
         f"/chat/message?token={API_TOKEN}",
-        json={"text": "hello there"},
+        json={"text": "hello there, how is the studio?"},
     )
     assert res.status_code == 200
     body = res.json()
-    assert body["ok"] is False
-    assert "Unknown command" in (body.get("note") or "")
+    assert body["ok"] is True
+    assert body["replies"]
+    assert body["result"]["command"] == "converse"
 
 
 def test_chat_message_validation_empty_text(tmp_path: Path) -> None:

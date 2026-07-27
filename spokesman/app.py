@@ -100,6 +100,8 @@ class NotifyRequest(BaseModel):
     originating_identity: str = Field(..., min_length=1)
     claims: list[Claim] = Field(..., min_length=1)
     message_ref: str | None = None
+    #: When set and an approved handoff for this role is active, prefix ``[ROLE]``.
+    via_handoff_role: str | None = None
 
     @field_validator("kind")
     @classmethod
@@ -135,6 +137,12 @@ def run_notifier_pass(
     try:
         cursor = load_cursor(settings.state_dir)
         batch = poll_notifications(conn, cursor)
+        try:
+            from .context import refresh_prep_cache
+
+            refresh_prep_cache(conn)
+        except Exception:  # noqa: BLE001 - anticipatory; never fail the poll
+            logger.warning("prep cache refresh on poll failed")
     finally:
         _close(conn)
 
@@ -163,18 +171,19 @@ def handle_inbound_command(
     client: MessagingClient,
     connect: ConnectFn,
     msg: InboundMessage,
+    *,
+    notifier: object | None = None,
 ) -> Optional[dict]:
-    """Interpret one inbound message and act (status / approve / deny), or None.
+    """Interpret one inbound message and act, or converse (ADR-0026).
 
+    Fast path:
     - ``status``            → live DB summary (falls back to ``state/status.md``).
     - ``approve <id>`` /
       ``deny <id>``         → resolve the real approval via the runtime store.
-    - ``decide <id> <answer>`` → answer an OPEN-ENDED decision (ADR-0025) via the
-      runtime decision store; this also resumes the parked dependent task.
+    - ``decide <id> <answer>`` → answer an OPEN-ENDED decision (ADR-0025).
 
-    A reply is always sent for a recognized command (so the stakeholder gets
-    confirmation); unrecognized text is ignored (returns ``None``). The webhook's
-    signature gate already authenticated the sender, so no extra auth here.
+    Anything else is free-text converse (answer / enqueue PM goal / prep /
+    handoff proposal) — never silently dropped.
     """
     parts = msg.text.strip().split()
     if not parts:
@@ -188,6 +197,12 @@ def handle_inbound_command(
             conn = connect()
             try:
                 summary = studio_status(conn).render()
+                try:
+                    from .context import refresh_prep_cache
+
+                    refresh_prep_cache(conn)
+                except Exception:  # noqa: BLE001
+                    pass
             finally:
                 _close(conn)
         except Exception:  # DB unreachable → fall back to the git status.md
@@ -206,6 +221,33 @@ def handle_inbound_command(
             conn = connect()
             try:
                 approval = resolve(conn, approval_id, verb, resolver)
+                if (
+                    approval is not None
+                    and verb == "approve"
+                    and approval.status == "approved"
+                ):
+                    try:
+                        from .handoff import activate_handoff_for_approval
+
+                        handoff = activate_handoff_for_approval(conn, approval.id)
+                        if handoff is not None:
+                            client.send_text(
+                                f"Approval {approval_id} approved. "
+                                f"Handoff to {handoff.role.upper()} is active "
+                                f"(messages tagged [{handoff.role.upper()}]). "
+                                "Say 'end handoff' when done.",
+                                to=to,
+                            )
+                            return {
+                                "command": verb,
+                                "ok": True,
+                                "status": approval.status,
+                                "handoff_id": str(handoff.id),
+                            }
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "handoff activate failed for %s", approval_id
+                        )
             finally:
                 _close(conn)
         except ValueError:
@@ -255,7 +297,18 @@ def handle_inbound_command(
         client.send_text(f"Decision {decision_id} answered.", to=to)
         return {"command": _DECIDE_VERB, "ok": True, "status": decision.status}
 
-    return None
+    # ADR-0026 — free-text converse (never silently drop).
+    from .converse import handle_conversation
+
+    outcome = handle_conversation(
+        settings, client, connect, msg, notifier=notifier
+    )
+    return {
+        "command": "converse",
+        "intent": outcome.intent.value,
+        "ok": True,
+        **outcome.meta,
+    }
 
 
 def _close(conn: object) -> None:
@@ -364,12 +417,14 @@ def create_app(
             timestamp="",
         )
         record_inbound(settings, [msg], channel="web")
-        result = handle_inbound_command(settings, capture, connect, msg)
+        result = handle_inbound_command(
+            settings, capture, connect, msg, notifier=notifier
+        )
         if result is None:
             return {
                 "ok": False,
                 "replies": [],
-                "note": "Unknown command. Try: status · approve <id> · deny <id>",
+                "note": "No reply produced.",
             }
         return {"ok": True, "replies": capture.replies, "result": result}
 
@@ -448,7 +503,9 @@ def create_app(
             messages = iter_twilio_inbound(form_str)
             record_inbound(settings, messages, channel=CHANNEL_TWILIO_SMS)
             for msg in messages:
-                handle_inbound_command(settings, client, connect, msg)
+                handle_inbound_command(
+                    settings, client, connect, msg, notifier=notifier
+                )
             return PlainTextResponse("", status_code=200)
 
         raw_body = await request.body()
@@ -466,7 +523,9 @@ def create_app(
 
         replies = 0
         for msg in messages:
-            if handle_inbound_command(settings, client, connect, msg) is not None:
+            if handle_inbound_command(
+                settings, client, connect, msg, notifier=notifier
+            ) is not None:
                 replies += 1
 
         return JSONResponse({"received": len(messages), "replies": replies})
@@ -488,10 +547,33 @@ def create_app(
             return {"blocked": True, "relayed": [], "claims": [], "escalated": False,
                     "reason": "runtime unreachable (fail closed)"}
         try:
+            claims = list(req.claims)
+            if req.via_handoff_role:
+                from .handoff import active_handoff, format_handoff_relay
+
+                active = active_handoff(conn)
+                role = req.via_handoff_role.strip().lower()
+                if active is None or active.role != role:
+                    return {
+                        "blocked": True,
+                        "relayed": [],
+                        "claims": [],
+                        "escalated": False,
+                        "reason": "no active handoff for role "
+                        f"{role!r} — propose & get human approval first",
+                    }
+                claims = [
+                    Claim(
+                        statement=format_handoff_relay(role, c.statement),
+                        evidence=list(c.evidence),
+                        is_judgment=c.is_judgment,
+                    )
+                    for c in claims
+                ]
             return relay_claims(
                 conn, notifier, kind=req.kind,
                 originating_identity=req.originating_identity,
-                claims=req.claims, message_ref=req.message_ref,
+                claims=claims, message_ref=req.message_ref,
             )
         finally:
             _close(conn)

@@ -40,6 +40,7 @@ from runtime.event_types import (
     EVENT_DECISION_REQUESTED,
     EVENT_REVIEW_ALARM,
     EVENT_REVIEW_FLAGGED,
+    EVENT_SPOKESMAN_PREP_READY,
     EVENT_TASK_FAILED_EXHAUSTED,
 )
 from runtime.events import read_events
@@ -57,7 +58,9 @@ APPROVE_EVENT_TYPES = frozenset({EVENT_APPROVAL_REQUESTED})
 #: approval it needs a human reply, so it is batched into the same periodic digest.
 DECISION_EVENT_TYPES = frozenset({EVENT_DECISION_REQUESTED})
 #: 📣 inform (non-blocking) — major mistake / recovery, written to the feed.
-INFORM_EVENT_TYPES = frozenset({EVENT_TASK_FAILED_EXHAUSTED, EVENT_REVIEW_FLAGGED})
+INFORM_EVENT_TYPES = frozenset(
+    {EVENT_TASK_FAILED_EXHAUSTED, EVENT_REVIEW_FLAGGED, EVENT_SPOKESMAN_PREP_READY}
+)
 
 #: How much of a free-form reason string to carry into a message (hygiene; the
 #: runtime reasons are leak-free but can be long when signals are concatenated).
@@ -231,6 +234,21 @@ def classify_event(
     if etype in INFORM_EVENT_TYPES:
         if etype == EVENT_REVIEW_FLAGGED and payload.get("severity") == "high":
             return None  # already covered by the 🚨 alarm + 🛑 approval for this episode
+        if etype == EVENT_SPOKESMAN_PREP_READY:
+            text = "Prep ready — studio context refreshed."
+            if conn is not None:
+                try:
+                    from .context import load_prep_cache
+
+                    cached = load_prep_cache(conn)
+                    if cached is not None:
+                        text = f"*Follow-up*\n{cached.render_brief()}"
+                except Exception:  # noqa: BLE001
+                    pass
+            return NotificationItem(
+                kind=NotifyKind.INFORM, text=text, seq=seq,
+                event_type=etype, task_id=task_id,
+            )
         if etype == EVENT_TASK_FAILED_EXHAUSTED:
             retries = payload.get("retries")
             text = (

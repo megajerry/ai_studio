@@ -1,7 +1,8 @@
 """Stakeholder web chat — fallback when SMS/WhatsApp is down (ADR-0006).
 
-Same command vocabulary as the messaging channel (``status``, ``approve <id>``,
-``deny <id>``, ``decide <id> <answer>``), over a token-gated HTML UI.
+Same command vocabulary as the messaging channel, plus free-form questions and
+requirements (ADR-0026). Shortcuts: ``status``, ``approve <id>``, ``deny <id>``,
+``decide <id> <answer>``.
 """
 
 from __future__ import annotations
@@ -107,7 +108,7 @@ def render_chat(*, channel: str, dry_run: bool, token: str) -> str:
   </header>
   <div id="log"></div>
   <form id="f" autocomplete="off">
-    <input id="msg" type="text" placeholder="status · approve &lt;id&gt; · deny &lt;id&gt;" autofocus/>
+    <input id="msg" type="text" placeholder="Ask about the studio · or: status · approve &lt;id&gt;" autofocus/>
     <button type="submit" id="send">Send</button>
   </form>
   <script>
@@ -131,8 +132,8 @@ def render_chat(*, channel: str, dry_run: bool, token: str) -> str:
       try {{ return JSON.stringify(detail); }} catch (_) {{ return String(detail); }}
     }}
 
-    add('bot', 'Web chat is connected. Try: status');
-    add('sys', 'Commands: status · approve <id> · deny <id> · decide <id> <answer>');
+    add('bot', 'Web chat is connected. Ask anything about the studio, or give a requirement.');
+    add('sys', 'Shortcuts: status · approve <id> · deny <id> · decide <id> <answer> · end handoff');
 
     form.addEventListener('submit', async (e) => {{
       e.preventDefault();
