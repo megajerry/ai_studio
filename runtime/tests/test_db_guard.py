@@ -137,8 +137,11 @@ def test_conftest_skips_db_items_when_reachable_but_not_disposable(tmp_path, mon
         conftest, "require_disposable_db", lambda *a, **k: (False, guard_reason)
     )
 
-    db_mod = _fake_module(tmp_path, "test_db_like", "from runtime import db\ncan_connect\n")
-    plain_mod = _fake_module(tmp_path, "test_pure", "assert True\n")
+    # Build the DB-like source from the marker constant so THIS test file never
+    # contains the DB-gate call marker literally and thus never self-flags.
+    db_src = f"from runtime import db\ndb.{conftest._DB_GATE_MARKER}timeout=2.0)\n"
+    db_mod = _fake_module(tmp_path, "some_db_like_mod", db_src)
+    plain_mod = _fake_module(tmp_path, "some_pure_mod", "assert True\n")
 
     db_by_fixture = _FakeItem("t_conn", ["conn"], plain_mod)   # DB via fixture
     db_by_source = _FakeItem("t_src", [], db_mod)              # DB via can_connect ref
@@ -161,7 +164,10 @@ def test_conftest_no_skip_when_disposable(tmp_path, monkeypatch):
     monkeypatch.setattr(conftest.db, "can_connect", lambda *a, **k: True)
     monkeypatch.setattr(conftest, "require_disposable_db", lambda *a, **k: (True, "ok"))
 
-    db_item = _FakeItem("t_conn", ["conn"], _fake_module(tmp_path, "test_x", "can_connect"))
+    db_item = _FakeItem(
+        "t_conn", ["conn"],
+        _fake_module(tmp_path, "some_db_mod", f"db.{conftest._DB_GATE_MARKER})"),
+    )
     conftest.pytest_collection_modifyitems(None, [db_item])
     assert db_item.markers == []  # disposable → run normally
 
@@ -177,7 +183,10 @@ def test_conftest_no_skip_when_unreachable(tmp_path, monkeypatch):
         return (False, "should not be consulted")
 
     monkeypatch.setattr(conftest, "require_disposable_db", _guard)
-    db_item = _FakeItem("t_conn", ["conn"], _fake_module(tmp_path, "test_y", "can_connect"))
+    db_item = _FakeItem(
+        "t_conn", ["conn"],
+        _fake_module(tmp_path, "some_db_mod", f"db.{conftest._DB_GATE_MARKER})"),
+    )
     conftest.pytest_collection_modifyitems(None, [db_item])
     assert db_item.markers == []
     assert called["n"] == 0  # guard not even consulted when DB unreachable

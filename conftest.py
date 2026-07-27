@@ -18,10 +18,13 @@ test is skipped **loudly** with the guard reason. Behavior matrix:
 - DB reachable + NOT disposable + no opt-in
                          → skip every DB-backed item with the loud guard reason
 
-A DB-backed item is identified structurally: its test module references
-``can_connect`` (that is precisely how every DB suite gates) OR it requests a
-connection fixture (``conn`` / ``live_conn`` / ``setup_conn``). The skip is
-visible in pytest output so "all skipped" is never mistaken for "all passed".
+A DB-backed item is identified structurally: its test module CALLS
+``can_connect(`` (that is precisely how every DB suite gates — ``not
+db.can_connect(timeout=2.0)``) OR it requests a connection fixture (``conn`` /
+``live_conn`` / ``setup_conn``). Matching the call form (with the open paren)
+avoids flagging pure unit tests that merely mention the name (e.g. this guard's
+own tests). The skip is visible in pytest output so "all skipped" is never
+mistaken for "all passed".
 """
 
 from __future__ import annotations
@@ -36,8 +39,12 @@ from runtime.db_guard import require_disposable_db
 #: Fixture names that hand a test a live DB connection in this repo.
 _DB_FIXTURES = {"conn", "live_conn", "setup_conn"}
 
-#: Per-file cache: does this test module reference the ``can_connect`` DB gate?
+#: Per-file cache: does this test module CALL the ``can_connect`` DB gate?
 _DB_MODULE_CACHE: dict[str, bool] = {}
+
+#: The gate every DB suite uses (``not db.can_connect(timeout=2.0)``). Matching the
+#: call form (open paren) avoids flagging tests that only mention the name.
+_DB_GATE_MARKER = "can_connect("
 
 
 def _module_is_db_backed(item: pytest.Item) -> bool:
@@ -48,7 +55,7 @@ def _module_is_db_backed(item: pytest.Item) -> bool:
     hit = _DB_MODULE_CACHE.get(path)
     if hit is None:
         try:
-            hit = "can_connect" in Path(path).read_text("utf-8")
+            hit = _DB_GATE_MARKER in Path(path).read_text("utf-8")
         except OSError:
             hit = False
         _DB_MODULE_CACHE[path] = hit
