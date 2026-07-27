@@ -246,7 +246,7 @@ EVENT_COMMS_FABRICATION_DETECTED = "comms.fabrication_detected"
 EVENT_TRUST_STRIKE = "trust.strike"
 EVENT_TRUST_CAPABILITY_REVOKED = "trust.capability_revoked"
 
-# --- Spokesman conversational interface (ADR-0028) ---------------------------
+# --- Spokesman conversational interface (ADR-0026) ---------------------------
 #: Body-free: ids / kinds / roles / task ids only — never message or goal text
 #: (those live in channel logs / task payloads / local tables; invariants 5 & 6).
 EVENT_HUMAN_MESSAGE = "human.message"
