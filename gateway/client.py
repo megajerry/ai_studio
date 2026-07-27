@@ -18,9 +18,9 @@ Use it::
     python3 -m gateway.client heartbeat <task-id>
     python3 -m gateway.client complete <task-id> --status merged
 
-Host-side, ``mint`` generates a credential and prints the ``TASK_GATEWAY_TOKENS``
-entry to paste into the git-ignored ``.env`` — the secret is shown once and only
-its SHA-256 digest is ever stored (ADR-0011).
+Host-side, ``mint`` generates a credential, **writes the digest-only spec into
+the git-ignored ``.env``** (``TASK_GATEWAY_TOKENS``), and prints the secret once
+for the remote. Only the SHA-256 digest is ever stored on the host (ADR-0011).
 """
 
 from __future__ import annotations
@@ -29,16 +29,22 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 #: Where the gateway lives (the tunnel hostname) and the caller's token secret.
 ENV_URL = "TASK_GATEWAY_URL"
 ENV_TOKEN = "TASK_GATEWAY_TOKEN"
+#: Host-side digest registry (never the secret).
+ENV_TOKENS = "TASK_GATEWAY_TOKENS"
+#: Optional override for the secrets file (same as onboarding).
+ENV_SECRETS_PATH = "AI_STUDIO_SECRETS"
 
 DEFAULT_TIMEOUT_S = 15.0
 
@@ -221,21 +227,135 @@ class TaskGatewayClient:
 # --- Host-side credential minting -------------------------------------------
 
 
-def mint(identity: str, scopes: list, workstreams: Optional[list] = None) -> dict:
+def default_env_file() -> Path:
+    """Git-ignored secrets file: ``$AI_STUDIO_SECRETS`` or repo-root ``.env``."""
+    override = (os.environ.get(ENV_SECRETS_PATH) or "").strip()
+    if override:
+        return Path(override).expanduser()
+    # client.py lives at gateway/client.py → repo root is parents[1]
+    return Path(__file__).resolve().parents[1] / ".env"
+
+
+def _split_token_specs(raw: str) -> list[str]:
+    return [e for e in re.split(r"[\s,]+", (raw or "").strip()) if e]
+
+
+def upsert_token_spec(existing: str, new_spec: str) -> str:
+    """Replace any prior spec for the same identity; otherwise append.
+
+    Spec shape: ``identity:scopes:digest[:workstreams]``. Identity is the first
+    ``:``-field. Order of other identities is preserved.
+    """
+    identity = new_spec.split(":", 1)[0]
+    kept: list[str] = []
+    replaced = False
+    for spec in _split_token_specs(existing):
+        if spec.split(":", 1)[0] == identity:
+            kept.append(new_spec)
+            replaced = True
+        else:
+            kept.append(spec)
+    if not replaced:
+        kept.append(new_spec)
+    return " ".join(kept)
+
+
+def write_dotenv_value(path: Path, key: str, value: str) -> None:
+    """Set ``key=value`` in a dotenv file (create the file if missing).
+
+    Replaces an existing assignment for ``key`` (including commented
+    ``# KEY=…`` lines we own for ``TASK_GATEWAY_TOKENS``). Never prints ``value``.
+    File mode is forced to ``0o600``.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = text.splitlines(keepends=True)
+    # Preserve whether the file used a trailing newline.
+    had_trailing_nl = (not text) or text.endswith("\n")
+
+    assignment = f"{key}={value}\n"
+    key_re = re.compile(rf"^[ \t]*#?[ \t]*{re.escape(key)}[ \t]*=")
+    out: list[str] = []
+    found = False
+    for line in lines:
+        if key_re.match(line.rstrip("\n\r")):
+            if not found:
+                out.append(assignment)
+                found = True
+            # drop duplicate KEY= lines
+            continue
+        out.append(line if line.endswith("\n") else line + "\n")
+    if not found:
+        if out and not out[-1].endswith("\n"):
+            out[-1] = out[-1] + "\n"
+        if out and out[-1].strip():
+            out.append("\n")
+        out.append(assignment)
+
+    body = "".join(out)
+    if had_trailing_nl and not body.endswith("\n"):
+        body += "\n"
+    path.write_text(body, encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def read_dotenv_value(path: Path, key: str) -> str:
+    """Return the raw value for ``key`` in a dotenv file, or ``\"\"``."""
+    if not path.exists():
+        return ""
+    key_re = re.compile(rf"^[ \t]*{re.escape(key)}[ \t]*=(.*)$")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = key_re.match(line)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        return raw
+    return ""
+
+
+def mint(
+    identity: str,
+    scopes: list,
+    workstreams: Optional[list] = None,
+    *,
+    env_file: Optional[Path] = None,
+    write_env: bool = True,
+) -> dict:
     """Generate a token secret + the ``TASK_GATEWAY_TOKENS`` entry for it.
 
-    Returns ``{"token", "digest", "spec"}``. Only ``spec`` (which contains the
-    **digest**, never the secret) is ever stored; the secret goes to the remote
-    once and is shown once. Hashing is inlined rather than imported from
-    :mod:`gateway.auth` so this file stays self-contained/copyable — the digest is
-    plain SHA-256 either way.
+    Returns ``{"token", "digest", "spec", "env_file", "env_written"}``. Only
+    ``spec`` (digest, never the secret) is written to ``env_file`` when
+    ``write_env`` is true — replacing any prior entry for the same identity.
+    The secret is returned for the remote once; hashing is inlined rather than
+    imported from :mod:`gateway.auth` so this file stays self-contained/copyable.
     """
     token = secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     spec = f"{identity}:{'|'.join(scopes)}:{digest}"
     if workstreams:
         spec = f"{spec}:{'|'.join(workstreams)}"
-    return {"token": token, "digest": digest, "spec": spec}
+
+    target = Path(env_file) if env_file is not None else default_env_file()
+    env_written = False
+    if write_env:
+        existing = read_dotenv_value(target, ENV_TOKENS)
+        merged = upsert_token_spec(existing, spec)
+        write_dotenv_value(target, ENV_TOKENS, merged)
+        env_written = True
+
+    return {
+        "token": token,
+        "digest": digest,
+        "spec": spec,
+        "env_file": str(target),
+        "env_written": env_written,
+    }
 
 
 # --- CLI --------------------------------------------------------------------
@@ -298,23 +418,52 @@ def main(argv: Optional[list] = None) -> int:
     p_done.add_argument("--spent-tokens", type=int, dest="spent_tokens")
 
     p_mint = sub.add_parser(
-        "mint", help="HOST-SIDE: generate a token + its TASK_GATEWAY_TOKENS entry"
+        "mint",
+        help="HOST-SIDE: mint a token and write its digest into .env automatically",
     )
     p_mint.add_argument("--identity", required=True)
     p_mint.add_argument("--scopes", default="read", help="read,enqueue,claim,complete")
     p_mint.add_argument("--workstreams", default="", help="optional pinning")
+    p_mint.add_argument(
+        "--env-file",
+        default="",
+        help=f"dotenv path (default: ${ENV_SECRETS_PATH} or repo .env)",
+    )
+    p_mint.add_argument(
+        "--write-env",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="upsert TASK_GATEWAY_TOKENS in the env file (default: true)",
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "mint":
-        out = mint(args.identity, _split_list(args.scopes), _split_list(args.workstreams))
-        print(json.dumps(out, indent=2))
-        print(
-            "\n# Host: append the spec (digest only) to TASK_GATEWAY_TOKENS in .env,\n"
-            "# then `docker compose --profile gateway up -d task-gateway`.\n"
-            "# Remote: set TASK_GATEWAY_TOKEN to `token` above. It is shown ONCE.",
-            file=sys.stderr,
+        env_path = Path(args.env_file).expanduser() if args.env_file else default_env_file()
+        out = mint(
+            args.identity,
+            _split_list(args.scopes),
+            _split_list(args.workstreams),
+            env_file=env_path,
+            write_env=bool(args.write_env),
         )
+        # Machine-readable on stdout (token shown once). Never put the secret in .env.
+        print(json.dumps(out, indent=2))
+        if out["env_written"]:
+            print(
+                f"\n# Host: wrote digest to {out['env_file']} ({ENV_TOKENS}).\n"
+                "# Recreate the gateway so it picks up .env:\n"
+                "#   make gateway-up\n"
+                "# Remote: set TASK_GATEWAY_TOKEN to `token` above (shown ONCE).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"\n# Host: append `spec` to {ENV_TOKENS} manually "
+                f"(--no-write-env), then make gateway-up.\n"
+                "# Remote: set TASK_GATEWAY_TOKEN to `token` above.",
+                file=sys.stderr,
+            )
         return 0
 
     try:

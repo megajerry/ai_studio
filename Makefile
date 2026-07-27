@@ -1,7 +1,7 @@
 # AI Studio — convenience targets for the M0 infra spine.
 DC := $(shell if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi)
 
-.PHONY: help onboard up down restart ps logs health clean migrate readiness test coverage evals gateway-up gateway-token
+.PHONY: help onboard up down restart ps logs health clean migrate readiness test coverage evals gateway-up gateway-token gateway-provision
 
 help:
 	@echo "AI Studio — targets:"
@@ -18,7 +18,8 @@ help:
 	@echo "  make coverage  Run the suite under coverage + print the report (needs pytest-cov)"
 	@echo "  make evals     Run the evaluation harness (Verifier P/R, PM structural, telemetry)"
 	@echo "  make gateway-up      Start the remote task gateway (ADR-0028; profile: gateway)"
-	@echo "  make gateway-token IDENTITY=<name> [SCOPES=read,enqueue,claim]  Mint a remote token"
+	@echo "  make gateway-token IDENTITY=<name> [SCOPES=…]  Mint token; writes digest into .env"
+	@echo "  make gateway-provision IDENTITY=<name>         Mint + start/recreate gateway"
 	@echo "  make clean     Stop and REMOVE volumes (destroys local data)"
 
 onboard:
@@ -63,8 +64,16 @@ gateway-up:
 	$(DC) --profile gateway up -d --build task-gateway
 	$(DC) --profile gateway ps task-gateway
 
+# Mint a credential and write its digest into .env automatically (no paste).
+# Prints the one-time secret on stdout — give that to the remote as TASK_GATEWAY_TOKEN.
+# IDENTITY required, e.g. `make gateway-token IDENTITY=offhost-cursor`
+# Optional: SCOPES=read,enqueue,claim,complete
 gateway-token:
-	@python3 -m gateway.client mint --identity $(IDENTITY) --scopes $(or $(SCOPES),read,enqueue,claim)
+	@test -n "$(IDENTITY)" || (echo "IDENTITY= is required (e.g. offhost-cursor)" >&2; exit 2)
+	@python3 -m gateway.client mint --identity $(IDENTITY) --scopes $(or $(SCOPES),read,enqueue,claim,complete)
+
+# Mint (writes .env) + recreate the gateway so the new digest is live.
+gateway-provision: gateway-token gateway-up
 
 # Empirical quality: run the suite under coverage and print the % (needs
 # `pip install -r runtime/requirements-dev.txt`). Config lives in .coveragerc.
