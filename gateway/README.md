@@ -15,7 +15,15 @@ is `pm.tick` `6135b920-0558-4912-9fab-a18aa0c9dd4f`, which the host worker must
 claim so the studio PM decomposes the requirement itself.
 
 So: review this branch as builder WIP, and let the PM's decomposition — not this
-session — decide whether it is the shape the studio wants.
+session — decide whether it is the shape the studio wants. (That `pm.tick` has
+since run in **dry-run**, which merged three generic "produce the artifact for
+part N of 3" placeholders rather than a real plan — so there is still no studio-PM
+decomposition to compare this against.)
+
+The code itself is verified end-to-end on the host as of 2026-07-27: the full
+suite passes with a live Postgres, and the queue verbs round-trip from genuinely
+off-LAN over a tunnel with every security gate observed refusing. Evidence is
+recorded in [`docs/remote-task-access.md`](../docs/remote-task-access.md) §5.
 
 ## What it is
 
