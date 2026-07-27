@@ -28,6 +28,9 @@ def _bool(name: str, default: bool = False) -> bool:
 class Settings:
     """Runtime settings resolved from environment variables."""
 
+    # --- Active messaging channel (whatsapp | twilio_sms) ---
+    channel: str
+
     # --- WhatsApp / Meta Graph API ---
     phone_number_id: str
     access_token: str
@@ -36,6 +39,11 @@ class Settings:
     stakeholder_number: str
     graph_api_base: str
     graph_api_version: str
+
+    # --- Twilio Programmable SMS ---
+    twilio_account_sid: str
+    twilio_auth_token: str
+    twilio_from_number: str
 
     # --- Control-plane auth (gates /notify + /digest/flush) ---
     api_token: str
@@ -47,7 +55,7 @@ class Settings:
 
     @property
     def messages_url(self) -> str:
-        """Graph API endpoint for sending messages."""
+        """Graph API endpoint for sending WhatsApp messages."""
         base = self.graph_api_base.rstrip("/")
         return f"{base}/{self.graph_api_version}/{self.phone_number_id}/messages"
 
@@ -71,24 +79,43 @@ _FIELD_BY_ENV = {
     "WHATSAPP_APP_SECRET": "app_secret",
     "WHATSAPP_VERIFY_TOKEN": "verify_token",
     "STAKEHOLDER_WHATSAPP_NUMBER": "stakeholder_number",
+    "TWILIO_ACCOUNT_SID": "twilio_account_sid",
+    "TWILIO_AUTH_TOKEN": "twilio_auth_token",
+    "TWILIO_FROM_NUMBER": "twilio_from_number",
+    "TWILIO_TO_NUMBER": "stakeholder_number",
 }
 
 
 def load_settings() -> Settings:
     """Build a :class:`Settings` from the current environment."""
+    from .channel import normalize_channel
+
     repo_root = Path(__file__).resolve().parent.parent
     state_dir = Path(
         os.environ.get("AI_STUDIO_STATE_DIR", str(repo_root / "state"))
     ).expanduser()
 
+    channel = normalize_channel(os.environ.get("SPOKESMAN_CHANNEL"))
+    # Prefer explicit Twilio destination when using SMS; else stakeholder WA number.
+    stakeholder = (
+        os.environ.get("TWILIO_TO_NUMBER", "").strip()
+        or os.environ.get("STAKEHOLDER_WHATSAPP_NUMBER", "").strip()
+    )
+    if stakeholder.startswith("+"):
+        stakeholder = stakeholder[1:]
+
     return Settings(
+        channel=channel,
         phone_number_id=os.environ.get("WHATSAPP_PHONE_NUMBER_ID", ""),
         access_token=os.environ.get("WHATSAPP_ACCESS_TOKEN", ""),
         app_secret=os.environ.get("WHATSAPP_APP_SECRET", ""),
         verify_token=os.environ.get("WHATSAPP_VERIFY_TOKEN", ""),
-        stakeholder_number=os.environ.get("STAKEHOLDER_WHATSAPP_NUMBER", ""),
+        stakeholder_number=stakeholder,
         graph_api_base=os.environ.get("GRAPH_API_BASE", "https://graph.facebook.com"),
         graph_api_version=os.environ.get("GRAPH_API_VERSION", "v21.0"),
+        twilio_account_sid=os.environ.get("TWILIO_ACCOUNT_SID", ""),
+        twilio_auth_token=os.environ.get("TWILIO_AUTH_TOKEN", ""),
+        twilio_from_number=os.environ.get("TWILIO_FROM_NUMBER", ""),
         api_token=os.environ.get("SPOKESMAN_API_TOKEN", ""),
         dry_run=_bool("SPOKESMAN_DRY_RUN", default=False),
         port=int(os.environ.get("SPOKESMAN_PORT", "8080")),

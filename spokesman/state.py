@@ -66,7 +66,12 @@ def iter_inbound_messages(payload: dict) -> list[InboundMessage]:
     return messages
 
 
-def record_inbound(settings: Settings, messages: list[InboundMessage]) -> Path | None:
+def record_inbound(
+    settings: Settings,
+    messages: list[InboundMessage],
+    *,
+    channel: str = "whatsapp",
+) -> Path | None:
     """Append inbound messages to the git-ignored inbox JSONL (masked sender)."""
     if not messages:
         return None
@@ -77,7 +82,7 @@ def record_inbound(settings: Settings, messages: list[InboundMessage]) -> Path |
         for msg in messages:
             record = {
                 "received_at": datetime.now(timezone.utc).isoformat(),
-                "channel": "whatsapp",
+                "channel": channel,
                 "message_id": msg.message_id,
                 "from": mask_number(msg.sender),
                 "text": msg.text[:MAX_STORED_TEXT],

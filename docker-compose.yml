@@ -140,6 +140,8 @@ services:
     environment:
       SPOKESMAN_PORT: ${SPOKESMAN_PORT:-8080}
       SPOKESMAN_DRY_RUN: ${SPOKESMAN_DRY_RUN:-0}
+      SPOKESMAN_CHANNEL: ${SPOKESMAN_CHANNEL:-whatsapp}
+      SPOKESMAN_API_TOKEN: ${SPOKESMAN_API_TOKEN:-}
       GRAPH_API_BASE: ${GRAPH_API_BASE:-https://graph.facebook.com}
       GRAPH_API_VERSION: ${GRAPH_API_VERSION:-v21.0}
       AI_STUDIO_STATE_DIR: /app/state
@@ -149,12 +151,25 @@ services:
       WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
       WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
       STAKEHOLDER_WHATSAPP_NUMBER: ${STAKEHOLDER_WHATSAPP_NUMBER:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      TWILIO_TO_NUMBER: ${TWILIO_TO_NUMBER:-}
+      # Runtime bridge reads the live event log / approvals (compose DNS name).
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-aistudio}
+      POSTGRES_DB: ${POSTGRES_DB:-aistudio}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/onboarding.sh to set POSTGRES_PASSWORD}
     ports:
       - "${SPOKESMAN_PORT:-8080}:${SPOKESMAN_PORT:-8080}"
     volumes:
       # Inbound messages / status summaries integrate with the git state tree
       # (ADR-0007). The runtime inbound log is git-ignored.
       - ./state:/app/state
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,os; urllib.request.urlopen('http://localhost:'+os.environ.get('SPOKESMAN_PORT','8080')+'/health')\""]
       interval: 15s
