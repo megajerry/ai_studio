@@ -38,9 +38,17 @@ def discover() -> list[Path]:
 def _applied(conn: psycopg.Connection) -> set[str]:
     with conn.cursor() as cur:
         cur.execute(_SCHEMA_MIGRATIONS_DDL)
-        conn.commit()
         cur.execute("SELECT filename FROM schema_migrations")
-        return {r["filename"] for r in cur.fetchall()}
+        rows = {r["filename"] for r in cur.fetchall()}
+    # Close our own transaction so we never hand a non-autocommit caller back a
+    # connection left in an open read-tx. The trailing SELECT opens an implicit
+    # transaction; if left dangling it snapshots the DB and keeps the caller's
+    # OWN later writes from committing/being visible on fresh connections — a
+    # footgun for any code that does `migrate(conn)` then writes on `conn`.
+    # Committing here is safe (the DDL is idempotent) and a no-op under autocommit.
+    if not conn.autocommit:
+        conn.commit()
+    return rows
 
 
 def migrate(conn: psycopg.Connection) -> list[str]:

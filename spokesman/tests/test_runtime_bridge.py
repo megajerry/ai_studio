@@ -129,10 +129,32 @@ pytestmark_live = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def conn():
+    # Autocommit so every setup write on this connection is immediately committed
+    # and therefore visible to the FRESH connections the bridge opens (via
+    # ``db.connect``) — otherwise a test's setup rows live in an uncommitted tx and
+    # cross-connection reads miss them. See ``test_migrate_leaves_conn_idle`` for
+    # the matching ``migrate()`` footgun this pairs with.
     c = db.connect()
+    c.autocommit = True
     migrate(c)
     try:
         yield c
+    finally:
+        c.close()
+
+
+@pytestmark_live
+def test_migrate_leaves_conn_idle() -> None:
+    """``migrate()`` must not leave a non-autocommit caller's connection in an open
+    transaction: a dangling read-tx snapshots the DB and hides the caller's own
+    later writes from fresh connections (the runtime-bridge test-isolation bug)."""
+    from psycopg.pq import TransactionStatus
+
+    c = db.connect()
+    assert c.autocommit is False
+    try:
+        migrate(c)
+        assert c.info.transaction_status == TransactionStatus.IDLE
     finally:
         c.close()
 
