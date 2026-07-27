@@ -167,6 +167,33 @@ def test_pinned_token_may_act_on_its_own_workstream() -> None:
     assert resp.status_code == 503  # past the gate, DB is the only failure
 
 
+def test_a_singly_pinned_token_need_not_restate_its_workstream() -> None:
+    # Omitting the workstream resolves to the pin (as it does for read/claim),
+    # so the request reaches the DB rather than being rejected as incomplete.
+    resp = _client().post(
+        "/v1/tasks", json={"type": "work.demo"}, headers=bearer(PINNED_SECRET)
+    )
+    assert resp.status_code == 503
+
+
+def test_an_unpinned_token_must_name_the_workstream() -> None:
+    # Nothing to infer from: refuse rather than guess a destination workstream.
+    resp = _client().post(
+        "/v1/tasks", json={"type": "work.demo"}, headers=bearer(FULL_SECRET)
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "workstream_required"
+
+
+def test_a_blank_workstream_is_not_a_workstream() -> None:
+    resp = _client().post(
+        "/v1/tasks",
+        json={"workstream": "   ", "type": "work.demo"},
+        headers=bearer(FULL_SECRET),
+    )
+    assert resp.status_code == 422
+
+
 # --- Gate 5: rate limiting -------------------------------------------------
 
 

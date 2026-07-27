@@ -94,10 +94,24 @@ def _close(conn: Any) -> None:
 # --- Request models ---------------------------------------------------------
 
 
-class EnqueueRequest(BaseModel):
-    """Create one task. ``workstream``/``type`` are identifier-shaped, not free text."""
+def _as_identifier(v: str) -> str:
+    v = v.strip().lower()
+    if not is_identifier(v):
+        raise ValueError(
+            "must match [a-z0-9][a-z0-9._-]{0,63} (identifier-shaped, not free text)"
+        )
+    return v
 
-    workstream: str
+
+class EnqueueRequest(BaseModel):
+    """Create one task. ``workstream``/``type`` are identifier-shaped, not free text.
+
+    ``workstream`` may be omitted when the token is pinned to exactly one — the
+    same resolution the read and claim verbs use, so a pinned remote never has to
+    restate what its credential already fixes.
+    """
+
+    workstream: Optional[str] = None
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: int = 0
@@ -105,15 +119,17 @@ class EnqueueRequest(BaseModel):
     budget_tokens: Optional[int] = None
     depends_on: list[UUID] = Field(default_factory=list, max_length=MAX_DEPENDS_ON)
 
-    @field_validator("workstream", "type")
+    @field_validator("type")
     @classmethod
     def _identifier(cls, v: str) -> str:
-        v = v.strip().lower()
-        if not is_identifier(v):
-            raise ValueError(
-                "must match [a-z0-9][a-z0-9._-]{0,63} (identifier-shaped, not free text)"
-            )
-        return v
+        return _as_identifier(v)
+
+    @field_validator("workstream")
+    @classmethod
+    def _identifier_or_none(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not str(v).strip():
+            return None
+        return _as_identifier(v)
 
     @field_validator("assignee")
     @classmethod
@@ -471,6 +487,10 @@ def create_app(
             authorization=authorization, scope=SCOPE_ENQUEUE, verb="enqueue",
             workstream=req.workstream,
         )
+        if allowed.workstream is None:
+            # Unpinned token (or pinned to several): nothing to infer from, and
+            # guessing a workstream is exactly the widening pinning prevents.
+            raise HTTPException(status_code=422, detail="workstream_required")
         payload_bytes = len(json.dumps(req.payload).encode("utf-8"))
         if payload_bytes > settings.max_payload_bytes:
             raise HTTPException(
@@ -487,7 +507,7 @@ def create_app(
         try:
             task = enqueue_task(
                 conn,
-                workstream=req.workstream,
+                workstream=allowed.workstream,
                 type=req.type,
                 payload={**req.payload, "enqueued_by": allowed.identity},
                 priority=priority,

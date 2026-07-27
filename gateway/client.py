@@ -160,7 +160,7 @@ class TaskGatewayClient:
     def enqueue(
         self,
         *,
-        workstream: str,
+        workstream: Optional[str] = None,
         type: str,
         payload: Optional[dict] = None,
         priority: int = 0,
@@ -272,7 +272,10 @@ def main(argv: Optional[list] = None) -> int:
     p_get.add_argument("task_id")
 
     p_enq = sub.add_parser("enqueue", help="create a task")
-    p_enq.add_argument("--workstream", required=True)
+    p_enq.add_argument(
+        "--workstream",
+        help="omit when the token is pinned to exactly one workstream",
+    )
     p_enq.add_argument("--type", required=True)
     p_enq.add_argument("--payload", default="{}", help="JSON object")
     p_enq.add_argument("--priority", type=int, default=0)

@@ -287,6 +287,7 @@ _DEP_IMPORT_NAME = {
     "httpx": "httpx",
     "fastapi": "fastapi",
     "uvicorn[standard]": "uvicorn",
+    "python-multipart": "python_multipart",
 }
 
 

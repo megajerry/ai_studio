@@ -97,7 +97,10 @@ remote SQL breaks.
    scope → 403. A read-only remote cannot mutate the queue.
 4. **Workstream restriction.** A token may be pinned to specific workstreams;
    listing/enqueueing/claiming outside them → 403. Preserves vertical isolation
-   (ADR-0018) across the remote boundary.
+   (ADR-0018) across the remote boundary. A pin of exactly one workstream is also
+   the *implied* target when a request omits one — inference only ever narrows to
+   what the credential already fixes; an unpinned (or multi-pinned) token with no
+   named workstream is refused (422) rather than guessed at.
 5. **Identity binding + attribution.** The token's identity *is* the
    `worker_id`/`claimed_by`/`agent_id`, so every remote action is attributable in
    `task_transitions` and the event log; the ADR-0021 trust ledger already fences
