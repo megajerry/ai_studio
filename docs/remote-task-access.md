@@ -14,30 +14,33 @@ on someone else's network — works the studio task queue. Decision record:
 ## 1. Host: mint a credential
 
 ```bash
-python3 -m gateway.client mint --identity offhost-cursor --scopes read,enqueue,claim
-# or: make gateway-token IDENTITY=offhost-cursor SCOPES=read,enqueue,claim
+# Writes the digest into git-ignored .env automatically (no paste step).
+# Prints the one-time secret on stdout — give THAT to the remote.
+make gateway-provision IDENTITY=offhost-cursor SCOPES=read,enqueue,claim,complete
+# or step-by-step:
+#   python3 -m gateway.client mint --identity offhost-cursor --scopes read,enqueue,claim,complete
+#   make gateway-up
 ```
 
-It prints three things:
+`mint` upserts `TASK_GATEWAY_TOKENS` in `.env` (or `$AI_STUDIO_SECRETS`): same
+identity is replaced on re-mint; other identities are kept. Only the SHA-256
+**digest** is stored — never the secret. Use `--no-write-env` only if you
+deliberately want a dry printout.
+
+It prints JSON including:
 
 | Field | Goes to | Notes |
 | --- | --- | --- |
-| `token` | the **remote**, once | The secret. Never commit it, never log it. |
-| `digest` | nothing | Informational — the SHA-256 of the token. |
-| `spec` | the host's `.env` | `identity:scopes:digest[:workstreams]` — **digest only**. |
+| `token` | the **remote**, once | The secret. Never commit it, never put it in host `.env`. |
+| `digest` / `spec` | already written to `.env` | Informational echo of what was stored. |
+| `env_file` | — | Path that was updated. |
 
-Append the spec to `TASK_GATEWAY_TOKENS` in the git-ignored `.env` (entries are
-whitespace- or comma-separated):
-
-```bash
-TASK_GATEWAY_TOKENS="offhost-cursor:read|enqueue|claim:3f8c…64hex"
-```
-
-Grant the **least** scopes that job needs, and pin a token to a vertical when it
-only has business there (keeps ADR-0018 isolation across the remote boundary):
+Pin a token to a vertical when it only has business there (keeps ADR-0018
+isolation across the remote boundary):
 
 ```bash
-TASK_GATEWAY_TOKENS="video-agent:read|claim|complete:…:video"
+python3 -m gateway.client mint --identity video-agent \
+  --scopes read,claim,complete --workstreams video
 ```
 
 Because only the digest is stored, a leaked `.env` yields **no usable
