@@ -57,7 +57,7 @@ readiness:
 # opt-in is scoped to these make targets ONLY — it is never exported globally, so
 # a prod host that runs the studio (not `make test`) never marks its DB disposable.
 test:
-	AI_STUDIO_TEST_DB=1 python -m pytest runtime/tests/ spokesman/tests/ gateway/tests/ evals/ -q
+	AI_STUDIO_TEST_DB=1 AI_STUDIO_TRAFFIC=test python -m pytest runtime/tests/ spokesman/tests/ gateway/tests/ evals/ -q
 
 # Remote (non-LAN) task access — ADR-0028 / docs/remote-task-access.md.
 gateway-up:
@@ -78,14 +78,14 @@ gateway-provision: gateway-token gateway-up
 # Empirical quality: run the suite under coverage and print the % (needs
 # `pip install -r runtime/requirements-dev.txt`). Config lives in .coveragerc.
 coverage:
-	AI_STUDIO_TEST_DB=1 python -m pytest runtime/tests/ spokesman/tests/ gateway/tests/ evals/ \
+	AI_STUDIO_TEST_DB=1 AI_STUDIO_TRAFFIC=test python -m pytest runtime/tests/ spokesman/tests/ gateway/tests/ evals/ \
 		--cov --cov-config=.coveragerc --cov-report=term-missing --cov-report=html -q
 	@echo "HTML coverage written to htmlcov/index.html"
 
 # Run the evaluation harness itself (seeded-defect Verifier P/R + PM structural +
 # telemetry quality rollup). Writes a JSON + markdown report to state/.
 evals:
-	AI_STUDIO_TEST_DB=1 python -m evals --json state/eval-report.json --markdown state/eval-report.md
+	AI_STUDIO_TEST_DB=1 AI_STUDIO_TRAFFIC=test python -m evals --json state/eval-report.json --markdown state/eval-report.md
 
 clean:
 	$(DC) down -v

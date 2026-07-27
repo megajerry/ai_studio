@@ -1,14 +1,14 @@
 """Classify test/demo queue noise so stakeholder views stay real-only.
 
-Live pytest suites enqueue into ephemeral workstreams (``skilllc-<hex>``,
-``test-spk-…``, ``gw-<hex>-other``, …) and demo types (``work.demo``). Those rows
-must not dominate the dashboard or the ``status`` feed. The queue itself is
-untouched — this is a **read filter** only.
+Primary signal: ``payload.traffic = 'test'`` (:mod:`runtime.traffic`). Secondary:
+ephemeral pytest workstreams / demo types. Never match on goal text. Read filter
+only — the queue is untouched.
 """
 
 from __future__ import annotations
 
 import re
+from typing import Any, Mapping, Optional
 
 #: Workstreams that are known fixture/demo sandboxes (exact match).
 _NOISE_WORKSTREAMS_EXACT = frozenset({"test"})
@@ -75,15 +75,33 @@ def is_noise_task_type(task_type: str | None) -> bool:
     return (task_type or "").strip() in _NOISE_TASK_TYPES
 
 
+def is_noise_task(
+    *,
+    workstream: str | None = None,
+    task_type: str | None = None,
+    payload: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """True when a task must be hidden from stakeholder views / prod cleanups."""
+    if payload is not None and str(payload.get("traffic") or "").lower() == "test":
+        return True
+    if is_noise_workstream(workstream):
+        return True
+    if is_noise_task_type(task_type):
+        return True
+    return False
+
+
 def real_task_sql(alias: str = "") -> str:
     """SQL boolean: row is stakeholder-visible.
 
     ``alias`` is an optional table alias prefix (``\"t\"`` → ``t.workstream``).
-    Keep in sync with :func:`is_noise_workstream` / :func:`is_noise_task_type`.
+    Prefer ``payload.traffic``; fall back to workstream/type heuristics for
+    legacy rows enqueued before traffic tagging.
     """
     p = f"{alias}." if alias else ""
     return f"""(
-  {p}workstream IS NOT NULL
+  coalesce({p}payload->>'traffic', 'prod') <> 'test'
+  AND {p}workstream IS NOT NULL
   AND {p}workstream <> ''
   AND lower({p}workstream) <> 'test'
   AND {p}workstream !~* '^(test[-_]|test-spk-|skilllc-|curate-|pm-research-|traj-|grnd-|lesson-|boot-|glob-|race-|gw-|cap-|fail-|worker-|quality-|dec-|spk-|gate-|cleanup-)'

@@ -7,9 +7,12 @@ on someone else's network — works the studio task queue. Decision record:
 [`db-operations.md`](db-operations.md).
 
 > **The remote never gets a database credential.** It gets a scoped bearer token
-> for five verbs — list, enqueue, claim, heartbeat, complete — each executed
-> host-side through `runtime.tasks`, so the canonical lifecycle guard stays the
-> only writer. Postgres remains bound to loopback.
+> for task verbs — list, enqueue, claim, heartbeat, complete — plus read-only
+> agent/status/event views under the same `read` scope (no re-mint required for
+> those). Each mutating verb runs host-side through `runtime.tasks`, so the
+> canonical lifecycle guard stays the only writer. Postgres remains bound to
+> loopback. Remotes may act as **any** studio role (including PM): pass
+> `--agent-type=pm` on claim; omit `--assignee` to see the full grabbable pool.
 
 ## 1. Host: mint a credential
 
@@ -97,9 +100,14 @@ export TASK_GATEWAY_TOKEN=…                         # the minted secret
 
 python3 -m gateway.client whoami
 python3 -m gateway.client ready --workstream productivity
+python3 -m gateway.client agents                       # who is running what
+python3 -m gateway.client studio-status                # queue pulse (test filtered)
+python3 -m gateway.client events --limit 20            # recent event types/ids
+python3 -m gateway.client agents-env                   # non-secret host markers
 python3 -m gateway.client enqueue --workstream productivity --type work.docs \
     --payload '{"goal": "draft the remote-access runbook"}'
-python3 -m gateway.client claim --workstream productivity
+# Act as PM (or any role) — do not default-narrow to the offhost pool:
+python3 -m gateway.client claim --workstream productivity --agent-type pm
 python3 -m gateway.client heartbeat <task-id>       # while working
 python3 -m gateway.client complete <task-id> --status merged --result '{"summary": "…"}'
 ```
@@ -140,9 +148,10 @@ curl -s -X POST "$TASK_GATEWAY_URL/v1/tasks" \
 
 | Can | Cannot |
 | --- | --- |
-| List ready / waiting / for-review tasks, read one by id | Run SQL, read the events table, see other verticals when pinned |
+| List ready / waiting / for-review tasks, read one by id | Run SQL, see payloads on other verticals when pinned |
+| Pull agent status, studio pulse, recent event types, non-secret env markers (`read`) | Read event bodies, DSNs, tokens, or API keys |
 | Enqueue a task (priority/budget/payload all clamped) | Outrank host work, mint an unbounded budget, write a status directly |
-| Claim + start a task as its own identity | Claim work pinned to `host`, or claim while its identity is revoked |
+| Claim + start any grabbable task as its own identity (any role via `--agent-type`) | Claim while its identity is revoked / quarantined |
 | Heartbeat / complete a task **it holds** | Touch a task another worker holds |
 
 A claimed remote task is an ordinary queue row: the supervisor re-kicks it if the

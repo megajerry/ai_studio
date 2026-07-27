@@ -12,9 +12,8 @@ Use it::
 
     python3 -m gateway.client whoami
     python3 -m gateway.client ready --workstream productivity
-    python3 -m gateway.client enqueue --workstream productivity --type work.docs \\
-        --payload '{"goal": "draft the runbook"}'
-    python3 -m gateway.client claim
+    python3 -m gateway.client agents
+    python3 -m gateway.client claim --workstream productivity --agent-type pm
     python3 -m gateway.client heartbeat <task-id>
     python3 -m gateway.client complete <task-id> --status merged
 
@@ -192,8 +191,14 @@ class TaskGatewayClient:
         *,
         workstream: Optional[str] = None,
         agent_type: Optional[str] = None,
-        assignee: Optional[str] = "offhost",
+        assignee: Optional[str] = None,
     ) -> dict:
+        """Claim the next grabbable task.
+
+        Remotes may act as any role (pass ``agent_type=pm`` etc.). ``assignee``
+        defaults to unset so host- and offhost-pool work are both visible; pass
+        ``offhost`` / ``host`` to narrow deliberately.
+        """
         return self._request(
             "POST", "/v1/tasks/claim",
             body={
@@ -202,6 +207,30 @@ class TaskGatewayClient:
                 "assignee": assignee,
             },
         )
+
+    def agents_status(self, *, workstream: Optional[str] = None) -> dict:
+        return self._request(
+            "GET", "/v1/agents/status", params={"workstream": workstream}
+        )
+
+    def studio_status(self) -> dict:
+        return self._request("GET", "/v1/studio/status")
+
+    def events_recent(
+        self,
+        *,
+        limit: Optional[int] = None,
+        workstream: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> dict:
+        return self._request(
+            "GET",
+            "/v1/events/recent",
+            params={"limit": limit, "workstream": workstream, "task_id": task_id},
+        )
+
+    def agents_env(self) -> dict:
+        return self._request("GET", "/v1/agents/env")
 
     def heartbeat(self, task_id: str) -> dict:
         return self._request("POST", f"/v1/tasks/{task_id}/heartbeat", body={})
@@ -403,10 +432,35 @@ def main(argv: Optional[list] = None) -> int:
     p_enq.add_argument("--budget-tokens", type=int, dest="budget_tokens")
     p_enq.add_argument("--depends-on", dest="depends_on", help="comma-separated ids")
 
-    p_claim = sub.add_parser("claim", help="grab + start the next task")
+    p_claim = sub.add_parser(
+        "claim",
+        help="grab + start the next task (any role; pass --agent-type=pm to act as PM)",
+    )
     p_claim.add_argument("--workstream")
-    p_claim.add_argument("--agent-type", dest="agent_type")
-    p_claim.add_argument("--assignee", choices=["host", "offhost"], default="offhost")
+    p_claim.add_argument(
+        "--agent-type",
+        dest="agent_type",
+        help="role label recorded on the claim (pm, executor, remote, …)",
+    )
+    p_claim.add_argument(
+        "--assignee",
+        choices=["host", "offhost"],
+        default=None,
+        help="optional pool filter; omit to claim any grabbable task",
+    )
+
+    p_agents = sub.add_parser(
+        "agents", help="who is running what (in-flight tasks + heartbeats)"
+    )
+    p_agents.add_argument("--workstream")
+
+    sub.add_parser("studio-status", help="aggregate queue pulse (test traffic filtered)")
+    sub.add_parser("agents-env", help="non-secret host orientation markers")
+
+    p_events = sub.add_parser("events", help="recent event types/ids (no bodies)")
+    p_events.add_argument("--workstream")
+    p_events.add_argument("--task-id", dest="task_id")
+    p_events.add_argument("--limit", type=int)
 
     p_hb = sub.add_parser("heartbeat", help="refresh a held task's heartbeat")
     p_hb.add_argument("task_id")
@@ -496,6 +550,16 @@ def main(argv: Optional[list] = None) -> int:
             out = client.claim(
                 workstream=args.workstream, agent_type=args.agent_type,
                 assignee=args.assignee,
+            )
+        elif args.command == "agents":
+            out = client.agents_status(workstream=args.workstream)
+        elif args.command == "studio-status":
+            out = client.studio_status()
+        elif args.command == "agents-env":
+            out = client.agents_env()
+        elif args.command == "events":
+            out = client.events_recent(
+                limit=args.limit, workstream=args.workstream, task_id=args.task_id,
             )
         elif args.command == "heartbeat":
             out = client.heartbeat(args.task_id)

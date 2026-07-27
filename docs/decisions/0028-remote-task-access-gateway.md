@@ -138,6 +138,15 @@ host **never blocks** on a remote also stands: the gateway is an *additional*
 inbound path for a remote that happens to be online, not a dependency — if it is
 down, remotes fall back to `state/offhost/` over git exactly as before.
 
+### Amendment (2026-07-27)
+
+Remotes are not confined to an "offhost executor" niche: a claim may name any
+`agent_type` (including `pm`) and defaults to no assignee pool filter. Read-only
+observability (`/v1/agents/status`, `/v1/studio/status`, `/v1/events/recent`,
+`/v1/agents/env`) is served under the existing `read` scope so already-minted
+tokens need no rotation. Prod vs test queue rows are labeled via
+`payload.traffic` ([ADR-0030](0030-prod-vs-test-traffic-tag.md)).
+
 ## Consequences
 
 - A non-LAN remote session can participate in the real queue (enqueue / list /

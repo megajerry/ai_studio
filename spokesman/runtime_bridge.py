@@ -384,7 +384,8 @@ def _pending_approvals_real(conn: psycopg.Connection):
     # Approvals without a task_id cannot be proven real — omit from stakeholder feed.
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT a.id FROM approvals a "
+            "SELECT a.id, a.task_id, a.role, a.tool, a.tier, a.reason, a.created_at "
+            "FROM approvals a "
             "JOIN tasks t ON t.id = a.task_id "
             f"WHERE a.status = 'pending' AND ({real_task_sql('t')}) "
             "ORDER BY a.created_at ASC"
@@ -550,17 +551,24 @@ def resolve(
     alias (``approve``/``deny``/``yes``/``no``). Returns the resolved
     :class:`runtime.approvals.Approval`, or ``None`` if the id is unknown / already
     resolved (``resolve_approval`` is guarded to ``pending``). Emits
-    ``approval.resolved`` to the live event log; the worker's ``resume_approved``
-    then re-queues (approved) or fails (denied) the blocked task — untouched here.
+    ``approval.resolved`` and **immediately** runs :func:`runtime.worker.resume_approved`
+    so a parked ``pm.tick`` / work task is re-queued (or abandoned on deny) without
+    waiting for the next worker-loop sweep — verbal SMS/chat approval must invoke
+    the next agent step.
     """
     from runtime.approvals import resolve_approval  # local import: keeps psycopg lazy
+    from runtime.worker import resume_approved
 
     canonical = normalize_decision(decision) or decision
     if canonical not in (STATUS_APPROVED, STATUS_DENIED):
         raise ValueError("decision must be approve/deny (or approved/denied)")
     if isinstance(approval_id, str):
         approval_id = UUID(approval_id)
-    return resolve_approval(conn, approval_id, canonical, resolver, DbEventSink(conn))
+    sink = DbEventSink(conn)
+    approval = resolve_approval(conn, approval_id, canonical, resolver, sink)
+    if approval is not None:
+        resume_approved(conn, sink)
+    return approval
 
 
 def answer(
