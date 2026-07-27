@@ -303,6 +303,32 @@ def test_a_remote_does_not_steal_host_pinned_work(client, conn, ws) -> None:
     assert still.claimed_by is None
 
 
+@pytest.mark.parametrize("blank", [None, "", "   ", "\t"])
+def test_a_blank_assignee_does_not_steal_host_pinned_work(client, conn, ws, blank) -> None:
+    """The null/blank BYPASS: a blank/``null`` assignee must coerce to ``offhost``,
+    NOT to ``None`` (which drops the pool clause in grab_task and spans every pool
+    incl. host). For each blank form the claim must NOT grab the host-pinned task,
+    which stays ``up_for_grabs`` / ``claimed_by IS NULL`` (mirrors the ``host`` case).
+
+    An offhost task coexists so a 200-with-task result would prove the grab ran and
+    still correctly avoided the host pool (not merely that the queue was empty)."""
+    host_task = enqueue_task(
+        conn, workstream=ws, type="work.host", assignee=Assignee.HOST
+    )
+    safe = enqueue_task(conn, workstream=ws, type="work.remote", assignee=Assignee.OFFHOST)
+    resp = client.post("/v1/tasks/claim", json={"workstream": ws, "assignee": blank},
+                       headers=bearer(REMOTE_SECRET))
+    assert resp.status_code == 200, resp.text
+    grabbed = resp.json()["task"]
+    # Whatever it grabbed, it was NOT the host task.
+    assert grabbed is None or grabbed["id"] != str(host_task.id)
+    if grabbed is not None:
+        assert grabbed["id"] == str(safe.id)
+    still = get_task(conn, host_task.id)
+    assert still.status is TaskStatus.UP_FOR_GRABS
+    assert still.claimed_by is None
+
+
 def test_a_bogus_assignee_is_422_not_500(client, conn, ws) -> None:
     """An out-of-range assignee is rejected cleanly (422), never an ungraceful 500
     from ``Assignee(<bad>)`` — the runtime store is never even opened."""
