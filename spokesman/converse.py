@@ -1,8 +1,13 @@
-"""Conversational inbound path for Spokesman (ADR-0026).
+"""Spokesman agent — model-first human interface (ADR-0026).
 
-Keyword shortcuts stay in ``app.handle_inbound_command``. Free text lands here:
-classify intent → answer from grounded context / enqueue ``pm.tick`` /
-``spokesman.prep`` / propose handoff. Never calls PM directly.
+The model interprets the stakeholder message first. Studio actions
+(``studio_status``, ``enqueue_goal``, ``request_prep``, ``propose_handoff``,
+``end_handoff``) are **tools** the agent may call — they never replace
+understanding the prompt.
+
+Keyword shortcuts (``status`` / ``approve`` / ``deny`` / ``decide``) remain a
+fast path in ``app.handle_inbound_command`` for SMS muscle memory; free text
+always enters this agent loop.
 """
 
 from __future__ import annotations
@@ -11,189 +16,234 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Callable, Optional
-from uuid import UUID
 
 from runtime.enforce import DbEventSink, EventSink, NullEventSink
-from runtime.event_types import (
-    EVENT_HUMAN_GOAL,
-    EVENT_HUMAN_MESSAGE,
-    EVENT_SPOKESMAN_PREP_READY,
-)
-from runtime.grounding import Claim
+from runtime.event_types import EVENT_HUMAN_GOAL, EVENT_HUMAN_MESSAGE
+from runtime.model import call_model
 from runtime.scheduler import PM_TICK_TYPE
 from runtime.tasks import enqueue_task
 
 from .context import (
     SPOKESMAN_PREP_TYPE,
-    StudioContext,
     context_for_answer,
     emit_body_free,
     refresh_prep_cache,
 )
-from .handoff import format_handoff_relay, propose_handoff
+from .handoff import end_handoff, propose_handoff
 
 logger = logging.getLogger(__name__)
 
 ConnectFn = Callable[[], Any]
 
+MAX_AGENT_ROUNDS = 4
+TOOL_NAMES = frozenset(
+    {
+        "studio_status",
+        "enqueue_goal",
+        "request_prep",
+        "propose_handoff",
+        "end_handoff",
+    }
+)
 
-class Intent(str, Enum):
-    ANSWER = "answer"
-    ENQUEUE_GOAL = "enqueue_goal"
-    NEED_PREP = "need_prep"
-    PROPOSE_HANDOFF = "propose_handoff"
+SYSTEM_PROMPT = """\
+You are Spokesman — the sole default human interface for AI Studio (a local-first
+venture-studio agent OS). You speak naturally with the stakeholder. You know the
+studio through tools; you do not invent facts.
+
+Rules:
+1. Read and interpret the human's message FIRST. Respond like a competent aide.
+2. Use tools when you need live studio data or must take an action. Do not dump
+   raw status unless the human asked for it or you need it to answer.
+3. Never claim you did something (queued work, approved, etc.) unless a tool
+   result confirms it.
+4. Keep replies concise (SMS-friendly). Prefer one short paragraph + bullets.
+5. Coordination with other agents is ONLY via tools (enqueue / prep / handoff) —
+   you never call other agents directly.
+
+Available tools (call by name with JSON args):
+- studio_status() — live open-task / approval / decision snapshot.
+- enqueue_goal(goal: string) — queue a requirement for the PM (pm.tick).
+- request_prep(questions: string[]) — high-priority prep dig; you'll follow up.
+- propose_handoff(role: string, reason: string) — ask human to approve a
+  specialist back-and-forth (pm|critic|reviewer|researcher).
+- end_handoff() — end an active specialist handoff.
+
+Response format — return ONLY a single JSON object, no markdown fences:
+{"tool_calls":[{"name":"<tool>","args":{...}}, ...], "reply":"<text or null>"}
+
+- If you need tools first: set tool_calls (1+), reply null (or a brief ack).
+- When ready to answer the human: tool_calls [] and a non-null reply.
+- You may combine: run tools and also set a short ack reply the same turn.
+"""
 
 
 @dataclass
 class ConverseOutcome:
-    intent: Intent
+    """Result of one agent session with the stakeholder."""
+
+    intent: str = "converse"
     replies: list[str] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
 
 
-_QUESTION_RE = re.compile(
-    r"^(who|what|when|where|why|how|is|are|do|does|did|can|could|would|will|"
-    r"should|status|any|which)\b|\?$",
-    re.I,
-)
-_GOAL_RE = re.compile(
-    r"\b(please |pls )?(build|implement|create|ship|fix|add|remove|change|"
-    r"update|investigate|research|plan|start|stop|prioritize|focus on|"
-    r"i want|i need|we need|work on|make sure)\b",
-    re.I,
-)
-_HANDOFF_RE = re.compile(
-    r"\b(talk (directly )?to|hand ?off|speak (with|to)|bring in)\b.*(pm|critic|"
-    r"reviewer|researcher|agent)|"
-    r"\b(pm|critic|reviewer)\b.*(talk|discuss|directly)\b",
-    re.I,
-)
-_PREP_RE = re.compile(
-    r"\b(dig into|look up|check (the )?(logs|db|database|budget|spend)|"
-    r"investigate (why|how)|deeper (look|dive)|find out)\b",
-    re.I,
-)
-_END_HANDOFF_RE = re.compile(r"^(end handoff|stop handoff|exit handoff)\b", re.I)
+@dataclass
+class _ToolCtx:
+    settings: Any
+    connect: ConnectFn
+    conn: Any
+    sink: EventSink
+    workstream: str
 
 
-def classify_intent(text: str) -> tuple[Intent, dict[str, Any]]:
-    """Heuristic classifier (also used when model dry-run returns stubs)."""
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return Intent.ANSWER, {"topic": "empty"}
-    if _HANDOFF_RE.search(cleaned):
-        role = "pm"
-        for candidate in ("critic", "reviewer", "researcher", "pm"):
-            if re.search(rf"\b{candidate}\b", cleaned, re.I):
-                role = candidate
-                break
-        return Intent.PROPOSE_HANDOFF, {"role": role, "reason": cleaned[:300]}
-    if _PREP_RE.search(cleaned) and not _QUESTION_RE.search(cleaned.split()[0]):
-        return Intent.NEED_PREP, {"questions": [cleaned]}
-    if _GOAL_RE.search(cleaned) and not cleaned.endswith("?"):
-        return Intent.ENQUEUE_GOAL, {"goal": cleaned}
-    if _QUESTION_RE.search(cleaned) or cleaned.endswith("?"):
-        return Intent.ANSWER, {"topic": cleaned}
-    # Imperative without keyword → treat as goal; otherwise answer from context.
-    if len(cleaned.split()) >= 4 and cleaned[0].isupper():
-        return Intent.ENQUEUE_GOAL, {"goal": cleaned}
-    return Intent.ANSWER, {"topic": cleaned}
-
-
-def _try_model_classify(text: str, conn: Any) -> Optional[tuple[Intent, dict[str, Any]]]:
-    """Optional LLM classify; returns None on dry-run / parse failure."""
+def _close(conn: object) -> None:
     try:
-        from runtime.model import call_model
+        conn.close()  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
-        return None
-    prompt = (
-        "Classify the stakeholder message for AI Studio Spokesman.\n"
-        "Return ONLY JSON: "
-        '{"intent":"answer|enqueue_goal|need_prep|propose_handoff",'
-        '"goal":"...", "questions":["..."], "role":"pm", "reason":"..."}\n'
-        f"Message: {text[:1500]}"
-    )
-    try:
-        completion = call_model(
-            "spokesman",
-            "converse",
-            [{"role": "user", "content": prompt}],
-            quality="standard",
-            conn=conn,
-            sink=NullEventSink(),
-            workstream="productivity",
-            force_dry_run=False,
-        )
-        raw = (completion.text or "").strip()
-        if raw.startswith("[dry-run:"):
-            return None
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end < 0:
-            return None
-        data = json.loads(raw[start : end + 1])
-        intent_s = str(data.get("intent") or "").strip()
-        intent = Intent(intent_s)
-        meta: dict[str, Any] = {}
-        if intent == Intent.ENQUEUE_GOAL:
-            meta["goal"] = str(data.get("goal") or text).strip()
-        elif intent == Intent.NEED_PREP:
-            qs = data.get("questions") or [text]
-            meta["questions"] = [str(q) for q in qs][:5]
-        elif intent == Intent.PROPOSE_HANDOFF:
-            meta["role"] = str(data.get("role") or "pm")
-            meta["reason"] = str(data.get("reason") or text)[:300]
-        else:
-            meta["topic"] = text
-        return intent, meta
-    except Exception:  # noqa: BLE001
-        logger.info("model classify unavailable; using heuristics")
-        return None
+        pass
 
 
-def resolve_intent(text: str, conn: Any = None) -> tuple[Intent, dict[str, Any]]:
-    if conn is not None:
-        modeled = _try_model_classify(text, conn)
-        if modeled is not None:
-            return modeled
-    return classify_intent(text)
+def _parse_agent_json(raw: str) -> dict[str, Any]:
+    """Extract the agent JSON object from a model completion."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < 0 or end <= start:
+        raise ValueError("no JSON object in model output")
+    data = json.loads(text[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("agent output is not an object")
+    return data
 
 
-def _judgment_claims(statements: list[str]) -> list[Claim]:
-    """Label conversational prose as judgment (ADR-0021) for the gate."""
-    return [Claim(statement=s, is_judgment=True) for s in statements if s.strip()]
+def _run_tool(name: str, args: dict[str, Any], ctx: _ToolCtx) -> dict[str, Any]:
+    """Execute one Spokesman tool; return a JSON-serializable result."""
+    args = args if isinstance(args, dict) else {}
+    if name == "studio_status":
+        if ctx.conn is None:
+            from .state import status_summary
 
-
-def _send_grounded_or_direct(
-    conn: Any,
-    client: Any,
-    notifier: Any,
-    *,
-    text: str,
-    to: Optional[str],
-    originating: str = "role/spokesman",
-) -> None:
-    """Prefer grounding gate; fall back to direct send for judgments / no notifier."""
-    if notifier is not None and conn is not None:
+            return {"ok": True, "text": status_summary(ctx.settings)}
         try:
-            from .grounding_gate import relay_claims
+            brief = context_for_answer(ctx.conn).render_brief()
+            return {"ok": True, "text": brief}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": type(exc).__name__}
 
-            result = relay_claims(
-                conn,
-                notifier,
-                kind="inform",
-                originating_identity=originating,
-                claims=_judgment_claims([text]),
-            )
-            # Capturing clients (web) also need the text on the messaging client.
-            if getattr(client, "replies", None) is not None or not result.get("relayed"):
-                client.send_text(text, to=to)
-            return
-        except Exception:  # noqa: BLE001
-            logger.warning("grounding relay failed; sending direct")
-    client.send_text(text, to=to)
+    if name == "enqueue_goal":
+        goal = str(args.get("goal") or "").strip()
+        if not goal:
+            return {"ok": False, "error": "missing goal"}
+        if ctx.conn is None:
+            return {"ok": False, "error": "db unavailable"}
+        task = enqueue_task(
+            ctx.conn,
+            workstream=ctx.workstream,
+            type=PM_TICK_TYPE,
+            payload={"goal": goal, "source": "spokesman", "kind": "human_goal"},
+            priority=50,
+        )
+        emit_body_free(
+            ctx.sink,
+            type=EVENT_HUMAN_GOAL,
+            workstream=ctx.workstream,
+            task_id=task.id,
+            payload={"task_id": str(task.id), "source": "spokesman"},
+        )
+        return {"ok": True, "task_id": str(task.id), "goal": goal}
+
+    if name == "request_prep":
+        questions = args.get("questions") or []
+        if isinstance(questions, str):
+            questions = [questions]
+        questions = [str(q).strip() for q in questions if str(q).strip()][:5]
+        if not questions:
+            return {"ok": False, "error": "missing questions"}
+        if ctx.conn is None:
+            return {"ok": False, "error": "db unavailable"}
+        task = enqueue_task(
+            ctx.conn,
+            workstream=ctx.workstream,
+            type=SPOKESMAN_PREP_TYPE,
+            payload={
+                "questions": questions,
+                "priority": "high",
+                "source": "spokesman",
+            },
+            priority=100,
+        )
+        return {"ok": True, "task_id": str(task.id), "questions": questions}
+
+    if name == "propose_handoff":
+        role = str(args.get("role") or "pm").strip().lower() or "pm"
+        reason = str(args.get("reason") or "Specialist discussion needed.").strip()[:500]
+        if ctx.conn is None:
+            return {"ok": False, "error": "db unavailable"}
+        handoff, approval = propose_handoff(
+            ctx.conn,
+            role=role,
+            reason=reason,
+            workstream=ctx.workstream,
+            sink=ctx.sink,
+        )
+        return {
+            "ok": True,
+            "handoff_id": str(handoff.id),
+            "approval_id": str(approval.id),
+            "role": role,
+            "hint": f"Human must reply: approve {approval.id}",
+        }
+
+    if name == "end_handoff":
+        if ctx.conn is None:
+            return {"ok": False, "error": "db unavailable"}
+        ended = end_handoff(ctx.conn, sink=ctx.sink)
+        if ended is None:
+            return {"ok": False, "error": "no active handoff"}
+        return {"ok": True, "handoff_id": str(ended.id), "role": ended.role}
+
+    return {"ok": False, "error": f"unknown tool {name!r}"}
+
+
+def _agent_turn(
+    messages: list[dict[str, Any]],
+    *,
+    conn: Any,
+    workstream: str,
+    user_text: str,
+) -> dict[str, Any]:
+    """One model turn; returns parsed agent JSON (or a safe conversational fallback)."""
+    completion = call_model(
+        "spokesman",
+        "converse",
+        messages,
+        quality="standard",
+        conn=conn,
+        sink=NullEventSink(),
+        workstream=workstream,
+        spokesman_user=user_text,
+        spokesman_messages=messages,
+    )
+    raw = (completion.text or "").strip()
+    try:
+        return _parse_agent_json(raw)
+    except Exception:  # noqa: BLE001 - model drifted; still talk to the human
+        logger.warning("spokesman agent JSON parse failed; using raw text fallback")
+        if raw.startswith("[dry-run:"):
+            # Should not happen when dry-run spokesman_user is wired; belt+suspenders.
+            return {
+                "tool_calls": [],
+                "reply": (
+                    f"I heard you: {user_text[:400]}. "
+                    "(Model dry-run — wire a provider key for full replies.)"
+                ),
+            }
+        # Prefer treating free text as the reply rather than dying silently.
+        return {"tool_calls": [], "reply": raw[:2000] or "Sorry — I blanked. Try again?"}
 
 
 def handle_conversation(
@@ -204,31 +254,11 @@ def handle_conversation(
     *,
     notifier: Any = None,
 ) -> ConverseOutcome:
-    """Run free-text converse for one inbound message."""
+    """Run the Spokesman agent on one inbound free-text message."""
+    del notifier  # reserved: future grounded outbound from agent claims
     text = (msg.text or "").strip()
     to = getattr(msg, "sender", None) or None
     workstream = getattr(settings, "workstream", None) or "productivity"
-
-    if _END_HANDOFF_RE.match(text):
-        try:
-            from .handoff import end_handoff
-
-            conn = connect()
-            try:
-                ended = end_handoff(conn, sink=DbEventSink(conn))
-            finally:
-                _close(conn)
-            reply = (
-                "Handoff ended. You're back with Spokesman only."
-                if ended
-                else "No active handoff to end."
-            )
-            client.send_text(reply, to=to)
-            return ConverseOutcome(intent=Intent.ANSWER, replies=[reply], meta={"ended": bool(ended)})
-        except Exception:  # noqa: BLE001
-            logger.exception("end handoff failed")
-            client.send_text("Could not end handoff; try again shortly.", to=to)
-            return ConverseOutcome(intent=Intent.ANSWER, replies=[], meta={"error": "db"})
 
     conn = None
     sink: EventSink = NullEventSink()
@@ -236,184 +266,144 @@ def handle_conversation(
         conn = connect()
         sink = DbEventSink(conn)
     except Exception:  # noqa: BLE001
-        logger.warning("DB unavailable for converse; limited mode")
+        logger.warning("DB unavailable for spokesman agent; tools that need DB will fail")
 
     if conn is not None:
         emit_body_free(
             sink,
             type=EVENT_HUMAN_MESSAGE,
             workstream=workstream,
-            payload={"channel": getattr(settings, "channel", "web"), "chars": len(text)},
+            payload={
+                "channel": getattr(settings, "channel", "web"),
+                "chars": len(text),
+            },
         )
 
-    intent, meta = resolve_intent(text, conn=conn)
+    ctx = _ToolCtx(
+        settings=settings,
+        connect=connect,
+        conn=conn,
+        sink=sink,
+        workstream=workstream,
+    )
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": text},
+    ]
+    replies: list[str] = []
+    tool_trace: list[dict[str, Any]] = []
+    final_reply: Optional[str] = None
 
     try:
-        if intent == Intent.ANSWER:
-            return _do_answer(conn, client, notifier, settings, text, to, meta, sink, workstream)
-        if intent == Intent.ENQUEUE_GOAL:
-            return _do_enqueue_goal(conn, client, text, to, meta, sink, workstream)
-        if intent == Intent.NEED_PREP:
-            return _do_need_prep(conn, client, text, to, meta, sink, workstream)
-        if intent == Intent.PROPOSE_HANDOFF:
-            return _do_propose_handoff(conn, client, to, meta, sink, workstream)
+        for _round in range(MAX_AGENT_ROUNDS):
+            parsed = _agent_turn(
+                messages, conn=conn, workstream=workstream, user_text=text
+            )
+            tool_calls = parsed.get("tool_calls") or []
+            if not isinstance(tool_calls, list):
+                tool_calls = []
+            reply = parsed.get("reply")
+            if isinstance(reply, str) and reply.strip():
+                final_reply = reply.strip()
+                replies.append(final_reply)
+
+            if not tool_calls:
+                break
+
+            results = []
+            for call in tool_calls[:5]:
+                if not isinstance(call, dict):
+                    continue
+                name = str(call.get("name") or "").strip()
+                args = call.get("args") if isinstance(call.get("args"), dict) else {}
+                if name not in TOOL_NAMES:
+                    result = {"ok": False, "error": f"unknown tool {name!r}"}
+                else:
+                    result = _run_tool(name, args, ctx)
+                tool_trace.append({"name": name, "args": args, "result": result})
+                results.append({"name": name, "result": result})
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"tool_calls": tool_calls, "reply": reply},
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Tool results (JSON). Continue: more tools or final reply.\n"
+                        + json.dumps(results, ensure_ascii=False)
+                    ),
+                }
+            )
+        else:
+            if final_reply is None:
+                final_reply = (
+                    "I started looking into that but hit my step limit — "
+                    "ask me to continue or try a narrower question."
+                )
+                replies.append(final_reply)
+
+        if final_reply is None:
+            # Tools ran with no prose — synthesize a minimal human-facing line.
+            if tool_trace:
+                final_reply = _summarize_tools(tool_trace)
+            else:
+                final_reply = "I'm here — what should we focus on?"
+            replies.append(final_reply)
+
+        # Send once (last reply is the one for the human this turn).
+        client.send_text(replies[-1], to=to)
+        return ConverseOutcome(
+            intent="converse",
+            replies=[replies[-1]],
+            meta={
+                "ok": True,
+                "rounds": min(MAX_AGENT_ROUNDS, len(tool_trace) + 1),
+                "tools": [t["name"] for t in tool_trace],
+                "tool_trace": tool_trace,
+            },
+        )
     finally:
         if conn is not None:
             _close(conn)
 
-    reply = "I heard you, but could not act — try again shortly."
-    client.send_text(reply, to=to)
-    return ConverseOutcome(intent=intent, replies=[reply], meta=meta)
 
-
-def _do_answer(
-    conn: Any,
-    client: Any,
-    notifier: Any,
-    settings: Any,
-    text: str,
-    to: Optional[str],
-    meta: dict,
-    sink: EventSink,
-    workstream: str,
-) -> ConverseOutcome:
-    if conn is None:
-        from .state import status_summary
-
-        summary = status_summary(settings)
-        reply = f"{summary}\n\n(Asked: {text[:200]})"
-        client.send_text(reply, to=to)
-        return ConverseOutcome(intent=Intent.ANSWER, replies=[reply], meta=meta)
-
-    ctx: StudioContext = context_for_answer(conn)
-    reply = (
-        f"*Spokesman*\n{ctx.render_brief()}\n\n"
-        f"_Re: {text[:240]}_"
-    )
-    # Active handoff: still Spokesman answers unless this is a relay path.
-    _send_grounded_or_direct(conn, client, notifier, text=reply, to=to)
-    return ConverseOutcome(
-        intent=Intent.ANSWER,
-        replies=[reply],
-        meta={**meta, "refreshed_at": ctx.refreshed_at},
-    )
-
-
-def _do_enqueue_goal(
-    conn: Any,
-    client: Any,
-    text: str,
-    to: Optional[str],
-    meta: dict,
-    sink: EventSink,
-    workstream: str,
-) -> ConverseOutcome:
-    goal = str(meta.get("goal") or text).strip()
-    if conn is None:
-        reply = "Runtime DB unreachable — could not enqueue that for the PM. Try again shortly."
-        client.send_text(reply, to=to)
-        return ConverseOutcome(intent=Intent.ENQUEUE_GOAL, replies=[reply], meta={"ok": False})
-
-    task = enqueue_task(
-        conn,
-        workstream=workstream,
-        type=PM_TICK_TYPE,
-        payload={"goal": goal, "source": "spokesman", "kind": "human_goal"},
-        priority=50,
-    )
-    emit_body_free(
-        sink,
-        type=EVENT_HUMAN_GOAL,
-        workstream=workstream,
-        task_id=task.id,
-        payload={"task_id": str(task.id), "source": "spokesman"},
-    )
-    reply = (
-        f"Got it — queued for the PM (task {str(task.id)[:8]}…). "
-        "I'll update you as it plans."
-    )
-    client.send_text(reply, to=to)
-    return ConverseOutcome(
-        intent=Intent.ENQUEUE_GOAL,
-        replies=[reply],
-        meta={"ok": True, "task_id": str(task.id), "goal": goal},
-    )
-
-
-def _do_need_prep(
-    conn: Any,
-    client: Any,
-    text: str,
-    to: Optional[str],
-    meta: dict,
-    sink: EventSink,
-    workstream: str,
-) -> ConverseOutcome:
-    questions = list(meta.get("questions") or [text])
-    if conn is None:
-        reply = "On it — but DB is down, so I can't dig deeper yet."
-        client.send_text(reply, to=to)
-        return ConverseOutcome(intent=Intent.NEED_PREP, replies=[reply], meta={"ok": False})
-
-    task = enqueue_task(
-        conn,
-        workstream=workstream,
-        type=SPOKESMAN_PREP_TYPE,
-        payload={
-            "questions": questions[:5],
-            "priority": "high",
-            "source": "spokesman",
-        },
-        priority=100,
-    )
-    topic = questions[0][:120] if questions else "that"
-    reply = f"On it — checking {topic}… I'll follow up shortly."
-    client.send_text(reply, to=to)
-    return ConverseOutcome(
-        intent=Intent.NEED_PREP,
-        replies=[reply],
-        meta={"ok": True, "task_id": str(task.id)},
-    )
-
-
-def _do_propose_handoff(
-    conn: Any,
-    client: Any,
-    to: Optional[str],
-    meta: dict,
-    sink: EventSink,
-    workstream: str,
-) -> ConverseOutcome:
-    if conn is None:
-        reply = "Can't propose a handoff without the runtime DB."
-        client.send_text(reply, to=to)
-        return ConverseOutcome(intent=Intent.PROPOSE_HANDOFF, replies=[reply], meta={"ok": False})
-
-    role = str(meta.get("role") or "pm")
-    reason = str(meta.get("reason") or "Extended specialist discussion.")
-    handoff, approval = propose_handoff(
-        conn, role=role, reason=reason, workstream=workstream, sink=sink
-    )
-    reply = (
-        f"This may need a direct {role.upper()} back-and-forth. "
-        f"Approve handoff? Reply: approve {str(approval.id)[:8]}… "
-        f"(full id: {approval.id}) — or deny {approval.id}"
-    )
-    client.send_text(reply, to=to)
-    return ConverseOutcome(
-        intent=Intent.PROPOSE_HANDOFF,
-        replies=[reply],
-        meta={
-            "ok": True,
-            "handoff_id": str(handoff.id),
-            "approval_id": str(approval.id),
-            "role": role,
-        },
-    )
+def _summarize_tools(tool_trace: list[dict[str, Any]]) -> str:
+    parts = []
+    for t in tool_trace:
+        name = t.get("name")
+        result = t.get("result") or {}
+        if name == "studio_status" and result.get("ok"):
+            parts.append(str(result.get("text") or "").strip())
+        elif name == "enqueue_goal" and result.get("ok"):
+            parts.append(
+                f"Queued for the PM (task {str(result.get('task_id', ''))[:8]}…)."
+            )
+        elif name == "request_prep" and result.get("ok"):
+            parts.append("On it — digging in; I'll follow up.")
+        elif name == "propose_handoff" and result.get("ok"):
+            parts.append(
+                f"Proposed handoff to {result.get('role')}. "
+                f"{result.get('hint') or ''}"
+            )
+        elif name == "end_handoff" and result.get("ok"):
+            parts.append("Handoff ended — back to Spokesman only.")
+        elif not result.get("ok"):
+            parts.append(f"{name} failed: {result.get('error')}")
+    return "\n\n".join(p for p in parts if p) or "Done."
 
 
 def run_prep_task(conn: Any, task: Any, sink: EventSink) -> dict[str, Any]:
     """Worker handler for ``spokesman.prep`` — refresh cache + emit ready event."""
+    from runtime.event_types import EVENT_SPOKESMAN_PREP_READY
+
     payload = dict(task.payload or {})
     questions = payload.get("questions") or []
     notes = [f"Prep for: {q}" for q in questions[:5] if isinstance(q, str)]
@@ -429,30 +419,130 @@ def run_prep_task(conn: Any, task: Any, sink: EventSink) -> dict[str, Any]:
             "refreshed_at": ctx.refreshed_at,
         },
     )
-    follow_up = (
-        f"*Follow-up*\n{ctx.render_brief()}\n\n"
-        f"_Prepared for: {'; '.join(str(q) for q in questions[:2]) or 'your ask'}_"
-    )
     return {
         "ok": True,
-        "follow_up": follow_up,
+        "follow_up": f"*Follow-up*\n{ctx.render_brief()}",
         "refreshed_at": ctx.refreshed_at,
         "n_questions": len(questions),
     }
 
 
-def maybe_tag_handoff_reply(conn: Any, role: str, text: str) -> str:
-    """Format a specialist relay if a handoff is active for ``role``."""
-    from .handoff import active_handoff
+def build_dry_run_spokesman_turn(
+    user_text: str,
+    *,
+    messages: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Deterministic agent JSON for keyless/dry-run (mirrors PM plan_goal).
 
-    active = active_handoff(conn)
-    if active and active.role == role:
-        return format_handoff_relay(role, text)
-    return text
+    Interprets the user message lightly so dry-run still behaves like an agent
+    (tools when appropriate, otherwise a normal conversational reply) — never a
+    status paste glued under ``_Re: …``.
+    """
+    # Follow-up after tools: produce a final human reply from tool results.
+    if messages:
+        for msg in reversed(messages):
+            content = str(msg.get("content") or "")
+            if content.startswith("Tool results"):
+                return _dry_run_reply_after_tools(content)
+
+    text = (user_text or "").strip()
+    lower = text.lower()
+
+    # Action-shaped → use tools (model-first dry-run still "chooses" tools).
+    if re.search(
+        r"\b(please |pls )?(build|implement|create|ship|fix|add|enqueue|"
+        r"i want|i need|we need|work on)\b",
+        text,
+        re.I,
+    ) and not text.endswith("?"):
+        return {
+            "tool_calls": [{"name": "enqueue_goal", "args": {"goal": text}}],
+            "reply": None,
+        }
+    if re.search(r"\b(dig into|look up|check the (logs|budget|db))\b", text, re.I):
+        return {
+            "tool_calls": [{"name": "request_prep", "args": {"questions": [text]}}],
+            "reply": "On it — checking that now.",
+        }
+    if re.search(r"\b(talk (directly )?to|hand ?off|speak with)\b", text, re.I):
+        role = "pm"
+        for candidate in ("critic", "reviewer", "researcher", "pm"):
+            if re.search(rf"\b{candidate}\b", text, re.I):
+                role = candidate
+                break
+        return {
+            "tool_calls": [
+                {
+                    "name": "propose_handoff",
+                    "args": {"role": role, "reason": text[:300]},
+                }
+            ],
+            "reply": None,
+        }
+    if re.search(r"^(end handoff|stop handoff)\b", text, re.I):
+        return {"tool_calls": [{"name": "end_handoff", "args": {}}], "reply": None}
+    if re.search(
+        r"\b(status|how'?s?\b|how (is|are) (things|we|the studio)|"
+        r"what('s| is) (blocked|open|pending)|any updates?|"
+        r"studio looking)\b",
+        lower,
+    ) or lower in {"status", "hi", "hello", "hey"}:
+        if lower in {"hi", "hello", "hey"}:
+            return {
+                "tool_calls": [],
+                "reply": (
+                    "Hey — Spokesman here. Ask me anything about the studio, "
+                    "give a requirement to queue for the PM, or say status if you "
+                    "want a snapshot."
+                ),
+            }
+        return {
+            "tool_calls": [{"name": "studio_status", "args": {}}],
+            "reply": None,
+        }
+
+    short = text if len(text) <= 280 else text[:277] + "…"
+    return {
+        "tool_calls": [],
+        "reply": (
+            f"Got it — \"{short}\". I can pull live studio status, queue work for "
+            "the PM, dig deeper, or propose a specialist handoff. What would you "
+            "like me to do with this?"
+        ),
+    }
 
 
-def _close(conn: object) -> None:
+def _dry_run_reply_after_tools(tool_results_content: str) -> dict[str, Any]:
+    """Second-turn dry-run: turn tool JSON into a short human reply."""
     try:
-        conn.close()  # type: ignore[attr-defined]
+        blob = tool_results_content.split("\n", 1)[1]
+        results = json.loads(blob)
     except Exception:  # noqa: BLE001
-        pass
+        return {
+            "tool_calls": [],
+            "reply": "I ran the tools — ask if you want more detail.",
+        }
+    parts: list[str] = []
+    for item in results if isinstance(results, list) else []:
+        name = item.get("name")
+        result = item.get("result") or {}
+        if name == "studio_status" and result.get("ok"):
+            parts.append(str(result.get("text") or "").strip())
+        elif name == "enqueue_goal" and result.get("ok"):
+            tid = str(result.get("task_id") or "")[:8]
+            parts.append(
+                f"Queued that for the PM (task {tid}…). I'll update you as it plans."
+            )
+        elif name == "request_prep" and result.get("ok"):
+            parts.append("Prep is running — I'll follow up when it's ready.")
+        elif name == "propose_handoff" and result.get("ok"):
+            parts.append(
+                f"I proposed a {result.get('role', 'pm').upper()} handoff. "
+                f"{result.get('hint') or 'Approve the pending approval to activate.'}"
+            )
+        elif name == "end_handoff" and result.get("ok"):
+            parts.append("Handoff ended. You're back with me only.")
+        elif result.get("ok") is False:
+            parts.append(f"Couldn't complete {name}: {result.get('error')}")
+    reply = "\n\n".join(p for p in parts if p) or "Done — anything else?"
+    return {"tool_calls": [], "reply": reply}

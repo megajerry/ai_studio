@@ -37,16 +37,17 @@ studio. It:
 
 ### 2. Inbound intents
 
-| Intent | Behavior |
-| --- | --- |
-| Keyword shortcuts | Unchanged fast path (`status` / `approve` / `deny` / `decide`). |
-| `answer` | Compose a reply from studio context (+ prep cache); ground before send. |
-| `enqueue_goal` | Ack + `enqueue_task(type="pm.tick", payload={goal, source:"spokesman"})`. |
-| `need_prep` | Ack + high-priority `spokesman.prep` task; follow up when ready. |
-| `propose_handoff` | Raise a 🔴 approval; activate handoff only on `approve`. |
+The **model interprets free text first** (agent loop via ``call_model``). Studio
+actions are tools the agent may invoke — they never replace understanding the
+prompt:
 
-Unrecognized free text is **never silently dropped** — it is classified into one
-of the intents above (heuristics + model; dry-run / keyless uses heuristics).
+| Path | Behavior |
+| --- | --- |
+| Keyword shortcuts | Fast path only: ``status`` / ``approve`` / ``deny`` / ``decide``. |
+| Free text | Spokesman agent: natural reply; optional tools ``studio_status``, ``enqueue_goal``, ``request_prep``, ``propose_handoff``, ``end_handoff``. |
+
+Unrecognized free text is **never silently dropped** and is **never answered by
+pasting a status dump under the user's words**.
 
 ### 3. Coordination with PM and others
 

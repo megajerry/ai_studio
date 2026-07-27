@@ -305,7 +305,7 @@ def handle_inbound_command(
     )
     return {
         "command": "converse",
-        "intent": outcome.intent.value,
+        "intent": outcome.intent if isinstance(outcome.intent, str) else str(outcome.intent),
         "ok": True,
         **outcome.meta,
     }
