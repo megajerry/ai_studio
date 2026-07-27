@@ -149,7 +149,7 @@ surfaces it BATCHED/async (ADR-0006, `decide <id> <answer>`), `answer_decision` 
 it (`blocked→up_for_grabs`) with the answer readable; body-free events; cross-resume
 safety vs approvals proven both directions (distinct `blocked_on_decision` marker). So
 an agent is never stalled waiting on a stakeholder decision ·
-**PM build-vs-buy/borrow + agile-adoption principle** (ADR-0026): internalized as a PM
+**PM build-vs-buy/borrow + agile-adoption principle** (ADR-0027): internalized as a PM
 operating principle (in the plan prompt via a `strategy_aware` layer) — NOT a cron — the
 PM continuously weighs build vs. buy/borrow + adopting a better paradigm/tech (change
 only on evidence), and OWNS a **budget-tuned baseline external-research cadence**
@@ -157,7 +157,7 @@ only on evidence), and OWNS a **budget-tuned baseline external-research cadence*
 adaptive master switch); `run_pm_tick` commissions exactly ONE `research` scan when due
 (no stacking, no research-of-research loop, degrade-safe), proposing `reviewed:false`
 candidates only — the standing external half of the learning loop, without churn ·
-onboarding/secrets · model shortlist + cost model · ADRs 0001–0026.
+onboarding/secrets · model shortlist + cost model · ADRs 0001–0027.
 
 ## 🔄 In progress
 

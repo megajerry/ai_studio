@@ -33,3 +33,4 @@ these for detail; this file is the index.
 | [0024](0024-skill-induction.md) | Skill induction | Measure-first efficacy + a review-gated Curator that induces reusable skills from recurring, mature trajectories. |
 | [0025](0025-async-decisions.md) | Async open-ended decisions | Park → free worker → resume on free-text/option answers (open-ended sibling of approvals). |
 | [0026](0026-spokesman-conversational-interface.md) | Spokesman conversational interface | Full human↔studio NL loop; goals → `pm.tick` via queue; prep cache; approval-gated handoffs. |
+| [0027](0027-build-vs-buy-agile-adoption.md) | Build vs. buy/borrow + agile adoption | PM operating principle (not a cron): weigh building in-house vs adopting a mature component; stay agile on better paradigms without churn. |
