@@ -60,6 +60,7 @@ from .approvals import (
     get_approval,
 )
 from .budget import remaining as budget_remaining
+from .crossworkstream import FEATURE_REQUEST_TYPE, STATUS_ESCALATED
 from .db import connect
 from .enforce import DbEventSink, EventSink, InvokeStatus, NullEventSink, invoke
 from .event_types import (
@@ -80,7 +81,7 @@ from .roles.failure_analyst import (
     FAILURE_ANALYST_TASK_TYPES,
     run_failure_analysis as run_failure_analysis_default,
 )
-from .roles.pm import REPLAN_TASK_TYPE, run_pm_replan, run_pm_tick
+from .roles.pm import REPLAN_TASK_TYPE, run_pm_replan, run_pm_tick, triage_request
 from .roles.researcher import RESEARCH_TASK_TYPE, run_research as run_research_default
 from .roles.retro import RETRO_TASK_TYPE, run_retro as run_retro_default
 from .roles.skill_lifecycle import (
@@ -163,7 +164,7 @@ class RunResult(BaseModel):
 
     task_id: str
     task_type: str
-    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "curator" | "skill_lifecycle" | "unknown"
+    #: "pm" | "replan" | "work" | "code" | "retro" | "review" | "research" | "sourcing" | "failure_analysis" | "curator" | "skill_lifecycle" | "triage" | "unknown"
     kind: str
     #: "done" (merged) | "failed" (abandoned) | "blocked"
     outcome: str
@@ -964,6 +965,43 @@ def _handle_code(
     )
 
 
+def _handle_feature_request(
+    conn: Any,
+    task: Task,
+    sink: EventSink,
+    *,
+    heartbeat: Heartbeater,
+    worker_id: str,
+    run_triage: Callable[..., Any],
+) -> RunResult:
+    """Receiving-PM intake for a cross-workstream ``feature_request`` (ADR-0018).
+
+    A :class:`~runtime.crossworkstream.FeatureRequest` filed onto this workstream's
+    board rides on a ``feature_request`` task; without this branch it fell through
+    to the "unknown task type" arm and was ABANDONED. Here it is routed to
+    :func:`runtime.roles.pm.triage_request`, which evaluates it through the
+    receiving workstream's own success lens and drives the request task to a legal
+    terminal / next state via the single guarded ``transition`` (accept → ``merged``
+    + up_for_grabs ``work.*`` items; decline → ``abandoned``; needs_clarification →
+    back to ``up_for_grabs``; escalate → ``blocked`` on a 🛑 approval).
+
+    ``triage_request`` owns ALL state changes + the ``request.*`` event stream (it
+    picks the task up idempotently — the task is already ``in_progress`` here, so
+    its ``up_for_grabs → claimed → in_progress`` hops no-op); the worker only
+    heartbeats and reports the verdict. It enqueues only ``work.*`` items on accept
+    — never another ``feature_request`` — so intake cannot loop.
+    """
+    heartbeat(conn, task.id, worker_id)
+    result = run_triage(conn, task, sink, worker_id=worker_id)
+    return RunResult(
+        task_id=str(task.id),
+        task_type=task.type,
+        kind="triage",
+        outcome=("blocked" if result.decision == STATUS_ESCALATED else "done"),
+        detail=f"request {result.decision} ({result.work_item_count} work item(s))",
+    )
+
+
 def run_once(
     conn: Any,
     worker_id: str,
@@ -995,6 +1033,7 @@ def run_once(
     run_failure_analysis: Callable[..., Any] = run_failure_analysis_default,
     run_curator: Callable[..., Any] = run_curator_default,
     run_skill_lifecycle: Callable[..., Any] = run_skill_lifecycle_default,
+    run_triage: Callable[..., Any] = triage_request,
     resolve_config: Callable[[Optional[str]], Optional[WorkstreamConfig]] = resolve_workstream_config,
     resolve_intensity: IntensityResolver = _resolve_intensity_default,
 ) -> Optional[RunResult]:
@@ -1159,6 +1198,19 @@ def run_once(
             registry=registry, config=eff_config, model_registry=model_registry,
             heartbeat=heartbeat, complete=complete, worker_id=worker_id,
             run_review=run_review, skills=eff_skills,
+        )
+
+    if task.type == FEATURE_REQUEST_TYPE:
+        # A cross-workstream request filed onto this workstream's board (ADR-0018):
+        # route it to the receiving PM's intake (pm.triage_request), which decides
+        # accept/decline/clarify/escalate through its own success lens and drives the
+        # request task to a legal terminal/next state. Without this branch it fell to
+        # the "unknown task type" arm below and was ABANDONED. triage_request owns all
+        # transitions + request.* events and enqueues only up_for_grabs work.* items on
+        # accept — never another feature_request — so intake cannot loop.
+        return _handle_feature_request(
+            conn, task, sink,
+            heartbeat=heartbeat, worker_id=worker_id, run_triage=run_triage,
         )
 
     if task.type in CODE_TASK_TYPES:

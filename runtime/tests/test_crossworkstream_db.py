@@ -56,6 +56,9 @@ from runtime.events import read_events
 from runtime.migrate import migrate
 from runtime.models import Task, TaskStatus
 from runtime.roles.pm import triage_request
+from runtime.tasks import enqueue_task
+from runtime.tools import ToolRegistry
+from runtime.worker import run_once
 
 # --- distinctive secret bodies used to prove events never leak them ----------
 SECRET_PROBLEM = "SECRET-PROBLEM-xyzzy-do-not-leak"
@@ -319,6 +322,79 @@ def test_requester_observes_outcome_via_events(conn, wss):
     assert EVENT_REQUEST_ACCEPTED in seen
     # Every request.* event names the requester so it can filter its own stream.
     assert all(e.payload.get("from_workstream") == from_ws for e in events)
+
+
+# --- worker dispatch (the landmine: feature_request must be TRIAGED, not dropped)
+
+
+@pytestmark_db
+def test_unknown_task_type_is_abandoned(conn, wss):
+    """BEFORE-repro: the `run_once` "unknown task type" arm abandons the task.
+
+    This is the exact failure mode `feature_request` hit before it was wired: a
+    generic worker claimed it, `run_once` had no dispatch branch, so it fell to
+    this arm → RunResult(kind="unknown", outcome="failed") and the task ABANDONED
+    with `{"error": "no handler for task type ..."}`. This documents the arm so a
+    regression that un-wires `feature_request` reproduces it.
+    """
+    _from_ws, to_ws = wss
+    bogus = enqueue_task(conn, workstream=to_ws, type="bogus.unhandled", payload={})
+    conn.commit()
+
+    r = run_once(conn, "w-unknown", DbEventSink(conn),
+                 registry=ToolRegistry(), workstream=to_ws)
+    assert r is not None
+    assert r.kind == "unknown"
+    assert r.outcome == "failed"
+    assert _status(conn, bogus.id) == "abandoned"
+    with conn.cursor() as cur:
+        cur.execute("SELECT result FROM tasks WHERE id = %s", (bogus.id,))
+        result = cur.fetchone()["result"]
+    conn.commit()
+    assert "no handler for task type" in result["error"]
+
+
+@pytestmark_db
+def test_feature_request_dispatched_through_worker_is_triaged(conn, wss):
+    """AFTER: a submitted `feature_request` claimed by a worker is TRIAGED.
+
+    The landmine: `submit_request` enqueues an `up_for_grabs` `feature_request`
+    task, but `worker.run_once` had no dispatch branch for it, so a generic worker
+    claiming it fell to the "unknown task type" arm (see
+    `test_unknown_task_type_is_abandoned`) and ABANDONED it — the intended handler
+    `pm.triage_request` was never reached outside tests. With the dispatch branch
+    the worker routes it to `triage_request`, which (keyless default lens) ACCEPTS
+    a well-specified request: decomposes it into `up_for_grabs` work items and
+    drives the request task to `merged` — NOT abandoned.
+    """
+    from_ws, to_ws = wss
+    task = submit_request(conn, request=_make_request(from_ws, to_ws),
+                          sink=DbEventSink(conn))
+    conn.commit()
+    assert task.status is TaskStatus.UP_FOR_GRABS
+
+    before_work = _work_count(conn, to_ws)
+    r = run_once(conn, "pm-w", DbEventSink(conn),
+                 registry=ToolRegistry(), workstream=to_ws)
+
+    # The worker claimed + triaged it (NOT the unknown/failed arm).
+    assert r is not None
+    assert r.kind == "triage"
+    assert r.outcome == "done"
+    assert r.task_id == str(task.id)
+
+    # The request task reached a legal TERMINAL state (merged), NOT abandoned.
+    assert _status(conn, task.id) == "merged"
+    assert _status(conn, task.id) != "abandoned"
+    assert request_status(get_request(conn, task.id)) == STATUS_ACCEPTED
+
+    # Triage did its job: it decomposed the request into up_for_grabs work items
+    # (one per success criterion) and emitted the request.* decision events.
+    assert _work_count(conn, to_ws) == before_work + 2
+    types = [e.type for e in read_events(conn, task_id=task.id)]
+    assert EVENT_REQUEST_UNDER_REVIEW in types
+    assert EVENT_REQUEST_ACCEPTED in types
+    _no_bodies_leaked(conn, task.id)
 
 
 def _work_count(conn, workstream: str) -> int:
