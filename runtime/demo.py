@@ -47,6 +47,140 @@ from .tasks import enqueue_task
 from .worker import build_registry, run_once
 
 
+#: The exact workstreams THIS demo run creates. Populated by :func:`_new_ws` and
+#: wiped by :func:`_cleanup_workstreams` in ``main()``'s finally, so the demo is a
+#: valid go-live smoke test that leaves NO residue in ANY database — including the
+#: LIVE studio DB (ADR-0029). We delete ONLY these exact strings, never a pattern.
+_created_workstreams: list[str] = []
+
+#: Exact ``approvals.id`` values the demo creates whose row is NOT reachable from a
+#: demo task via ``task_id`` — the experiment ``experiment.scale`` approval
+#: (``task_id IS NULL``) and the reviewer ``review`` approval (whose ``task_id``
+#: points at a synthetic Task that was never INSERTed into ``tasks``). Tracked as
+#: they are created so cleanup can delete them by exact id (no LIKE, no global).
+_created_approval_ids: list[str] = []
+
+#: Exact ``search_cache`` primary keys (``query_hash``, ``provider``, ``k``) the
+#: demo's researcher step caches. Captured by a tight before/after diff around that
+#: one synchronous step, so we delete precisely the cache rows the demo created.
+_created_search_cache_keys: list[tuple[str, str, int]] = []
+
+
+def _new_ws(prefix: str) -> str:
+    """Mint a demo workstream and RECORD it for scoped self-cleanup (ADR-0029)."""
+    ws = f"{prefix}-{uuid4().hex[:8]}"
+    _created_workstreams.append(ws)
+    return ws
+
+
+def _track_approval(approval_id) -> None:
+    """Record an approval id the demo created (parentless rows cleanup can't reach)."""
+    if approval_id:
+        _created_approval_ids.append(str(approval_id))
+
+
+def _approval_ids(conn) -> set[str]:
+    """Snapshot the current set of ``approvals.id`` values (as text)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id::text AS id FROM approvals")
+        ids = {r["id"] for r in cur.fetchall()}
+    if not conn.autocommit:
+        conn.commit()
+    return ids
+
+
+def _search_cache_keys(conn) -> set[tuple[str, str, int]]:
+    """Snapshot the current set of ``search_cache`` primary keys."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT query_hash, provider, k FROM search_cache")
+        keys = {(r["query_hash"], r["provider"], int(r["k"])) for r in cur.fetchall()}
+    if not conn.autocommit:
+        conn.commit()
+    return keys
+
+
+def _cleanup_workstreams(
+    conn,
+    workstreams: list[str],
+    *,
+    approval_ids: "list[str] | tuple[str, ...]" = (),
+    search_cache_keys: "list[tuple[str, str, int]] | tuple" = (),
+) -> int:
+    """Delete every row the demo created, scoped to its OWN exact rows.
+
+    Deletes, in FK-safe order:
+
+    1. ``spokesman_handoffs`` for the demo's workstreams FIRST — its ``approval_id``
+       references ``approvals`` (``NO ACTION``), so it must go before approvals.
+    2. ``task_transitions`` tied to the demo's tasks (FK → ``tasks``).
+    3. ``approvals`` reachable via a demo task's ``task_id`` **and** the exact
+       ``approval_ids`` the demo created directly (parentless rows: the experiment
+       ``experiment.scale`` with ``task_id IS NULL``, and the reviewer ``review``
+       whose ``task_id`` was never inserted).
+    4. ``search_cache`` rows the demo cached, by exact (``query_hash``,``provider``,
+       ``k``) key.
+    5. Every remaining ``workstream``-scoped table by exact workstream, with
+       ``tasks`` LAST (so FK-referencing rows are already gone; ``trajectory_steps``
+       cascades on the ``trajectories`` delete).
+
+    NEVER a global TRUNCATE/DELETE and never a LIKE pattern — only the exact
+    workstreams / ids / cache keys the demo itself created.
+    """
+    if not workstreams:
+        return 0
+    deleted = 0
+    demo_tasks = "SELECT id FROM tasks WHERE workstream = ANY(%s)"
+
+    def _run(cur, sql, params) -> None:
+        nonlocal deleted
+        cur.execute(sql, params)
+        if cur.rowcount and cur.rowcount > 0:
+            deleted += cur.rowcount
+
+    with conn.cursor() as cur:
+        # Discover workstream-scoped tables (future-proof as migrations are added).
+        cur.execute(
+            "SELECT table_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND column_name = 'workstream'"
+        )
+        ws_tables = [r["table_name"] for r in cur.fetchall()]
+
+        # 1. spokesman_handoffs first (its approval_id → approvals is NO ACTION).
+        if "spokesman_handoffs" in ws_tables:
+            _run(cur, "DELETE FROM spokesman_handoffs WHERE workstream = ANY(%s)",
+                 (workstreams,))
+
+        # 2. task_transitions (FK → tasks) — before the tasks delete.
+        _run(cur, f"DELETE FROM task_transitions WHERE task_id IN ({demo_tasks})",
+             (workstreams,))
+
+        # 3. approvals: reachable-via-demo-task OR an exact id the demo created.
+        _run(
+            cur,
+            f"DELETE FROM approvals WHERE task_id IN ({demo_tasks}) "
+            "OR id::text = ANY(%s)",
+            (workstreams, [str(a) for a in approval_ids]),
+        )
+
+        # 4. search_cache rows the demo cached, by exact composite key.
+        for qh, provider, k in search_cache_keys:
+            _run(cur,
+                 "DELETE FROM search_cache WHERE query_hash = %s AND provider = %s "
+                 "AND k = %s",
+                 (qh, provider, k))
+
+        # 5. Remaining workstream-scoped tables, ``tasks`` LAST (FK targets).
+        remaining = [t for t in ws_tables
+                     if t not in ("tasks", "spokesman_handoffs")]
+        ordered = remaining + (["tasks"] if "tasks" in ws_tables else [])
+        for table in ordered:
+            _run(cur, f"DELETE FROM {table} WHERE workstream = ANY(%s)",
+                 (workstreams,))
+    if not conn.autocommit:
+        conn.commit()
+    return deleted
+
+
 def _count_work_tasks(conn, workstream: str) -> int:
     """How many ``work.*`` tasks the PM enqueued for this workstream (decomposition)."""
     with conn.cursor() as cur:
@@ -84,7 +218,7 @@ def _demonstrate_learning(conn, registry, config, worker_id: str) -> bool:
     """Show the learning loop end-to-end: a work task fails → Retro distills a
     lesson into Knowledge memory → the NEXT PM prompt for that workstream is shown
     to INCLUDE the recalled lesson (deterministic apply-the-lesson step)."""
-    ws = f"learn-{uuid4().hex[:8]}"
+    ws = _new_ws("learn")
     sink = DbEventSink(conn)
     query = "work.demo verification success criterion marker"
     base = _PM_BASE_PROMPT.format(goal="prove the studio learns")
@@ -149,7 +283,7 @@ def _demonstrate_review(conn, registry, config, scratch: str) -> bool:
     clean episode and FLAGS a hallucinated-success one (a done/verified CLAIM whose
     real artifact lacks the marker) — escalating with 🚨 review.alarm + a 🛑 approval.
     The verdict rests on the ACTUAL artifact evidence, never a claim (ADR-0014)."""
-    ws = f"review-{uuid4().hex[:8]}"
+    ws = _new_ws("review")
     sink = DbEventSink(conn)
     print(f"\n=== reviewer / whistle-blower demo (workstream={ws}) ===")
 
@@ -180,6 +314,9 @@ def _demonstrate_review(conn, registry, config, scratch: str) -> bool:
     flagged = run_review(conn, _review_task(ws, bad_id, artifact_path=bad_path,
                                             marker=bad_marker, scratch=scratch),
                          sink, registry=registry, config=config)
+    # The reviewer's 🛑 approval targets a synthetic Task never inserted into
+    # ``tasks``, so cleanup can't reach it by task_id — track its exact id.
+    _track_approval(flagged.approval_id)
     esc = " 🚨 alarm + 🛑 approval raised" if flagged.severity == "high" else ""
     print(f"  hallucinated:   review {'FLAGGED' if not flagged.ok else 'PASSED'} "
           f"(severity={flagged.severity}, {len(flagged.reasons)} signal(s)){esc}")
@@ -195,14 +332,19 @@ def _demonstrate_research(conn, registry, config, worker_id: str) -> bool:
     → search runs through the policy-gated cached gateway (net.fetch, keyless
     dry-run) → findings are distilled into recallable Knowledge lessons. The
     research task enqueues NOTHING (no research-loop)."""
-    ws = f"research-{uuid4().hex[:8]}"
+    ws = _new_ws("research")
     sink = DbEventSink(conn)
     print(f"\n=== researcher demo (workstream={ws}) ===")
 
     before = len(recall_lessons(conn, ws, "best practice", k=5, include_global=False))
     enqueue_task(conn, workstream=ws, type=RESEARCH_TASK_TYPE,
                  payload={"topic": f"best practices for LLM agent tool use {ws}"})
+    # The researcher's search is the ONLY step that writes the global (workstream-less)
+    # search_cache; snapshot its keys tightly around this synchronous call so cleanup
+    # deletes exactly the cache rows the demo created (ADR-0029 zero-residue promise).
+    _cache_before = _search_cache_keys(conn)
     r = run_once(conn, worker_id, sink, registry=registry, config=config, workstream=ws)
+    _created_search_cache_keys.extend(_search_cache_keys(conn) - _cache_before)
     print(f"  worker (research): {r.kind} {r.outcome} — {r.detail}" if r else "  worker: nothing claimed")
 
     after = recall_lessons(conn, ws, "best practices LLM agent tool use", k=5,
@@ -227,7 +369,7 @@ def _demonstrate_critic(conn, skills) -> bool:
     consensus and decomposes; (2) on an unresolved genuine disagreement the loop is
     BOUNDED and escalates a 🛑 pushback to the stakeholder (never an infinite loop).
     Distinct from the after-the-fact Reviewer: it critiques BEFORE commitment."""
-    ws = f"critic-{uuid4().hex[:8]}"
+    ws = _new_ws("critic")
     sink = DbEventSink(conn)
     print(f"\n=== critic / PM↔Critic consensus demo (workstream={ws}) ===")
 
@@ -253,6 +395,9 @@ def _demonstrate_critic(conn, skills) -> bool:
                             payload={"goal": "ship despite a fundamental objection"})
     escalated = run_pm_tick(conn, esc_task, sink, skills=skills,
                             critic=stubborn, critic_rounds=2)
+    # This approval's task_id IS a demo task (cleanup reaches it via task_id), but
+    # track the id too so cleanup is robust regardless of how it was linked.
+    _track_approval(escalated.approval_id)
     print(f"  escalation: PM decision={escalated.decision!r} "
           f"(🛑 approval raised={bool(escalated.approval_id)})")
 
@@ -269,8 +414,8 @@ def _demonstrate_workstream_config(conn, scratch: str) -> bool:
     from .workstream import bootstrap_workstream, resolve_workstream_config
     from .worker import run_once
 
-    ws = f"vconfig-{uuid4().hex[:8]}"
-    other = f"vother-{uuid4().hex[:8]}"
+    ws = _new_ws("vconfig")
+    other = _new_ws("vother")
     base_dir = Path(tempfile.mkdtemp(prefix="ai_studio_ws_"))
     (base_dir / ws).mkdir()
     (base_dir / ws / "config.yaml").write_text(
@@ -374,7 +519,7 @@ def _demonstrate_failure_analyst(conn, scratch: str) -> bool:
     )
     from .tools import FilesystemTool, ToolRegistry
 
-    ws = f"fail-{uuid4().hex[:8]}"
+    ws = _new_ws("fail")
     sink = DbEventSink(conn)
     reg = ToolRegistry()
     reg.register(FilesystemTool(root=scratch))
@@ -428,8 +573,15 @@ def _demonstrate_failure_analyst(conn, scratch: str) -> bool:
             workstream=ws, type="model.call.failed",
             payload={"error_type": "RateLimitError", "model": "m", "provider": "p",
                      "role": "executor", "task_type": "work"}))
+    # A scaled experiment raises a red ``experiment.scale`` approval with
+    # ``task_id IS NULL`` (surfaced only via the event payload, not the return
+    # value) — snapshot approval ids tightly around this synchronous call so we
+    # track its exact id and cleanup can delete it (ADR-0029 zero residue).
+    _appr_before = _approval_ids(conn)
     exp = observe_and_evaluate_fix(conn, fix.experiment_id, sink=sink,
                                    workstream=ws, since_seq=cursor)
+    for aid in (_approval_ids(conn) - _appr_before):
+        _track_approval(aid)
     effective = exp.status in (ExperimentStatus.KEPT, ExperimentStatus.SCALED)
     print(f"  post-fix traffic: observed rate={exp.observed_value} → experiment "
           f"{exp.status.value} (fix {'CONFIRMED effective' if effective else 'ineffective'})")
@@ -451,7 +603,7 @@ def _demonstrate_curator(conn, scratch: str) -> bool:
     from .tools import FilesystemTool, ToolRegistry
     from .trajectory import add_step, close_trajectory, start_trajectory
 
-    ws = f"curate-{uuid4().hex[:8]}"
+    ws = _new_ws("curate")
     sink = DbEventSink(conn)
     reg = ToolRegistry()
     reg.register(FilesystemTool(root=scratch))
@@ -516,6 +668,10 @@ def _demonstrate_curator(conn, scratch: str) -> bool:
 def main() -> int:
     # Keyless by construction — dry-run every model call.
     os.environ.setdefault("MODELS_DRY_RUN", "1")
+    # Fresh ledger of this run's own rows (for scoped self-cleanup).
+    _created_workstreams.clear()
+    _created_approval_ids.clear()
+    _created_search_cache_keys.clear()
 
     if not db.can_connect(timeout=2.0):
         print(
@@ -526,7 +682,7 @@ def main() -> int:
         )
         return 0
 
-    workstream = f"demo-{uuid4().hex[:8]}"
+    workstream = _new_ws("demo")
     scratch = tempfile.mkdtemp(prefix="ai_studio_demo_")
     registry = build_registry(scratch)
     config = load_policy()
@@ -602,6 +758,21 @@ def main() -> int:
 
         return 0 if (ok and learned and reviewed and researched and configured and critiqued and healed and curated) else 1
     finally:
+        # Self-cleanup (ADR-0029): leave NO residue in ANY database — including the
+        # LIVE studio DB — so `python -m runtime.demo` stays a safe go-live smoke
+        # test. Scoped to the demo's OWN exact workstreams; guarded so a cleanup
+        # hiccup never crashes the run or flips the exit code.
+        try:
+            removed = _cleanup_workstreams(
+                conn, list(_created_workstreams),
+                approval_ids=list(_created_approval_ids),
+                search_cache_keys=list(_created_search_cache_keys),
+            )
+            print(f"runtime.demo: self-cleanup removed {removed} row(s) across "
+                  f"{len(_created_workstreams)} demo workstream(s) — no residue left")
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the demo result
+            print(f"runtime.demo: WARNING self-cleanup failed ({type(exc).__name__}: "
+                  f"{exc}); demo's synthetic workstreams may remain")
         conn.close()
 
 

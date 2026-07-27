@@ -35,3 +35,4 @@ these for detail; this file is the index.
 | [0026](0026-spokesman-conversational-interface.md) | Spokesman conversational interface | Full human↔studio NL loop; goals → `pm.tick` via queue; prep cache; approval-gated handoffs. |
 | [0027](0027-build-vs-buy-agile-adoption.md) | Build vs. buy/borrow + agile adoption | PM operating principle (not a cron): weigh building in-house vs adopting a mature component; stay agile on better paradigms without churn. |
 | [0028](0028-remote-task-access-gateway.md) | Non-LAN remote task access | Remote sessions get a scoped, token-gated task-verb API over the tunnel — never a DB credential; Postgres stays loopback/LAN-only. |
+| [0029](0029-disposable-db-test-guard.md) | Keep the live DB sacred | DB-backed tests skip unless the target DB is disposable (`AI_STUDIO_TEST_DB` opt-in or `*_test` name); `runtime.demo` self-cleans its own workstreams. |
