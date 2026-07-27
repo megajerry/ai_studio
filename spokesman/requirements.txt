@@ -2,6 +2,7 @@ fastapi>=0.111,<1.0
 uvicorn[standard]>=0.30,<1.0
 httpx>=0.27,<1.0
 pydantic>=2.7,<3.0
+python-multipart>=0.0.9,<1.0
 # Runtime bridge (spokesman/runtime_bridge.py) reads/acts on the runtime
 # Postgres via the runtime package (events / approvals / tasks). Same pin as
 # runtime/requirements.txt. The dry-run send path needs no live WhatsApp creds,

@@ -31,3 +31,5 @@ these for detail; this file is the index.
 | [0022](0022-capacity-governance.md) | Graduated capacity governance | Budget zones (warn → throttle → reserve → hard-stop) + reserve buffer + burn-rate projection; optional Capacity Steward. |
 | [0023](0023-graduated-recovery.md) | Graduated, progress-aware recovery ladder | Supervisor recovery ladder (nudge → re-kick → escalate → re-decompose → abandon) + a failure-pattern analyst. |
 | [0024](0024-skill-induction.md) | Skill induction | Measure-first efficacy + a review-gated Curator that induces reusable skills from recurring, mature trajectories. |
+| [0025](0025-async-decisions.md) | Async open-ended decisions | Park → free worker → resume on free-text/option answers (open-ended sibling of approvals). |
+| [0026](0026-spokesman-conversational-interface.md) | Spokesman conversational interface | Full human↔studio NL loop; goals → `pm.tick` via queue; prep cache; approval-gated handoffs. |

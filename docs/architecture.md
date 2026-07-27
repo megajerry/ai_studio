@@ -277,9 +277,13 @@ in here if/when the supervisor path outgrows itself.
 ## 9. Stakeholder communication (the Spokesman)
 
 The stakeholder spends **< 4 hrs/day** on the project, so upward comms must be
-**high-signal and aggregated**. A **Spokesman** service aggregates all-workstream
-state from the event log and is the human interface
-([ADR-0006](decisions/0006-stakeholder-comms.md)).
+**high-signal and aggregated**. A **Spokesman** service is the **sole default
+human interface** to the whole studio
+([ADR-0006](decisions/0006-stakeholder-comms.md),
+[ADR-0026](decisions/0026-spokesman-conversational-interface.md)): it aggregates
+all-workstream state, answers natural-language questions from grounded studio
+state, routes requirements into the task queue (e.g. `pm.tick` with a goal —
+never a direct agent call), and anticipates likely asks via a prep cache.
 
 | Class | What | Behavior |
 | --- | --- | --- |
@@ -289,9 +293,11 @@ state from the event log and is the human interface
 
 Channels ([ADR-0006](decisions/0006-stakeholder-comms.md)): **both** a
 local-hosted **dashboard** (deep, full-state console; remote via tunnel) and
-**WhatsApp** (live push + quick approvals). The Spokesman posts 🛑/🚨 to WhatsApp
-and maintains the dashboard; stakeholder replies re-enter the system as events/
-tasks.
+messaging (**WhatsApp** / **SMS**) plus a token-gated **web chat** fallback.
+The Spokesman posts 🛑/🚨 on the live channel and maintains the dashboard;
+inbound free text is classified (question → answer; requirement → enqueue;
+rare specialist handoff → human-approved relay as `[Role]`). Keyword shortcuts
+(`status` / `approve` / `deny` / `decide`) remain a fast path.
 
 ### Grounding & accountability — everything told to the human is verified
 

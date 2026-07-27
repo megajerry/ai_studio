@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from .whatsapp import WhatsAppClient
+from .channel import MessagingClient
 
 Kind = Literal["approve", "inform", "alarm"]
 
@@ -79,7 +79,7 @@ class Notifier:
     ``POST /digest/flush`` endpoint) sends it as a single message.
     """
 
-    def __init__(self, client: WhatsAppClient) -> None:
+    def __init__(self, client: MessagingClient) -> None:
         self._client = client
         self._pending: list[PendingItem] = []
         self._lock = threading.Lock()

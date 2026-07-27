@@ -34,6 +34,8 @@ _OUTPUT_RATIO = 4  # output ~= input // 4
 
 #: Option key the PM sets on a planning call to request a structured plan (above).
 PLAN_GOAL_OPT = "plan_goal"
+#: Option key Spokesman sets so dry-run returns a parseable agent turn (ADR-0026).
+SPOKESMAN_USER_OPT = "spokesman_user"
 
 
 def _goal_digest(goal: str) -> str:
@@ -116,6 +118,33 @@ class DryRunProvider:
                 model_id=model_id,
                 provider=self.name,
                 raw={"dry_run": True, "plan": True},
+            )
+
+        # Spokesman agent turn → deterministic JSON the converse loop can parse
+        # (model-first; tools optional). Lazy import avoids a dryrun↔spokesman cycle
+        # at module load.
+        spokesman_user = opts.get(SPOKESMAN_USER_OPT)
+        if isinstance(spokesman_user, str) and spokesman_user.strip():
+            from spokesman.converse import build_dry_run_spokesman_turn
+
+            msgs = opts.get("spokesman_messages")
+            if not isinstance(msgs, list):
+                msgs = messages
+            text = json.dumps(
+                build_dry_run_spokesman_turn(spokesman_user, messages=msgs)
+            )
+            input_tokens = max(1, messages_char_len(messages) // _CHARS_PER_TOKEN)
+            output_tokens = max(1, len(text) // _CHARS_PER_TOKEN)
+            return Completion(
+                text=text,
+                usage=Usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=0,
+                ),
+                model_id=model_id,
+                provider=self.name,
+                raw={"dry_run": True, "spokesman": True},
             )
 
         chars = messages_char_len(messages)

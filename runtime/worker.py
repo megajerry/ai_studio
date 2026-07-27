@@ -107,6 +107,9 @@ from .tools import CodingTool, FilesystemTool, ShellTool, ToolRegistry
 
 log = logging.getLogger("runtime.worker")
 
+#: ADR-0026 — Spokesman anticipatory prep (high-priority context refresh).
+SPOKESMAN_PREP_TYPE = "spokesman.prep"
+
 #: Orchestration event types (canonical definitions in runtime.event_types):
 #: ``EVENT_WORK_RETRY`` (re-enqueue after a verify fail), ``EVENT_RETRO_TRIGGERED``
 #: / ``EVENT_REVIEW_TRIGGERED`` (enqueued after a terminal work task), and
@@ -1037,6 +1040,20 @@ def run_once(
             skills=eff_skills,
             charter=(wcfg.charter if wcfg else None),
             overlay=(wcfg.overlay_for("pm") if wcfg else None),
+        )
+
+    if task.type == SPOKESMAN_PREP_TYPE:
+        from spokesman.converse import run_prep_task
+
+        heartbeat(conn, task.id, worker_id)
+        result = run_prep_task(conn, task, sink)
+        complete(conn, task.id, result=result, status=TaskStatus.MERGED)
+        return RunResult(
+            task_id=str(task.id),
+            task_type=task.type,
+            kind="spokesman_prep",
+            outcome="done",
+            detail=f"prep refreshed ({result.get('n_questions', 0)} question(s))",
         )
 
     if task.type == REPLAN_TASK_TYPE:

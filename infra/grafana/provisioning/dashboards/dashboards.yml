@@ -1,0 +1,14 @@
+# Auto-load JSON dashboards from ./json on Grafana boot.
+apiVersion: 1
+
+providers:
+  - name: ai-studio
+    orgId: 1
+    folder: AI Studio
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+      foldersFromFilesStructure: false

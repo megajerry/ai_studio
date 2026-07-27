@@ -141,6 +141,10 @@ routing:
       high: pm
       standard: pm
       low: mid
+    converse:            # Spokesman human dialogue (ADR-0026) — natural language first.
+      high: mid
+      standard: mid
+      low: cheap
     code:                # one-shot coding — quality/reliability first (NOT the Cursor
       high: pm           # harness). Frontier one-shot coding -> Opus (fast, reliable).
       standard: mid
