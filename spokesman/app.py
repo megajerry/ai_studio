@@ -29,16 +29,26 @@ import logging
 from typing import Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 
 from runtime.grounding import Claim
 
+from .channel import (
+    CHANNEL_TWILIO_SMS,
+    CHANNEL_WHATSAPP,
+    MessagingClient,
+    build_messaging_client,
+)
+from .chat import CaptureClient, render_chat
 from .classify import Notifier, NotifyKind
 from .config import Settings, get_settings
+from .dashboard import render_dashboard
 from .grounding_gate import relay_claims
+from .privacy import render_privacy_policy
 from .runtime_bridge import (
     answer,
+    dashboard_snapshot,
     load_cursor,
     poll_notifications,
     resolve,
@@ -52,7 +62,9 @@ from .state import (
     record_inbound,
     status_summary,
 )
-from .whatsapp import WhatsAppClient, verify_signature
+from .terms import render_terms
+from .twilio_sms import iter_twilio_inbound, verify_twilio_signature
+from .whatsapp import verify_signature
 
 logger = logging.getLogger("spokesman.app")
 
@@ -102,6 +114,11 @@ class NotifyRequest(BaseModel):
         return v.strip().lower()
 
 
+class ChatMessage(BaseModel):
+    """One web-chat inbound line from the stakeholder."""
+
+    text: str = Field(..., min_length=1, max_length=4000)
+
 def run_notifier_pass(
     settings: Settings,
     notifier: Notifier,
@@ -143,7 +160,7 @@ def run_notifier_pass(
 
 def handle_inbound_command(
     settings: Settings,
-    client: WhatsAppClient,
+    client: MessagingClient,
     connect: ConnectFn,
     msg: InboundMessage,
 ) -> Optional[dict]:
@@ -157,13 +174,14 @@ def handle_inbound_command(
 
     A reply is always sent for a recognized command (so the stakeholder gets
     confirmation); unrecognized text is ignored (returns ``None``). The webhook's
-    HMAC gate already authenticated the sender, so no extra auth here.
+    signature gate already authenticated the sender, so no extra auth here.
     """
     parts = msg.text.strip().split()
     if not parts:
         return None
     verb = parts[0].lower()
     to = msg.sender or None
+    channel_tag = settings.channel
 
     if verb == STATUS_KEYWORD:
         try:
@@ -183,7 +201,7 @@ def handle_inbound_command(
             client.send_text(f"Usage: {verb} <approval-id>", to=to)
             return {"command": verb, "ok": False, "error": "missing id"}
         approval_id = parts[1]
-        resolver = f"whatsapp:{mask_number(msg.sender)}"
+        resolver = f"{channel_tag}:{mask_number(msg.sender)}"
         try:
             conn = connect()
             try:
@@ -214,7 +232,7 @@ def handle_inbound_command(
             return {"command": _DECIDE_VERB, "ok": False, "error": "missing id/answer"}
         decision_id = parts[1]
         answer_text = msg.text.strip().split(None, 2)[2]
-        resolver = f"whatsapp:{mask_number(msg.sender)}"
+        resolver = f"{channel_tag}:{mask_number(msg.sender)}"
         try:
             conn = connect()
             try:
@@ -259,10 +277,10 @@ def create_app(
     """
     settings = settings or get_settings()
     connect = connect or _default_connect
-    client = WhatsAppClient(settings)
+    client = build_messaging_client(settings)
     notifier = Notifier(client)
 
-    app = FastAPI(title="AI Studio Spokesman", version="0.1.0")
+    app = FastAPI(title="AI Studio Spokesman", version="0.2.0")
     app.state.settings = settings
     app.state.client = client
     app.state.notifier = notifier
@@ -283,13 +301,107 @@ def create_app(
         ):
             raise HTTPException(status_code=401, detail="invalid or missing token")
 
+    def require_dashboard_token(
+        token: str | None = None,
+        x_spokesman_token: str | None = Header(default=None),
+    ) -> None:
+        """Gate the HTML dashboard. Accepts ``?token=`` (mobile-friendly) or header."""
+        expected = settings.api_token
+        provided = x_spokesman_token or token
+        if not expected or not provided or not hmac.compare_digest(provided, expected):
+            raise HTTPException(status_code=401, detail="invalid or missing token")
+
     @app.get("/health")
     def health() -> dict:
         return {
             "status": "ok",
             "dry_run": settings.dry_run,
+            "channel": settings.channel,
             "pending_digest": notifier.pending_count,
         }
+
+    @app.get("/privacy", response_class=HTMLResponse)
+    def privacy() -> HTMLResponse:
+        """Public Privacy Policy URL for Twilio / messaging provider consoles."""
+        return HTMLResponse(render_privacy_policy())
+
+    @app.get("/terms", response_class=HTMLResponse)
+    def terms() -> HTMLResponse:
+        """Public Terms of Service URL for Twilio / messaging provider consoles."""
+        return HTMLResponse(render_terms())
+
+    @app.get("/", response_class=HTMLResponse)
+    @app.get("/chat", response_class=HTMLResponse)
+    def chat(
+        token: str | None = None,
+        x_spokesman_token: str | None = Header(default=None),
+    ) -> HTMLResponse:
+        """Stakeholder web chat — fallback when SMS/WhatsApp is unavailable."""
+        require_dashboard_token(token=token, x_spokesman_token=x_spokesman_token)
+        # Prefer query token so the page can call the API without a header UI.
+        page_token = token or x_spokesman_token or ""
+        return HTMLResponse(
+            render_chat(
+                channel=settings.channel,
+                dry_run=settings.dry_run,
+                token=page_token,
+            )
+        )
+
+    @app.post("/chat/message")
+    def chat_message(
+        body: ChatMessage,
+        token: str | None = None,
+        x_spokesman_token: str | None = Header(default=None),
+    ) -> dict:
+        """Run one inbound command and return Spokesman replies as JSON."""
+        require_dashboard_token(token=token, x_spokesman_token=x_spokesman_token)
+        capture = CaptureClient(inner=None)  # web-only; SMS may be broken
+        msg = InboundMessage(
+            message_id="web-chat",
+            sender=settings.stakeholder_number or "web",
+            text=body.text.strip(),
+            timestamp="",
+        )
+        record_inbound(settings, [msg], channel="web")
+        result = handle_inbound_command(settings, capture, connect, msg)
+        if result is None:
+            return {
+                "ok": False,
+                "replies": [],
+                "note": "Unknown command. Try: status · approve <id> · deny <id>",
+            }
+        return {"ok": True, "replies": capture.replies, "result": result}
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard(
+        token: str | None = None,
+        x_spokesman_token: str | None = Header(default=None),
+    ) -> HTMLResponse:
+        """Stakeholder task/agent stats page (ADR-0006 dashboard channel)."""
+        require_dashboard_token(token=token, x_spokesman_token=x_spokesman_token)
+        try:
+            conn = connect()
+        except Exception:  # noqa: BLE001 - degrade to an empty-ish page, don't crash
+            logger.warning("/dashboard: runtime DB unreachable")
+            body = (
+                "<!doctype html><meta name='viewport' content='width=device-width,"
+                "initial-scale=1'><title>AI Studio</title>"
+                "<body style='font-family:system-ui;padding:1rem'>"
+                "<h1>AI Studio</h1><p>Runtime DB unreachable.</p></body>"
+            )
+            return HTMLResponse(body, status_code=503)
+        try:
+            snap = dashboard_snapshot(conn)
+            return HTMLResponse(
+                render_dashboard(
+                    snap,
+                    dry_run=settings.dry_run,
+                    token=token or x_spokesman_token,
+                )
+            )
+        finally:
+            _close(conn)
 
     # Meta sends hub.* query params (dots), which are not valid Python
     # identifiers, so we read them off the raw request.
@@ -313,7 +425,32 @@ def create_app(
     async def receive_webhook(
         request: Request,
         x_hub_signature_256: str | None = Header(default=None),
+        x_twilio_signature: str | None = Header(default=None),
     ) -> Response:
+        if settings.channel == CHANNEL_TWILIO_SMS:
+            form = dict(await request.form())
+            form_str = {k: str(v) for k, v in form.items()}
+            public = request.headers.get("x-forwarded-proto")
+            host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+            if public and host:
+                url = f"{public}://{host}{request.url.path}"
+            else:
+                url = str(request.url)
+            if not verify_twilio_signature(
+                auth_token=settings.twilio_auth_token,
+                url=url,
+                params=form_str,
+                signature=x_twilio_signature,
+            ):
+                if not settings.dry_run:
+                    logger.warning("Rejected Twilio webhook: bad signature")
+                    return PlainTextResponse("invalid signature", status_code=403)
+            messages = iter_twilio_inbound(form_str)
+            record_inbound(settings, messages, channel=CHANNEL_TWILIO_SMS)
+            for msg in messages:
+                handle_inbound_command(settings, client, connect, msg)
+            return PlainTextResponse("", status_code=200)
+
         raw_body = await request.body()
         if not verify_signature(raw_body, x_hub_signature_256, settings.app_secret):
             logger.warning("Rejected inbound webhook: bad signature")
@@ -325,7 +462,7 @@ def create_app(
             return JSONResponse({"error": "invalid json"}, status_code=400)
 
         messages = iter_inbound_messages(payload)
-        record_inbound(settings, messages)
+        record_inbound(settings, messages, channel=CHANNEL_WHATSAPP)
 
         replies = 0
         for msg in messages:

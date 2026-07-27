@@ -352,6 +352,101 @@ def studio_status(conn: psycopg.Connection) -> StudioStatus:
     )
 
 
+@dataclass(frozen=True)
+class DashboardSnapshot:
+    """Stakeholder-facing aggregates for the mobile / browser status page.
+
+    Bodies and arg values stay out — ids, counts, statuses, role/agent labels only
+    (CLAUDE.md invariants 5 & 6).
+    """
+
+    status: StudioStatus
+    by_status: dict[str, int]
+    by_agent_type: dict[str, int]
+    by_assignee: dict[str, int]
+    by_workstream: dict[str, int]
+    recent_event_types: dict[str, int]
+    open_trajectories: int
+    closed_trajectories: int
+    pending_approval_ids: list[str]
+
+
+def dashboard_snapshot(conn: psycopg.Connection) -> DashboardSnapshot:
+    """Richer read-only snapshot for the HTML dashboard (extends :func:`studio_status`)."""
+    status = studio_status(conn)
+    by_status: dict[str, int] = {}
+    by_agent_type: dict[str, int] = {}
+    by_assignee: dict[str, int] = {}
+    by_workstream: dict[str, int] = {}
+    recent_event_types: dict[str, int] = {}
+    open_traj = 0
+    closed_traj = 0
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, count(*) AS n FROM tasks GROUP BY status")
+        for row in cur.fetchall():
+            by_status[str(row["status"])] = int(row["n"])
+
+        cur.execute(
+            "SELECT COALESCE(agent_type, '(unclaimed)') AS agent_type, count(*) AS n "
+            "FROM tasks GROUP BY 1 ORDER BY n DESC"
+        )
+        for row in cur.fetchall():
+            by_agent_type[str(row["agent_type"])] = int(row["n"])
+
+        cur.execute(
+            "SELECT COALESCE(assignee, '(any)') AS assignee, count(*) AS n "
+            "FROM tasks GROUP BY 1 ORDER BY n DESC"
+        )
+        for row in cur.fetchall():
+            by_assignee[str(row["assignee"])] = int(row["n"])
+
+        cur.execute(
+            "SELECT workstream, count(*) AS n FROM tasks GROUP BY workstream "
+            "ORDER BY n DESC"
+        )
+        for row in cur.fetchall():
+            by_workstream[str(row["workstream"])] = int(row["n"])
+
+        # Last ~200 events by type — cheap pulse of what the studio has been doing.
+        cur.execute(
+            "SELECT type, count(*) AS n FROM ("
+            "  SELECT type FROM events ORDER BY seq DESC NULLS LAST LIMIT 200"
+            ") recent GROUP BY type ORDER BY n DESC"
+        )
+        for row in cur.fetchall():
+            recent_event_types[str(row["type"])] = int(row["n"])
+
+        # Trajectories table lands with migration 0011; tolerate a fresh DB.
+        cur.execute("SELECT to_regclass('public.trajectories')")
+        if cur.fetchone()["to_regclass"]:
+            cur.execute(
+                "SELECT "
+                "count(*) FILTER (WHERE ended_at IS NULL) AS open, "
+                "count(*) FILTER (WHERE ended_at IS NOT NULL) AS closed "
+                "FROM trajectories"
+            )
+            row = cur.fetchone()
+            open_traj = int(row["open"] or 0)
+            closed_traj = int(row["closed"] or 0)
+
+    if not conn.autocommit:
+        conn.commit()
+
+    pending_ids = [str(a.id) for a in pending_approvals(conn)]
+    return DashboardSnapshot(
+        status=status,
+        by_status=by_status,
+        by_agent_type=by_agent_type,
+        by_assignee=by_assignee,
+        by_workstream=by_workstream,
+        recent_event_types=recent_event_types,
+        open_trajectories=open_traj,
+        closed_trajectories=closed_traj,
+        pending_approval_ids=pending_ids,
+    )
+
+
 # --- resolve ----------------------------------------------------------------
 
 #: Inbound decision words → the runtime's canonical approval status.
