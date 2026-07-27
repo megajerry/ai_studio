@@ -108,23 +108,182 @@ cloudflared tunnel --url http://localhost:8080
 Note the public URL, e.g. `https://spokesman.example.com`. Your webhook URL is
 `https://<public-host>/webhook`.
 
-## 6. Start the service
+## 6. Start — and update — the service
+
+> **TL;DR for updates:** to deploy a fix that was merged to `main`, run these
+> **three** commands, in this order, from the repo root:
+> ```bash
+> git pull                                                       # 0. GET THE MERGED CODE — do this first
+> python -m runtime.migrate                                      # 1. apply new DB migrations
+> docker compose --profile spokesman up -d --build spokesman     # 2. rebuild + recreate (--build is REQUIRED)
+> ```
+> Then verify with §6.3 (is the brain live?) and §6.4 (does it actually converse?).
+> The `--build` flag is **mandatory**. The Spokesman's Python code is baked into
+> the Docker image, so a plain `docker compose restart spokesman` (or `up -d`
+> without `--build`) keeps running the **OLD** code and ignores changes to
+> `docker-compose.yml`. This is the #1 cause of "I pulled the fix but nothing
+> changed."
+
+### 6.1 First start
 
 ```bash
 docker compose --profile spokesman up -d spokesman
-# health check:
-curl -s http://localhost:${SPOKESMAN_PORT:-8080}/health
-# -> {"status":"ok","dry_run":false,"channel":"...","pending_digest":0,
-#     "model":{"task":"converse","provider":"anthropic","model":"claude-sonnet-5","dry_run":false}}
-# (model.dry_run=true + provider "dryrun" means no model key is wired — the brain is a stub.)
 ```
 
 The `spokesman` service is behind a **compose profile**, so a plain
 `docker compose up` (the M0 spine) is unaffected — it starts **only** with
 `--profile spokesman`.
 
+### 6.2 Updating after a code or config change (`git pull`)
+
+Run these **in order**, from the repo root:
+
+```bash
+# 0. Get the merged code FIRST. The steps below act on whatever is checked out —
+#    skip this and you will rebuild the OLD code and think the fix didn't work.
+git checkout main && git pull   # fixes land on main; make sure you're on it
+
+# 1. Apply new DB migrations (idempotent — safe to run repeatedly; no-op if current).
+python -m runtime.migrate            # or: make migrate
+python -m runtime.migrate --status   # optional: lists applied vs pending
+
+# 2. Rebuild + recreate the container. --build is REQUIRED (see the warning above).
+docker compose --profile spokesman up -d --build spokesman
+```
+
+> **Pre-flight if the studio was ever run keyless/dry-run:** make sure
+> `MODELS_DRY_RUN` is **not** set to `1` in `.env` (`grep MODELS_DRY_RUN .env`).
+> That flag **forces the keyword stub even when a real key is present**, so a
+> chat that "won't converse no matter what" is often just this. Absent or `0` is
+> correct.
+
+- **Why `--build`:** the Dockerfile `COPY`s `spokesman/` and `runtime/` *into*
+  the image, and env changes (like the model-key passthroughs added under
+  ADR-0026) only take effect when the container is **recreated**. `restart` does
+  neither — it reruns the old container with the old image and old env.
+- **Why migrate first:** new features can add tables (e.g. cross-turn memory
+  needs `spokesman_conversations`, migration `0018`). The service degrades
+  gracefully if a table is missing, but the feature stays off until migrated.
+
+### 6.3 Verify the brain is actually live — do this after EVERY start
+
+```bash
+curl -s http://localhost:8080/health   # 8080 is the default port
+```
+
+(If you set a non-default `SPOKESMAN_PORT` in `.env`, use that number instead —
+or load `.env` into your shell first with `set -a; source .env; set +a` so
+`${SPOKESMAN_PORT}` resolves.)
+
+Expected when a real model is wired:
+
+```json
+{"status":"ok","dry_run":false,"channel":"...","pending_digest":0,
+ "model":{"task":"converse","provider":"anthropic","model":"claude-sonnet-5","dry_run":false}}
+```
+
+**Read the nested `model` block — it is the one true signal for whether the chat
+can converse:**
+
+- `"provider":"anthropic"` (or `google`/`openai`) **and `"dry_run":false`** →
+  ✅ a real LLM is answering. The chat will hold a conversation.
+- **`"dry_run":true`** with `"provider":"dryrun"` → ❌ the brain is a **keyword
+  stub**: it only pastes status and gives canned deflections, and it CANNOT
+  converse. **Do not report the chat as working.** Fix it via the Troubleshooting
+  section below, then re-check.
+
+> ⚠️ The **top-level** `"dry_run"` field describes the SMS/WhatsApp **channel**,
+> which is *independent* of the model. A `"dry_run":false` (LIVE) channel with a
+> `"model":{"dry_run":true}` brain is the exact silent failure this check exists
+> to catch. **Always read the nested `model.dry_run`, not the top-level one.**
+
 To smoke-test with no Meta credentials, set `SPOKESMAN_DRY_RUN=1` in `.env`
-first; outbound messages are logged rather than sent.
+first; outbound messages are logged rather than sent. (That is the *channel*
+dry-run; it does **not** affect the model.)
+
+### 6.4 Confirm a real back-and-forth conversation (the actual goal)
+
+`/health` (§6.3) proves the brain is *wired*; this proves it actually *converses
+and remembers*. Open the web chat in a browser:
+
+```
+https://<your-public-host>/chat?token=<SPOKESMAN_API_TOKEN>       # locally: http://localhost:8080/chat?token=<SPOKESMAN_API_TOKEN>
+```
+
+`<SPOKESMAN_API_TOKEN>` is the value from `.env` (the same token gates the page);
+grab it with `grep SPOKESMAN_API_TOKEN .env`.
+The header banner should read **`model: LIVE (<model-id>)`** — if it says
+`model: STUB`, stop and go to §6b.
+
+Send these **two messages in sequence** in the same chat window:
+
+1. `My name is Jerry.`
+2. `What is my name?`
+
+✅ **Working:** message 2 is answered **"Your name is Jerry."** (or similar). That
+single test proves BOTH that a real model is answering AND that cross-turn memory
+works.
+❌ **Broken:** message 2 comes back as a canned *"Got it — …"* deflection → the
+brain is a stub (§6b); or it replies *"I don't have your name"* → the model is
+live but memory isn't persisting → confirm migration `0018` was applied (§6.2
+step 1).
+
+**Scripted alternative (no browser)** — the same two turns over the API. The
+shared `session_key` is what links them into one conversation:
+
+```bash
+BASE=http://localhost:8080; TOK=<SPOKESMAN_API_TOKEN>; SID=smoketest-1
+for MSG in "My name is Jerry." "What is my name?"; do
+  curl -s -XPOST "$BASE/chat/message?token=$TOK" -H "X-Spokesman-Token: $TOK" \
+    -H 'content-type: application/json' -d "{\"text\":\"$MSG\",\"session_key\":\"$SID\"}"
+  echo
+done
+# The SECOND response's "replies" should mention "Jerry".
+```
+
+## 6b. Troubleshooting — the chat can't hold a conversation
+
+**Symptom:** the web chat (or WhatsApp) replies with robotic, repetitive text
+such as *"Got it — '&lt;your message&gt;'. I can pull live studio status, queue
+work for the PM, dig deeper, or propose a specialist handoff."*, only responds to
+`status`, or forgets what you told it one message earlier.
+
+**Root cause:** the model is running as the **dry-run keyword stub**, not a real
+LLM. Confirm it with `/health` (§6.3): if `model.dry_run` is `true`, work through
+these **in order** — the first one that applies is usually it:
+
+1. **Is a key in `.env`?** Run `grep ANTHROPIC_API_KEY .env`. It must be present
+   and non-empty. If it's missing, run `./scripts/onboarding.sh` (or add the
+   line), then rebuild with
+   `docker compose --profile spokesman up -d --build spokesman`.
+2. **Did you REBUILD after adding the key?** A container reads its environment
+   only when (re)created. Run
+   `docker compose --profile spokesman up -d --build spokesman` — **not**
+   `restart`. Then re-check `/health`.
+3. **Is the key actually inside the container?** Run:
+   ```bash
+   docker compose exec spokesman printenv | grep -E 'ANTHROPIC_API_KEY|MODELS_DRY_RUN'
+   ```
+   - `ANTHROPIC_API_KEY` empty or absent → the `.env` value isn't reaching the
+     container. Confirm `docker-compose.yml`'s `spokesman:` → `environment:` block
+     lists `ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}` (it does as of ADR-0026),
+     and that you run `docker compose` from the **repo root**, where `.env` lives
+     (Compose auto-reads `./.env` for `${VAR}` substitution).
+   - `MODELS_DRY_RUN=1` present → this **forces** the stub regardless of any key.
+     Set `MODELS_DRY_RUN=0` (or remove it) in `.env` and rebuild.
+4. **Wrong variable name?** The Anthropic adapter reads *exactly*
+   `ANTHROPIC_API_KEY`. A key saved under any other name (e.g. `CLAUDE_API_KEY`)
+   is ignored.
+5. **Still stubbed?** The decision lives in
+   `runtime/model/call.py::select_provider`: it returns the dry-run provider when
+   `MODELS_DRY_RUN` is truthy, when no adapter is wired for the model's provider,
+   or when the adapter's `available()` (for Anthropic: a non-empty
+   `ANTHROPIC_API_KEY`) is false. Trace from there.
+
+**Multi-turn memory (separate from the above):** even with a live model, the chat
+only remembers across turns once migration `0018` (`spokesman_conversations`) is
+applied — run `python -m runtime.migrate`. Without it, the chat still replies but
+treats every message as the first.
 
 ## 7. Register the webhook + subscribe
 

@@ -129,16 +129,27 @@ studio respects it. Nothing runs a vertical until the stakeholder chooses one.
 Opt-in; the M0 spine is unaffected by a plain `docker compose up`.
 
 ```bash
-docker compose --profile spokesman up -d spokesman
+python -m runtime.migrate                                    # apply migrations first (incl. spokesman tables)
+docker compose --profile spokesman up -d --build spokesman   # --build is REQUIRED after any git pull
 ```
 
+**Always use `--build`** when (re)deploying the Spokesman: its code is baked into
+the image, so `restart` / `up -d` without `--build` keeps the OLD code and ignores
+`docker-compose.yml` env changes.
+
 Needs the WhatsApp Meta Cloud API credentials (`WHATSAPP_*`), a chosen
-`WHATSAPP_VERIFY_TOKEN`, the `SPOKESMAN_API_TOKEN`, and a **public webhook
-tunnel** (`TUNNEL_PROVIDER` + e.g. `CLOUDFLARED_TUNNEL_TOKEN`) so Meta can reach
-the inbound webhook. Run with `SPOKESMAN_DRY_RUN=1` to log outbound sends without
-calling WhatsApp. Full setup: [`docs/spokesman-whatsapp.md`](spokesman-whatsapp.md).
-Verify: `GET /health` on the service returns OK; a test `/notify` (with the
-`X-Spokesman-Token` header) is delivered (or logged in dry-run).
+`WHATSAPP_VERIFY_TOKEN`, the `SPOKESMAN_API_TOKEN`, a **public webhook tunnel**
+(`TUNNEL_PROVIDER` + e.g. `CLOUDFLARED_TUNNEL_TOKEN`) so Meta can reach the
+inbound webhook, **and — because the Spokesman is a model-first agent (ADR-0026) —
+a model-provider key (`ANTHROPIC_API_KEY` or a fallback) in `.env`.** Run with
+`SPOKESMAN_DRY_RUN=1` to log outbound sends without calling WhatsApp. Full setup:
+[`docs/spokesman-whatsapp.md`](spokesman-whatsapp.md).
+
+Verify: `GET /health` returns OK **and its nested `model` block shows
+`"dry_run":false`** (a `true` there means the chat brain is a keyword stub, not a
+real LLM — see the Troubleshooting section in the Spokesman runbook); a test
+`/notify` (with the `X-Spokesman-Token` header) is delivered (or logged in
+dry-run).
 
 ---
 
