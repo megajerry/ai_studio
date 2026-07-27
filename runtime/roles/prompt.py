@@ -112,6 +112,22 @@ _STRATEGY_BODY = (
 )
 
 
+#: Role-commissioning catalog (ADR-0031). Additive, bounded guidance layered so the
+#: PM planner KNOWS the studio's specialist roles exist and CAN commission them by
+#: judgment (via :func:`runtime.roles.pm.enqueue_role_task`) — the roles are no longer
+#: dormant for lack of a producer. It is guidance text only; the human/PM stays in the
+#: loop (these roles are NOT on autonomous crons). Off by default (behavior-preserving);
+#: the PM opts in via ``role_catalog=<text>`` (the caller supplies the concrete menu so
+#: this generic assembler never has to import the role modules).
+_ROLES_HEADER = "### Specialist roles you can commission (enqueue by judgment — ADR-0031)"
+_ROLES_NOTE = (
+    "Besides decomposing work items, you may commission a specialist role by "
+    "enqueuing ONE task of its type when your judgment says the studio would benefit "
+    "(never on a fixed schedule — you decide). Each runs once, proposes reviewable "
+    "output only, and enqueues nothing itself (no loops). Available role task types:"
+)
+
+
 def _section(prompt: str, header: str, note: str, body: str) -> str:
     """Append one bounded, clearly-delimited section to ``prompt``.
 
@@ -135,6 +151,7 @@ def compose_role_prompt(
     task: Optional[str] = None,
     budget_aware: bool = False,
     strategy_aware: bool = False,
+    role_catalog: Optional[str] = None,
     allow_unreviewed: bool = False,
 ) -> str:
     """Assemble a role's full prompt from its layers (see the module docstring).
@@ -163,6 +180,8 @@ def compose_role_prompt(
         prompt = _section(prompt, _BUDGET_HEADER, _BUDGET_NOTE, _BUDGET_BODY)
     if strategy_aware:
         prompt = _section(prompt, _STRATEGY_HEADER, _STRATEGY_NOTE, _STRATEGY_BODY)
+    if role_catalog:
+        prompt = _section(prompt, _ROLES_HEADER, _ROLES_NOTE, role_catalog)
     if skills:
         prompt = compose_prompt(prompt, list(skills), allow_unreviewed=allow_unreviewed)
     if lessons:

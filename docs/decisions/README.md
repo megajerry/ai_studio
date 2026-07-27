@@ -37,3 +37,4 @@ these for detail; this file is the index.
 | [0028](0028-remote-task-access-gateway.md) | Non-LAN remote task access | Remote sessions get a scoped, token-gated task-verb API over the tunnel — never a DB credential; Postgres stays loopback/LAN-only. |
 | [0029](0029-disposable-db-test-guard.md) | Keep the live DB sacred | DB-backed tests skip unless the target DB is disposable (`AI_STUDIO_TEST_DB` opt-in or `*_test` name); `runtime.demo` self-cleans its own workstreams. |
 | [0030](0030-prod-vs-test-traffic-tag.md) | Prod vs test traffic tag | Every enqueue carries `payload.traffic` (`prod`/`test`); never infer test-ness from goal text. |
+| [0031](0031-role-agnostic-dispatcher.md) | Role-agnostic dispatcher + PM commissions roles | Worker dispatch is a single `task_type→handler` registry; PM enqueues any role by judgment; Critic stays an in-process consult. |
