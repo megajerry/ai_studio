@@ -25,6 +25,13 @@ break one, stop and flag it.
 
 1. **Agents don't call agents.** Coordination happens via the task queue / event
    log only. No direct agent-to-agent function calls.
+   - **Cursor Tasks are not studio roles.** Never spawn a Cursor subagent as
+     “the PM / Spokesman / Critic / …” — those roles run only via the host
+     worker claiming queue tasks (`pm.tick`, `work.*`, …). Off-host sessions
+     (ADR-0010) may code on `builder/*` when asked, but must not impersonate
+     runtime roles. See
+     [`state/lessons/2026-07-27-cursor-task-is-not-studio-pm.md`](state/lessons/2026-07-27-cursor-task-is-not-studio-pm.md)
+     and `.cursor/rules/studio-roles-are-queue-driven.mdc`.
 2. **Agents don't touch the host.** No direct `subprocess`, `os.system`, network
    sockets, or filesystem writes from agent code. All side effects go through a
    **tool**.
