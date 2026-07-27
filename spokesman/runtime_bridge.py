@@ -280,17 +280,31 @@ def poll_notifications(
 ) -> NotificationBatch:
     """Read + classify new events past ``since_cursor`` (the events ``seq``).
 
-    Reads across *all* workstreams (the Spokesman is the single all-workstream
+    Reads across *all* real workstreams (the Spokesman is the single all-workstream
     interface) in append order and returns the classified items plus the new
     high-water ``seq`` cursor. The cursor advances past *every* new event scanned
     — even ones that produced no notification — so operational churn is skipped
     exactly once and never re-scanned. With no new events the cursor is unchanged.
+
+    **Test/demo noise is excluded** the SAME way the read path is
+    (:func:`studio_status` / :func:`_pending_approvals_real` / :func:`dashboard_snapshot`
+    all filter via ``REAL_TASK_SQL``): events from ephemeral pytest/demo workstreams
+    (``spk-…`` / ``skilllc-…`` / ``work.demo`` sandboxes, see :mod:`spokesman.noise`)
+    are not surfaced. Without this the notify path pushed approvals/alarms that the
+    ``status`` read path then reports as "0 pending" — a notify≠status gap. The
+    cursor still advances past the skipped noise so it is never re-scanned. The
+    filter lives here (the notify path), not in :func:`classify_event`, which stays a
+    pure workstream-agnostic classifier.
     """
+    from .noise import is_noise_workstream
+
     events = read_events(conn, since_seq=since_cursor, limit=limit)
     batch = NotificationBatch(cursor=since_cursor)
     for event in events:
         if event.seq is not None and event.seq > batch.cursor:
             batch.cursor = event.seq
+        if is_noise_workstream(event.workstream):
+            continue
         item = classify_event(event, conn)
         if item is not None:
             batch.items.append(item)
@@ -500,7 +514,7 @@ def dashboard_snapshot(conn: psycopg.Connection) -> DashboardSnapshot:
             "    AND workstream !~* '^(test[-_]|test-spk-|skilllc-|curate-|pm-research-|"
             "traj-|grnd-|lesson-|boot-|glob-|race-|gw-|cap-|fail-|worker-|quality-|"
             "dec-|spk-|gate-|cleanup-)'"
-            "    AND workstream !~* '(^|[_-])[0-9a-f]{6,}(-other)?$'"
+            "    AND workstream !~* '[_-][0-9a-f]{8,}(-other)?$'"
             "  ORDER BY seq DESC NULLS LAST LIMIT 200"
             ") recent GROUP BY type ORDER BY n DESC"
         )
@@ -520,7 +534,7 @@ def dashboard_snapshot(conn: psycopg.Connection) -> DashboardSnapshot:
                 "  AND workstream !~* '^(test[-_]|test-spk-|skilllc-|curate-|pm-research-|"
                 "traj-|grnd-|lesson-|boot-|glob-|race-|gw-|cap-|fail-|worker-|quality-|"
                 "dec-|spk-|gate-|cleanup-)'"
-                "  AND workstream !~* '(^|[_-])[0-9a-f]{6,}(-other)?$'"
+                "  AND workstream !~* '[_-][0-9a-f]{8,}(-other)?$'"
             )
             row = cur.fetchone()
             open_traj = int(row["open"] or 0)

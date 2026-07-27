@@ -301,17 +301,25 @@ def _agent_turn(
     messages: list[dict[str, Any]],
     *,
     conn: Any,
+    sink: EventSink,
     workstream: str,
     user_text: str,
 ) -> dict[str, Any]:
-    """One model turn; returns parsed agent JSON (or a safe conversational fallback)."""
+    """One model turn; returns parsed agent JSON (or a safe conversational fallback).
+
+    ``sink`` is the SAME real :class:`DbEventSink` ``handle_conversation`` holds, so
+    the ``model.call`` cost event is persisted and this turn's spend accrues to the
+    workstream (ADR-0012 / invariant 6). Passing a ``NullEventSink`` here dropped the
+    cost event while ``conn`` still reserved budget — the reservation then netted to
+    zero on release, making Spokesman spend invisible and effectively unbounded.
+    """
     completion = call_model(
         "spokesman",
         "converse",
         messages,
         quality="standard",
         conn=conn,
-        sink=NullEventSink(),
+        sink=sink,
         workstream=workstream,
         spokesman_user=user_text,
         spokesman_messages=messages,
@@ -405,7 +413,7 @@ def handle_conversation(
     try:
         for _round in range(MAX_AGENT_ROUNDS):
             parsed = _agent_turn(
-                messages, conn=conn, workstream=workstream, user_text=text
+                messages, conn=conn, sink=sink, workstream=workstream, user_text=text
             )
             tool_calls = parsed.get("tool_calls") or []
             if not isinstance(tool_calls, list):

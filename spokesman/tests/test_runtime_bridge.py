@@ -161,7 +161,11 @@ def test_migrate_leaves_conn_idle() -> None:
 
 @pytest.fixture
 def ws() -> str:
-    return f"test-spk-{uuid4().hex[:10]}"
+    # A UNIQUE but NON-noise workstream so it is stakeholder-visible: the notify path
+    # (poll_notifications) now filters ephemeral pytest/demo workstreams the SAME way
+    # the read path does (spokesman.noise). A real prefix + a non-hex tail keeps this
+    # out of every noise rule (prefix / whole-'test' / trailing-hex-suffix).
+    return f"realws-{uuid4().hex[:8]}-live"
 
 
 def _max_seq(conn) -> int:
@@ -204,6 +208,31 @@ def test_pending_approval_shows_in_poll_and_digest(conn, ws) -> None:
     # Renders into a batched digest (ADR-0006: approvals are batched).
     digest = compose_digest([PendingItem(NotifyKind.APPROVE, item.text)])
     assert str(a.id) in digest and "Needs approval" in digest
+
+
+@pytestmark_live
+def test_noise_workstream_approval_not_surfaced_but_real_is(conn, ws) -> None:
+    # notify≠status gap: poll_notifications used to push approvals from ephemeral
+    # pytest/demo workstreams that the status read path (REAL_TASK_SQL) hides — so
+    # they showed as "0 pending". The notify path now applies the SAME noise filter.
+    baseline = _max_seq(conn)
+    noise_ws = f"spk-{uuid4().hex[:12]}"  # generated-prefix sandbox → not stakeholder-visible
+    noisy = request_approval(
+        conn, task_id=uuid4(), role="executor", tool="filesystem",
+        capabilities=["fs.write"], tier="red", reason="x", sink=DbEventSink(conn),
+        workstream=noise_ws,
+    )
+    real = request_approval(
+        conn, task_id=uuid4(), role="executor", tool="filesystem",
+        capabilities=["fs.write"], tier="red", reason="x", sink=DbEventSink(conn),
+        workstream=ws,  # real (non-noise) workstream
+    )
+    batch = poll_notifications(conn, baseline)
+    surfaced = {i.approval_id for i in batch.items}
+    assert str(real.id) in surfaced          # real workstream → surfaced
+    assert str(noisy.id) not in surfaced     # noise workstream → filtered
+    # The cursor still advances past the skipped noise so it is never re-scanned.
+    assert batch.cursor > baseline
 
 
 @pytestmark_live

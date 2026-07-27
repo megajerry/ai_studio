@@ -70,7 +70,10 @@ logger = logging.getLogger("spokesman.app")
 
 STATUS_KEYWORD = "status"
 #: Inbound command verbs that resolve an approval: ``<verb> <approval-id>``.
-_RESOLVE_VERBS = {"approve", "approved", "deny", "denied", "reject", "yes", "no"}
+#: Only unambiguous action verbs — NOT ``yes``/``no``/``reject``, which routinely
+#: begin free-text ("no, cancel that" / "yes please") and must reach the converse
+#: agent rather than be hijacked into a broken ``<verb> <id>`` fast-path.
+_RESOLVE_VERBS = {"approve", "approved", "deny", "denied"}
 #: Inbound verb that answers an OPEN-ENDED decision: ``decide <id> <answer>`` (ADR-0025).
 _DECIDE_VERB = "decide"
 

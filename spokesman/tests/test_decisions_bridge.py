@@ -76,7 +76,10 @@ def conn():
 
 @pytest.fixture
 def ws() -> str:
-    return f"test-decspk-{uuid4().hex[:10]}"
+    # NON-noise unique workstream (real prefix + non-hex tail): poll_notifications now
+    # filters ephemeral pytest/demo workstreams like the read path (spokesman.noise),
+    # so a decision must live in a real workstream to surface in the digest.
+    return f"realdec-{uuid4().hex[:8]}-live"
 
 
 def _max_seq(conn) -> int:

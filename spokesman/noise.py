@@ -49,8 +49,12 @@ _NOISE_TASK_TYPES = frozenset({
 })
 
 #: ``skilllc-ab12…``, ``foo-1a2b3c4d``, ``gw-….``-style disposable names.
+#: The hex must be a DELIMITER-separated suffix segment (``[_-]`` before it), never
+#: the whole name, and >= 8 chars. The old ``^|`` alternative + ``{6,}`` matched
+#: plain 6-char hex-only English words (``facade``/``decade``/``deface``/``abcdef``),
+#: silently dropping such a real workstream from status/dashboard/approvals.
 _HEX_SUFFIX_WS = re.compile(
-    r"(?:^|[_-])[0-9a-f]{6,}(?:-other)?$",
+    r"[_-][0-9a-f]{8,}(?:-other)?$",
     re.IGNORECASE,
 )
 
@@ -105,7 +109,7 @@ def real_task_sql(alias: str = "") -> str:
   AND {p}workstream <> ''
   AND lower({p}workstream) <> 'test'
   AND {p}workstream !~* '^(test[-_]|test-spk-|skilllc-|curate-|pm-research-|traj-|grnd-|lesson-|boot-|glob-|race-|gw-|cap-|fail-|worker-|quality-|dec-|spk-|gate-|cleanup-)'
-  AND {p}workstream !~* '(^|[_-])[0-9a-f]{{6,}}(-other)?$'
+  AND {p}workstream !~* '[_-][0-9a-f]{{8,}}(-other)?$'
   AND {p}type <> ALL(ARRAY['work.demo','work.probe','work.stall','work.stuck','work.real','t'])
 )"""
 
