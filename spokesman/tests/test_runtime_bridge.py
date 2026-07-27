@@ -223,8 +223,15 @@ def test_cursor_prevents_renotification(conn, ws) -> None:
 
 @pytestmark_live
 def test_studio_status_returns_real_counts(conn, ws) -> None:
+    # Fixture workstreams / demo types must NOT move the stakeholder feed.
     before = studio_status(conn)
     enqueue_task(conn, workstream=ws, type="work.demo", payload={})
+    after_noise = studio_status(conn)
+    assert after_noise.queued == before.queued
+    assert after_noise.open_tasks == before.open_tasks
+
+    # A real vertical + real type does.
+    enqueue_task(conn, workstream="productivity", type="work.task", payload={"goal": "live"})
     after = studio_status(conn)
     assert after.queued == before.queued + 1
     assert after.open_tasks == before.open_tasks + 1
