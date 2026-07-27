@@ -273,7 +273,7 @@ def _compose_plan_prompt(
         lessons=lessons,
         budget_aware=True,
         # The PM owns the build-vs-buy / agile-adoption operating principle
-        # (ADR-0026): it weighs building in-house vs adopting a mature component
+        # (ADR-0027): it weighs building in-house vs adopting a mature component
         # and stays flexible about a better paradigm/tech, changing only on clear
         # evidence (no churn). Injected into every PM plan prompt.
         strategy_aware=True,
@@ -335,12 +335,12 @@ class PlanResult(BaseModel):
     work_item_count: int = 0
     work_task_ids: list[str] = Field(default_factory=list)
     approval_id: Optional[str] = None
-    #: Id of the external-research scan this tick commissioned (ADR-0026), if the
+    #: Id of the external-research scan this tick commissioned (ADR-0027), if the
     #: PM's budget-tuned baseline cadence said one was due; ``None`` otherwise.
     research_task_id: Optional[str] = None
 
 
-# --- PM operating principle: build vs buy/borrow + agile adoption (ADR-0026) --
+# --- PM operating principle: build vs buy/borrow + agile adoption (ADR-0027) --
 #
 # A higher-level principle the PM OWNS — NOT a hard-coded cron. To hedge building
 # in-house against buying/borrowing and stay agile about a better paradigm/tech,
@@ -414,7 +414,7 @@ def _maybe_commission_research(
     now: Optional[datetime] = None,
     interval_hours: Optional[float] = None,
 ) -> Optional[str]:
-    """Commission ONE external-research scan iff the PM's cadence says it's DUE (ADR-0026).
+    """Commission ONE external-research scan iff the PM's cadence says it's DUE (ADR-0027).
 
     Returns the new ``research`` task id when one is enqueued, else ``None``. Pure
     orchestration side-action of a ``pm.tick`` — it is NOT recorded as a plan
@@ -769,7 +769,7 @@ def run_pm_tick(
     sink = sink or NullEventSink()
     goal = _resolve_goal(task)
 
-    # PM operating principle (ADR-0026): keep the studio learning the latest
+    # PM operating principle (ADR-0027): keep the studio learning the latest
     # industrial developments so it can hedge build vs buy/borrow and stay agile
     # about a better paradigm/tech. On this pulse, commission ONE external-research
     # scan IFF the PM's budget-tuned baseline cadence says one is due. This is a

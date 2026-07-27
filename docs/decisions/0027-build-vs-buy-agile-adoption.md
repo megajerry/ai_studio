@@ -1,4 +1,4 @@
-# 0026 — Build vs. buy/borrow + agile adoption: a PM operating principle, not a cron
+# 0027 — Build vs. buy/borrow + agile adoption: a PM operating principle, not a cron
 
 - **Status:** Accepted
 - **Date:** 2026-07-26

@@ -82,14 +82,14 @@ _BUDGET_BODY = (
 )
 
 
-#: Build-vs-buy & agile-adoption operating principle (ADR-0026). Additive, bounded
+#: Build-vs-buy & agile-adoption operating principle (ADR-0027). Additive, bounded
 #: guidance layered so a planning/deciding role continuously HEDGES building
 #: in-house against buying/borrowing a mature component, and stays FLEXIBLE about
 #: adopting a better paradigm/tech — changing only on clear evidence (no churn). It
 #: is behavior text only; adoption stays a deliberate, review-gated decision (never
 #: auto-adopt, ADR-0008). Off by default (behavior-preserving); the PM opts in via
 #: ``strategy_aware=True``.
-_STRATEGY_HEADER = "### Build vs. buy & agile adoption (weigh this on every plan / retro / major decision — ADR-0026)"
+_STRATEGY_HEADER = "### Build vs. buy & agile adoption (weigh this on every plan / retro / major decision — ADR-0027)"
 _STRATEGY_NOTE = (
     "The studio continuously learns from the latest industrial developments and "
     "hedges how it builds. Keep this principle in mind whenever you plan, run a "

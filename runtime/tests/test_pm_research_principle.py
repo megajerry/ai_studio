@@ -1,4 +1,4 @@
-"""PM build-vs-buy / agile-adoption operating principle tests (ADR-0026).
+"""PM build-vs-buy / agile-adoption operating principle tests (ADR-0027).
 
 Prove the principle is internalized as something the PM OWNS — a prompt disposition
 plus a budget-tuned baseline external-research cadence the PM triggers — NOT a
