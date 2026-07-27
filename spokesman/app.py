@@ -117,9 +117,16 @@ class NotifyRequest(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    """One web-chat inbound line from the stakeholder."""
+    """One web-chat inbound line from the stakeholder.
+
+    ``session_key`` is a stable per-conversation id the page generates and
+    persists (``crypto.randomUUID()`` in ``localStorage``) so the Spokesman can
+    thread conversation memory across turns (migration 0018). Optional so an older
+    client still works (the server derives a stable fallback).
+    """
 
     text: str = Field(..., min_length=1, max_length=4000)
+    session_key: str | None = Field(default=None, max_length=200)
 
 def run_notifier_pass(
     settings: Settings,
@@ -173,6 +180,7 @@ def handle_inbound_command(
     msg: InboundMessage,
     *,
     notifier: object | None = None,
+    session_key: str | None = None,
 ) -> Optional[dict]:
     """Interpret one inbound message and act, or converse (ADR-0026).
 
@@ -301,7 +309,7 @@ def handle_inbound_command(
     from .converse import handle_conversation
 
     outcome = handle_conversation(
-        settings, client, connect, msg, notifier=notifier
+        settings, client, connect, msg, notifier=notifier, session_key=session_key
     )
     return {
         "command": "converse",
@@ -427,8 +435,12 @@ def create_app(
             timestamp="",
         )
         record_inbound(settings, [msg], channel="web")
+        # Scope conversation memory (migration 0018) to the browser's stable
+        # per-conversation id; fall back to a fixed web key for older clients so a
+        # page without a session id is still one coherent (if shared) session.
+        session_key = (body.session_key or "").strip() or "web:default"
         result = handle_inbound_command(
-            settings, capture, connect, msg, notifier=notifier
+            settings, capture, connect, msg, notifier=notifier, session_key=session_key
         )
         if result is None:
             return {

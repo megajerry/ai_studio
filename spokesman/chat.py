@@ -139,6 +139,20 @@ def render_chat(
   </form>
   <script>
     const TOKEN = {token_js};
+    // Stable per-conversation id so the Spokesman can thread memory across turns
+    // (migration 0018). Persisted in localStorage: one browser = one session.
+    const SESSION_KEY = (function () {{
+      try {{
+        var s = localStorage.getItem('aistudio_chat_session');
+        if (!s) {{
+          s = (window.crypto && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : 'web-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+          localStorage.setItem('aistudio_chat_session', s);
+        }}
+        return s;
+      }} catch (_) {{ return 'web:default'; }}
+    }})();
     const log = document.getElementById('log');
     const form = document.getElementById('f');
     const input = document.getElementById('msg');
@@ -172,7 +186,7 @@ def render_chat(
         const res = await fetch('/chat/message?token=' + encodeURIComponent(TOKEN), {{
           method: 'POST',
           headers: {{ 'content-type': 'application/json', 'X-Spokesman-Token': TOKEN }},
-          body: JSON.stringify({{ text }}),
+          body: JSON.stringify({{ text, session_key: SESSION_KEY }}),
         }});
         const data = await res.json();
         if (!res.ok) {{
