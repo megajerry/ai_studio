@@ -19,6 +19,14 @@ Two gaps remained once the lifecycle state machine landed:
    foot-gun (`0.0.0.0/0` + `trust`). Access must be an explicit host allowlist,
    authenticated, and never exposed to the internet.
 
+**Scope note (added 2026-07-27).** Section 3 below covers **LAN** hosts only. A
+remote session that is *not* on the LAN (a cloud agent container, a laptop
+elsewhere) is deliberately **not** served by opening Postgres wider: a DB
+credential grants full SQL authority, which would bypass the lifecycle guard
+(invariant 4) and put a host secret in a remote environment (invariant 5). Those
+remotes use the token-gated **task gateway** instead —
+[ADR-0028](0028-remote-task-access-gateway.md).
+
 ## Decision
 
 ### 1. Degraded-mode contract (`runtime/db.py`)
@@ -86,6 +94,8 @@ needed.
   supervisor no longer stampedes workers on reconnect.
 - Remote DB access is an explicit, authenticated, internet-closed allowlist that a
   reviewer can read at a glance; adding a host is one env value + a firewall rule.
+  It stays **LAN-scoped** — non-LAN remotes go through the task gateway
+  ([ADR-0028](0028-remote-task-access-gateway.md)), never a wider `pg_hba`.
 - Remote/TLS can't be exercised in the off-host sandbox, so it is verified by
   config review + a template lint/render test; the resilience paths are covered by
   keyless unit tests (dead-port outage → clean `DBUnavailable`; grace window gates

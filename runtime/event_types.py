@@ -256,6 +256,19 @@ EVENT_HANDOFF_PROPOSED = "handoff.proposed"
 EVENT_HANDOFF_ACTIVATED = "handoff.activated"
 EVENT_HANDOFF_ENDED = "handoff.ended"
 
+# --- Remote task gateway (gateway/, ADR-0028) --------------------------------
+#: The non-LAN remote surface's audit trail. BODY-FREE: payloads carry ONLY the
+#: token IDENTITY + the verb + the required scope + the HTTP status + a decision
+#: reason CODE — NEVER the token, the task payload, or any driver/DSN text
+#: (invariants 5 & 6, mirroring the ``policy.decision`` / ``search.denied``
+#: discipline). ``gateway.access`` = an authorized remote call was served (so a
+#: read, which changes no state, still leaves a trace); ``gateway.denied`` = an
+#: AUTHENTICATED call was refused (missing scope / wrong workstream / rate limit /
+#: not the claim owner). An UNAUTHENTICATED refusal is deliberately NOT written
+#: here — it touches no DB, so an internet-facing flood cannot exhaust connections.
+EVENT_GATEWAY_ACCESS = "gateway.access"
+EVENT_GATEWAY_DENIED = "gateway.denied"
+
 # --- Experiments (runtime.experiment) ---------------------------------------
 EVENT_PROPOSED = "experiment.proposed"
 EVENT_STARTED = "experiment.started"

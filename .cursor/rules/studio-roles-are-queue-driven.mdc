@@ -1,0 +1,43 @@
+---
+description: Never impersonate studio roles with Cursor Tasks; use queue + worker
+alwaysApply: true
+---
+
+# Studio roles ≠ Cursor Tasks
+
+## Hard rule
+
+**Do not spawn a Cursor Task (or chat persona) as PM, Critic, Spokesman,
+Builder, Reviewer, Curator, Capacity Steward, or any other studio role.**
+
+Those roles exist only as queue-driven executors on the **host worker**
+(`runtime/roles/*`, claimed via `runtime.worker`). Spawning = **enqueue a
+task** (e.g. `pm.tick`, `work.*`), then ensure the worker claims it.
+
+## What “spawn PM” means
+
+1. Enqueue `pm.tick` (or the appropriate type) with the goal/payload.
+2. Confirm a host worker is running (`python -m runtime.worker` / compose
+   service).
+3. Report the task id and status. Wait on the queue — do not role-play PM.
+
+The studio PM **plans and enqueues work**; it **never implements** product
+code. If you write `gateway/` / features while calling yourself PM, you have
+already violated the role (see
+`state/lessons/2026-07-27-cursor-task-is-not-studio-pm.md`).
+
+## Allowed Cursor agent uses
+
+- **Off-host helper (ADR-0010):** research, docs, code on an explicit
+  `builder/<summary>` (or other non-role-impersonating) branch when the
+  stakeholder asked this session to implement, or when delegated via
+  `state/offhost/`.
+- **Separate review agent** for a merge-to-`main` review round (CONTRIBUTING)
+  — that is a process role for git review, not `runtime/roles/pm.py`.
+- **Never** title or prompt a Task “You are the PM/Spokesman/…” and have it
+  drive studio execution.
+
+## If tempted to fake a role
+
+Stop. Enqueue. Start/fix the worker. Say so. Do not substitute a Cursor
+subagent for the runtime.

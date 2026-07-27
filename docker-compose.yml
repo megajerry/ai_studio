@@ -186,6 +186,48 @@ services:
       timeout: 5s
       retries: 5
 
+  # Task gateway — the ONLY way a non-LAN remote session touches the queue
+  # (ADR-0028). It exposes the lifecycle VERBS (list/enqueue/claim/heartbeat/
+  # complete) through runtime.tasks behind a scoped bearer token; Postgres itself
+  # stays bound to loopback (ADR-0017). Opt-in: starts only with
+  # `docker compose --profile gateway up`, so the M0 spine is unaffected.
+  task-gateway:
+    profiles: ["gateway"]
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    restart: unless-stopped
+    environment:
+      TASK_GATEWAY_PORT: ${TASK_GATEWAY_PORT:-8081}
+      # SECRET-bearing but hash-only: identity:scopes:sha256hex[:workstreams]
+      # entries. EMPTY (default) = fail closed — every task endpoint answers 503.
+      TASK_GATEWAY_TOKENS: ${TASK_GATEWAY_TOKENS:-}
+      TASK_GATEWAY_RATE_PER_MIN: ${TASK_GATEWAY_RATE_PER_MIN:-120}
+      TASK_GATEWAY_BURST: ${TASK_GATEWAY_BURST:-20}
+      TASK_GATEWAY_MAX_BODY_BYTES: ${TASK_GATEWAY_MAX_BODY_BYTES:-65536}
+      TASK_GATEWAY_MAX_PAYLOAD_BYTES: ${TASK_GATEWAY_MAX_PAYLOAD_BYTES:-16384}
+      TASK_GATEWAY_MAX_PRIORITY: ${TASK_GATEWAY_MAX_PRIORITY:-10}
+      TASK_GATEWAY_MAX_BUDGET_TOKENS: ${TASK_GATEWAY_MAX_BUDGET_TOKENS:-200000}
+      TASK_GATEWAY_MAX_LIMIT: ${TASK_GATEWAY_MAX_LIMIT:-100}
+      # The DB credential stays HERE (host side) and never reaches a remote.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-aistudio}
+      POSTGRES_DB: ${POSTGRES_DB:-aistudio}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/onboarding.sh to set POSTGRES_PASSWORD}
+    ports:
+      # Loopback by default — reachability comes ONLY from an authenticated
+      # tunnel (see docs/remote-task-access.md). NEVER bind a public interface.
+      - "${TASK_GATEWAY_BIND_IP:-127.0.0.1}:${TASK_GATEWAY_PORT:-8081}:${TASK_GATEWAY_PORT:-8081}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,os; urllib.request.urlopen('http://localhost:'+os.environ.get('TASK_GATEWAY_PORT','8081')+'/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
 # Fixed internal subnet so Postgres' pg_hba can trust the compose network by CIDR
 # (172.28.0.0/16) while keeping remote LAN access a strict allowlist (ADR-0017).
 # Host tools reach Postgres through the published port, SNAT'd to this subnet's

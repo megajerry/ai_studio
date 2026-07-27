@@ -8,6 +8,7 @@ source =
     runtime
     evals
     spokesman
+    gateway
 omit =
     */tests/*
     */__pycache__/*
