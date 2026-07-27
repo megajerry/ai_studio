@@ -371,8 +371,15 @@ def enqueue_task(
     to the decision (``SELECT ... FROM tasks WHERE trajectory_id = …``). The link is
     set through this single guarded writer only — there is no ad-hoc UPDATE of the
     column anywhere (mirrors the transition-only discipline).
+
+    Payload is auto-tagged with ``traffic`` (``prod`` / ``test``) when missing —
+    see :mod:`runtime.traffic`. Test suites set ``AI_STUDIO_TRAFFIC=test`` (via
+    ``AI_STUDIO_TEST_DB=1``); production leaves the default ``prod``.
     """
+    from .traffic import tag_payload
+
     deps = list(depends_on or [])
+    tagged = tag_payload(payload)
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
@@ -386,7 +393,7 @@ def enqueue_task(
                 (
                     workstream,
                     type,
-                    Jsonb(payload or {}),
+                    Jsonb(tagged),
                     priority,
                     assignee.value if assignee else None,
                     budget_tokens,

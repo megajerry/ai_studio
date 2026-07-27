@@ -30,6 +30,13 @@ class _Capture:
         return {"ok": True, "to": to, "text": text}
 
 
+def test_dry_run_verbal_yes_calls_resolve_approval() -> None:
+    turn = build_dry_run_spokesman_turn("yes, go ahead")
+    assert turn["tool_calls"]
+    assert turn["tool_calls"][0]["name"] == "resolve_approval"
+    assert turn["tool_calls"][0]["args"]["decision"] == "approve"
+
+
 def test_dry_run_greeting_is_conversational_not_status_dump() -> None:
     turn = build_dry_run_spokesman_turn("hello")
     assert turn["tool_calls"] == []

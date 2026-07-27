@@ -330,7 +330,11 @@ class StudioStatus:
         )
 
 
-def studio_status(conn: psycopg.Connection) -> StudioStatus:
+def studio_status(
+    conn: psycopg.Connection,
+    *,
+    workstream: Optional[str] = None,
+) -> StudioStatus:
     """Summarize live task-queue counts + pending approvals + spend from the DB.
 
     One grouped scan of ``tasks`` (counts + summed ``spent_tokens`` per status)
@@ -340,16 +344,26 @@ def studio_status(conn: psycopg.Connection) -> StudioStatus:
     **Test/demo noise is excluded** (ephemeral pytest workstreams, ``work.demo``,
     …) so stakeholder ``status`` / chat tools match the dashboard. See
     :mod:`spokesman.noise`.
+
+    When ``workstream`` is set (e.g. a gateway token pinned to one vertical),
+    counts are restricted to that workstream (ADR-0018).
     """
     from .noise import REAL_TASK_SQL
 
     counts: dict[str, int] = {}
     spent = 0
+    clauses = [REAL_TASK_SQL]
+    params: list[object] = []
+    if workstream:
+        clauses.append("workstream = %s")
+        params.append(workstream)
+    where = " AND ".join(clauses)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT status, count(*) AS n, "
             "COALESCE(sum(spent_tokens), 0) AS tokens FROM tasks "
-            f"WHERE {REAL_TASK_SQL} GROUP BY status"
+            f"WHERE {where} GROUP BY status",
+            params,
         )
         for row in cur.fetchall():
             counts[row["status"]] = int(row["n"])
@@ -372,22 +386,33 @@ def studio_status(conn: psycopg.Connection) -> StudioStatus:
         blocked=counts.get("blocked", 0),
         done=counts.get("merged", 0),
         failed=counts.get("abandoned", 0),
-        pending_approvals=len(_pending_approvals_real(conn)),
+        pending_approvals=len(_pending_approvals_real(conn, workstream=workstream)),
         spent_tokens=spent,
     )
 
 
-def _pending_approvals_real(conn: psycopg.Connection):
+def _pending_approvals_real(
+    conn: psycopg.Connection,
+    *,
+    workstream: Optional[str] = None,
+):
     """Pending approvals whose linked task is real (not test/demo noise)."""
     from .noise import real_task_sql
 
     # Approvals without a task_id cannot be proven real — omit from stakeholder feed.
+    clauses = [f"a.status = 'pending'", f"({real_task_sql('t')})"]
+    params: list[object] = []
+    if workstream:
+        clauses.append("t.workstream = %s")
+        params.append(workstream)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT a.id FROM approvals a "
+            "SELECT a.id, a.task_id, a.role, a.tool, a.tier, a.reason, a.created_at "
+            "FROM approvals a "
             "JOIN tasks t ON t.id = a.task_id "
-            f"WHERE a.status = 'pending' AND ({real_task_sql('t')}) "
-            "ORDER BY a.created_at ASC"
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY a.created_at ASC",
+            params,
         )
         return list(cur.fetchall())
 
@@ -550,17 +575,24 @@ def resolve(
     alias (``approve``/``deny``/``yes``/``no``). Returns the resolved
     :class:`runtime.approvals.Approval`, or ``None`` if the id is unknown / already
     resolved (``resolve_approval`` is guarded to ``pending``). Emits
-    ``approval.resolved`` to the live event log; the worker's ``resume_approved``
-    then re-queues (approved) or fails (denied) the blocked task — untouched here.
+    ``approval.resolved`` and **immediately** runs :func:`runtime.worker.resume_approved`
+    so a parked ``pm.tick`` / work task is re-queued (or abandoned on deny) without
+    waiting for the next worker-loop sweep — verbal SMS/chat approval must invoke
+    the next agent step.
     """
     from runtime.approvals import resolve_approval  # local import: keeps psycopg lazy
+    from runtime.worker import resume_approved
 
     canonical = normalize_decision(decision) or decision
     if canonical not in (STATUS_APPROVED, STATUS_DENIED):
         raise ValueError("decision must be approve/deny (or approved/denied)")
     if isinstance(approval_id, str):
         approval_id = UUID(approval_id)
-    return resolve_approval(conn, approval_id, canonical, resolver, DbEventSink(conn))
+    sink = DbEventSink(conn)
+    approval = resolve_approval(conn, approval_id, canonical, resolver, sink)
+    if approval is not None:
+        resume_approved(conn, sink)
+    return approval
 
 
 def answer(

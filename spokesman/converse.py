@@ -44,6 +44,8 @@ TOOL_NAMES = frozenset(
         "request_prep",
         "propose_handoff",
         "end_handoff",
+        "list_pending_approvals",
+        "resolve_approval",
     }
 )
 
@@ -61,6 +63,11 @@ Rules:
 4. Keep replies concise (SMS-friendly). Prefer one short paragraph + bullets.
 5. Coordination with other agents is ONLY via tools (enqueue / prep / handoff) —
    you never call other agents directly.
+6. When the human verbally approves or denies a pending 🛑 request ("yes", "go
+   ahead", "approve that", "no", …), call resolve_approval — do NOT only chat.
+   Keyword shortcuts `approve <id>` / `deny <id>` also work; free text must use
+   the tool. Prefer an explicit approval_id; if omitted and exactly one pending
+   approval exists, resolve that one.
 
 Available tools (call by name with JSON args):
 - studio_status() — live open-task / approval / decision snapshot.
@@ -69,6 +76,10 @@ Available tools (call by name with JSON args):
 - propose_handoff(role: string, reason: string) — ask human to approve a
   specialist back-and-forth (pm|critic|reviewer|researcher).
 - end_handoff() — end an active specialist handoff.
+- list_pending_approvals() — pending 🛑 ids + short reasons (for verbal approve).
+- resolve_approval(decision: string, approval_id?: string) — approve/deny a
+  pending approval (decision: approve|deny|yes|no). Omitting approval_id is OK
+  only when exactly one is pending; otherwise list them and ask which.
 
 Response format — return ONLY a single JSON object, no markdown fences:
 {"tool_calls":[{"name":"<tool>","args":{...}}, ...], "reply":"<text or null>"}
@@ -205,6 +216,83 @@ def _run_tool(name: str, args: dict[str, Any], ctx: _ToolCtx) -> dict[str, Any]:
         if ended is None:
             return {"ok": False, "error": "no active handoff"}
         return {"ok": True, "handoff_id": str(ended.id), "role": ended.role}
+
+    if name == "list_pending_approvals":
+        if ctx.conn is None:
+            return {"ok": False, "error": "db unavailable"}
+        from .runtime_bridge import _pending_approvals_real
+
+        rows = _pending_approvals_real(ctx.conn)
+        items = [
+            {
+                "approval_id": str(r["id"]),
+                "tool": r.get("tool"),
+                "role": r.get("role"),
+                "tier": r.get("tier"),
+                "reason": (r.get("reason") or "")[:240],
+                "task_id": str(r["task_id"]) if r.get("task_id") else None,
+            }
+            for r in rows[:20]
+        ]
+        return {"ok": True, "count": len(items), "approvals": items}
+
+    if name == "resolve_approval":
+        if ctx.conn is None:
+            return {"ok": False, "error": "db unavailable"}
+        from .runtime_bridge import resolve
+        from .handoff import activate_handoff_for_approval
+
+        decision = str(args.get("decision") or "").strip().lower()
+        if not decision:
+            return {"ok": False, "error": "missing decision (approve|deny)"}
+        approval_id = str(args.get("approval_id") or "").strip() or None
+        if not approval_id:
+            from .runtime_bridge import _pending_approvals_real
+
+            pending = _pending_approvals_real(ctx.conn)
+            if len(pending) == 1:
+                approval_id = str(pending[0]["id"])
+            elif not pending:
+                return {"ok": False, "error": "no pending approvals"}
+            else:
+                return {
+                    "ok": False,
+                    "error": "ambiguous: multiple pending approvals",
+                    "approvals": [
+                        {
+                            "approval_id": str(r["id"]),
+                            "tool": r.get("tool"),
+                            "reason": (r.get("reason") or "")[:120],
+                        }
+                        for r in pending[:10]
+                    ],
+                }
+        resolver = f"spokesman:converse"
+        try:
+            approval = resolve(ctx.conn, approval_id, decision, resolver)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if approval is None:
+            return {
+                "ok": False,
+                "error": "approval not found or already resolved",
+                "approval_id": approval_id,
+            }
+        handoff_id = None
+        if approval.status == "approved":
+            try:
+                handoff = activate_handoff_for_approval(ctx.conn, approval.id)
+                if handoff is not None:
+                    handoff_id = str(handoff.id)
+            except Exception:  # noqa: BLE001
+                logger.exception("handoff activate failed for %s", approval_id)
+        return {
+            "ok": True,
+            "approval_id": str(approval.id),
+            "status": approval.status,
+            "handoff_id": handoff_id,
+            "resumed": True,
+        }
 
     return {"ok": False, "error": f"unknown tool {name!r}"}
 
@@ -424,6 +512,14 @@ def _summarize_tools(tool_trace: list[dict[str, Any]]) -> str:
             )
         elif name == "end_handoff" and result.get("ok"):
             parts.append("Handoff ended — back to Spokesman only.")
+        elif name == "list_pending_approvals" and result.get("ok"):
+            n = int(result.get("count") or 0)
+            parts.append(f"{n} pending approval(s)." if n else "No pending approvals.")
+        elif name == "resolve_approval" and result.get("ok"):
+            parts.append(
+                f"Approval {str(result.get('approval_id', ''))[:8]}… "
+                f"{result.get('status')} — queued work can resume."
+            )
         elif not result.get("ok"):
             parts.append(f"{name} failed: {result.get('error')}")
     return "\n\n".join(p for p in parts if p) or "Done."
@@ -527,6 +623,28 @@ def build_dry_run_spokesman_turn(
         }
     if re.search(r"^(end handoff|stop handoff)\b", text, re.I):
         return {"tool_calls": [{"name": "end_handoff", "args": {}}], "reply": None}
+    # Verbal approve/deny without the keyword shortcut → resolve_approval tool.
+    if re.search(
+        r"\b(approve|approved|deny|denied|reject)\b",
+        lower,
+    ) or re.search(
+        r"^(yes|yeah|yep|go ahead|sounds good|do it|lgtm|nope|no)\b",
+        lower,
+    ):
+        decision = "deny" if re.search(
+            r"\b(deny|denied|reject|nope)\b", lower
+        ) or re.match(r"^no\b", lower) else "approve"
+        m = re.search(
+            r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+            lower,
+        )
+        args: dict[str, Any] = {"decision": decision}
+        if m:
+            args["approval_id"] = m.group(1)
+        return {
+            "tool_calls": [{"name": "resolve_approval", "args": args}],
+            "reply": None,
+        }
     if re.search(
         r"\b(status|how'?s?\b|how (is|are) (things|we|the studio)|"
         r"what('s| is) (blocked|open|pending)|any updates?|"

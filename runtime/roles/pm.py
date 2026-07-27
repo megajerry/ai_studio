@@ -822,6 +822,30 @@ def run_pm_tick(
 
     # --- Confidence gate (ADR-0003) -----------------------------------------
 
+    # Human already approved a prior pushback on THIS tick → consume the grant and
+    # proceed (do not raise the same 🛑 again). Fingerprint matches request_approval
+    # above (empty caps, empty args).
+    from runtime.approvals import compute_fingerprint, consume_grant, find_grant
+
+    pushback_fp = compute_fingerprint(
+        task.id, "pm.plan", [], workstream=task.workstream, args={},
+    )
+    human_override = False
+    if conn is not None:
+        human_override = find_grant(conn, pushback_fp) is not None
+        if human_override:
+            consume_grant(conn, pushback_fp)
+    if human_override:
+        plan = plan.model_copy(update={"feasible": True})
+        _traj_step(
+            conn, tid, "decide",
+            "human granted prior 🛑 pushback → proceed with decomposition",
+            rationale="find_grant(pm.plan) hit; skipping infeasible re-pushback",
+            options_considered=["decompose", "clarify", "pushback"],
+            choice="decompose",
+            confidence=max(plan.confidence, threshold),
+        )
+
     # 1. Not feasible → push back (a first-class output). Raise a 🛑 approval so a
     #    human decides on the objective/scope concern; enqueue NO work.
     if not plan.feasible:

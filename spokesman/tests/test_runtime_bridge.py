@@ -39,7 +39,7 @@ from runtime.enforce import DbEventSink
 from runtime.events import append_event
 from runtime.migrate import migrate
 from runtime.models import Event, TaskStatus, make_event
-from runtime.tasks import block_task, claim_task, enqueue_task
+from runtime.tasks import block_task, claim_task, enqueue_task, get_task
 from runtime.worker import resume_approved
 
 from spokesman.app import create_app, handle_inbound_command, run_notifier_pass
@@ -230,8 +230,14 @@ def test_studio_status_returns_real_counts(conn, ws) -> None:
     assert after_noise.queued == before.queued
     assert after_noise.open_tasks == before.open_tasks
 
-    # A real vertical + real type does.
-    enqueue_task(conn, workstream="productivity", type="work.task", payload={"goal": "live"})
+    # A real vertical + real type does (explicit prod traffic — under
+    # AI_STUDIO_TRAFFIC=test the auto-tag would otherwise hide it).
+    enqueue_task(
+        conn,
+        workstream="productivity",
+        type="work.task",
+        payload={"goal": "live", "traffic": "prod"},
+    )
     after = studio_status(conn)
     assert after.queued == before.queued + 1
     assert after.open_tasks == before.open_tasks + 1
@@ -252,6 +258,9 @@ def test_inbound_approve_resolves_and_resumes_blocked_task(conn, ws) -> None:
     )
     blocked = block_task(conn, task.id, approval_id=approval.id, reason="🔴")
     assert blocked is not None and blocked.status == TaskStatus.BLOCKED
+    # Make the setup visible to handle_inbound's fresh connection.
+    if not conn.autocommit:
+        conn.commit()
 
     # 2. Inbound "approve <id>" through the runtime bridge (dry-run reply).
     client = RecordingClient()
@@ -264,11 +273,14 @@ def test_inbound_approve_resolves_and_resumes_blocked_task(conn, ws) -> None:
     assert result == {"command": "approve", "ok": True, "status": STATUS_APPROVED}
     assert client.sent and str(approval.id) in client.sent[0][0]
 
-    # 3. The approval is approved in the DB...
+    # 3. The approval is approved in the DB and the blocked task is re-queued
+    #    synchronously inside resolve() (not deferred to a later worker sweep).
     assert get_approval(conn, approval.id).status == STATUS_APPROVED
-    # ...and the blocked task becomes resumable (re-queued for retry).
+    resumed_task = get_task(conn, task.id)
+    assert resumed_task is not None and resumed_task.status == TaskStatus.UP_FOR_GRABS
+    # A second resume pass is a no-op (already advanced).
     res = resume_approved(conn, DbEventSink(conn))
-    assert str(task.id) in res.resumed
+    assert str(task.id) not in res.resumed
 
 
 @pytestmark_live

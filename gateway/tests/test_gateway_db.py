@@ -373,3 +373,49 @@ def test_a_revoked_identity_cannot_claim(client, conn, ws) -> None:
     ok = client.post("/v1/tasks/claim", json={"workstream": ws},
                      headers=bearer(REMOTE_SECRET))
     assert ok.json()["task"] is not None
+
+
+def test_agents_status_and_env_under_read_scope(client, conn, ws) -> None:
+    """New observability verbs reuse ``read`` — no re-mint required."""
+    # Enqueue via the gateway so the row is committed on a separate connection
+    # (the module-scoped test ``conn`` may hold an open txn).
+    created = client.post(
+        "/v1/tasks",
+        json={"workstream": ws, "type": "work.remote", "payload": {"goal": "x"}},
+        headers=bearer(REMOTE_SECRET),
+    )
+    assert created.status_code == 201, created.text
+
+    claimed = client.post(
+        "/v1/tasks/claim",
+        json={"workstream": ws, "agent_type": "pm"},
+        headers=bearer(REMOTE_SECRET),
+    )
+    assert claimed.status_code == 200 and claimed.json()["task"] is not None
+    assert claimed.json()["task"]["agent_type"] == "pm"
+
+    status = client.get(
+        f"/v1/agents/status?workstream={ws}", headers=bearer(REMOTE_SECRET)
+    )
+    assert status.status_code == 200
+    agents = status.json()["agents"]
+    assert any(a["agent_type"] == "pm" for a in agents)
+
+    env = client.get("/v1/agents/env", headers=bearer(REMOTE_SECRET))
+    assert env.status_code == 200
+    body = env.json()
+    assert body["identity"] == REMOTE_IDENTITY
+    assert "read" in body["scopes"]
+    assert "DATABASE" not in str(body).upper()
+    assert "PASSWORD" not in str(body).upper()
+
+    events = client.get(
+        f"/v1/events/recent?workstream={ws}&limit=10",
+        headers=bearer(REMOTE_SECRET),
+    )
+    assert events.status_code == 200
+    assert "events" in events.json()
+
+    pulse = client.get("/v1/studio/status", headers=bearer(REMOTE_SECRET))
+    assert pulse.status_code == 200
+    assert "queued" in pulse.json()

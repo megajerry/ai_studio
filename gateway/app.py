@@ -1,9 +1,8 @@
 """The remote task gateway's HTTP surface (ADR-0028).
 
-Five verbs and nothing else — every one of them routed through
-:mod:`runtime.tasks`, so the canonical lifecycle guard
-(:func:`runtime.tasks.transition`) stays the only way task state ever changes and
-**no raw-SQL path exists through this service**:
+Task verbs are routed through :mod:`runtime.tasks`, so the canonical lifecycle
+guard (:func:`runtime.tasks.transition`) stays the only way task state ever
+changes and **no raw-SQL path exists through this service**:
 
 | Verb | Endpoint | Scope |
 | --- | --- | --- |
@@ -12,9 +11,12 @@ Five verbs and nothing else — every one of them routed through
 | claim | ``POST /v1/tasks/claim`` | ``claim`` |
 | heartbeat | ``POST /v1/tasks/{id}/heartbeat`` | ``claim`` |
 | complete | ``POST /v1/tasks/{id}/complete`` | ``complete`` |
+| agents | ``GET /v1/agents/status`` · ``/v1/studio/status`` · ``/v1/events/recent`` · ``/v1/agents/env`` | ``read`` |
 
 ``GET /health`` (liveness, no DB, no secrets) and ``GET /v1/whoami`` (any valid
-token; reports the caller's own identity/scopes) round it out.
+token; reports the caller's own identity/scopes) round it out. New read-only
+observability endpoints reuse the existing ``read`` scope so already-minted
+tokens need no re-issue. Remotes may act as **any** role (PM included).
 
 The gates live in :mod:`gateway.auth`; this module adds the request-shaped ones:
 bounded bodies, bounded payloads, clamped priority/budget/limit, **claim
@@ -143,7 +145,14 @@ class EnqueueRequest(BaseModel):
 
 
 class ClaimRequest(BaseModel):
-    """Grab + start the next grabbable task for this identity."""
+    """Grab + start the next grabbable task for this identity.
+
+    Remotes may act as **any** role (PM, executor, …) via ``agent_type`` — that
+    is a bookkeeping label, not a pool filter. ``assignee`` defaults to
+    ``offhost`` (also matches unassigned) so a remote never steals work
+    explicitly pinned to ``host``; pass ``assignee=host`` only when deliberately
+    taking host-pool work.
+    """
 
     workstream: Optional[str] = None
     agent_type: Optional[str] = None
@@ -556,6 +565,8 @@ def create_app(
                 worker_id=allowed.identity,
                 assignee=Assignee(req.assignee) if req.assignee else None,
                 workstream=allowed.workstream,
+                # Bookkeeping label only — does not filter which types are grabbable.
+                # Remotes pass agent_type=pm (etc.) when acting as that role.
                 agent_type=req.agent_type or DEFAULT_AGENT_TYPE,
             )
             _audit(
@@ -567,6 +578,197 @@ def create_app(
             return {"task": _task_json(task) if task is not None else None}
         finally:
             _close(conn)
+
+    @app.get("/v1/agents/status")
+    def agents_status(
+        workstream: Optional[str] = None,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
+        """Who is running what: in-flight tasks + heartbeats (``read`` scope).
+
+        Ids / types / identities / timestamps only — no payloads or secrets.
+        Uses existing ``read`` so currently minted tokens need no re-issue.
+        """
+        allowed = _gate(
+            authorization=authorization, scope=SCOPE_READ, verb="agents_status",
+            workstream=workstream,
+        )
+        conn = _open("agents_status")
+        try:
+            ws = allowed.workstream
+            clauses = [
+                "status IN ('claimed','in_progress','ready_for_review',"
+                "'reviewer_blocked','approved','blocked')"
+            ]
+            params: list[object] = []
+            if ws is not None:
+                clauses.append("workstream = %s")
+                params.append(ws)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, workstream, type, status, agent_type, claimed_by, "
+                    "assignee, priority, heartbeat_at, claimed_at, updated_at "
+                    f"FROM tasks WHERE {' AND '.join(clauses)} "
+                    "ORDER BY heartbeat_at DESC NULLS LAST, updated_at DESC "
+                    "LIMIT 200",
+                    params,
+                )
+                rows = cur.fetchall()
+            agents = [
+                {
+                    "task_id": str(r["id"]),
+                    "workstream": r["workstream"],
+                    "type": r["type"],
+                    "status": r["status"],
+                    "agent_type": r["agent_type"],
+                    "identity": r["claimed_by"],
+                    "assignee": r["assignee"],
+                    "priority": r["priority"],
+                    "heartbeat_at": (
+                        r["heartbeat_at"].isoformat() if r["heartbeat_at"] else None
+                    ),
+                    "claimed_at": (
+                        r["claimed_at"].isoformat() if r["claimed_at"] else None
+                    ),
+                    "updated_at": (
+                        r["updated_at"].isoformat() if r["updated_at"] else None
+                    ),
+                }
+                for r in rows
+            ]
+            _audit(
+                conn, type=EVENT_GATEWAY_ACCESS, identity=allowed.identity,
+                verb="agents_status", scope=SCOPE_READ, status=200,
+                workstream=ws,
+            )
+            return {"agents": agents, "count": len(agents)}
+        finally:
+            _close(conn)
+
+    @app.get("/v1/studio/status")
+    def studio_status_view(
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
+        """Aggregate studio queue pulse (``read`` scope) — test traffic filtered."""
+        allowed = _gate(
+            authorization=authorization, scope=SCOPE_READ, verb="studio_status",
+        )
+        conn = _open("studio_status")
+        try:
+            from spokesman.runtime_bridge import studio_status as _studio_status
+
+            snap = _studio_status(conn, workstream=allowed.workstream)
+            _audit(
+                conn, type=EVENT_GATEWAY_ACCESS, identity=allowed.identity,
+                verb="studio_status", scope=SCOPE_READ, status=200,
+                workstream=allowed.workstream,
+            )
+            return {
+                "queued": snap.queued,
+                "in_progress": snap.in_progress,
+                "blocked": snap.blocked,
+                "done": snap.done,
+                "failed": snap.failed,
+                "pending_approvals": snap.pending_approvals,
+                "spent_tokens": snap.spent_tokens,
+                "open_tasks": snap.open_tasks,
+                "workstream": allowed.workstream,
+            }
+        finally:
+            _close(conn)
+
+    @app.get("/v1/events/recent")
+    def events_recent(
+        limit: Optional[int] = None,
+        workstream: Optional[str] = None,
+        task_id: Optional[str] = None,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
+        """Recent event-log pulse (``read`` scope) — types/ids only, no bodies."""
+        allowed = _gate(
+            authorization=authorization, scope=SCOPE_READ, verb="events_recent",
+            workstream=workstream,
+        )
+        conn = _open("events_recent")
+        try:
+            capped = max(1, min(int(limit or 50), 200))
+            ws = allowed.workstream
+            clauses = ["1=1"]
+            params: list[object] = []
+            if ws is not None:
+                clauses.append("workstream = %s")
+                params.append(ws)
+            if task_id:
+                try:
+                    tid = UUID(str(task_id).strip())
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400, detail="task_id must be a UUID",
+                    ) from exc
+                clauses.append("task_id = %s")
+                params.append(tid)
+            params.append(capped)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT seq, type, workstream, task_id, ts "
+                    f"FROM events WHERE {' AND '.join(clauses)} "
+                    "ORDER BY seq DESC NULLS LAST LIMIT %s",
+                    params,
+                )
+                rows = cur.fetchall()
+            events = [
+                {
+                    "seq": r["seq"],
+                    "type": r["type"],
+                    "workstream": r["workstream"],
+                    "task_id": str(r["task_id"]) if r["task_id"] else None,
+                    "ts": r["ts"].isoformat() if r["ts"] else None,
+                }
+                for r in rows
+            ]
+            _audit(
+                conn, type=EVENT_GATEWAY_ACCESS, identity=allowed.identity,
+                verb="events_recent", scope=SCOPE_READ, status=200,
+                workstream=ws,
+            )
+            return {"events": events, "count": len(events)}
+        finally:
+            _close(conn)
+
+    @app.get("/v1/agents/env")
+    def agents_env(
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
+        """Non-secret host markers a remote can use for orientation (``read``).
+
+        Never returns DSNs, tokens, API keys, or personal data (ADR-0011).
+        """
+        allowed = _gate(
+            authorization=authorization, scope=SCOPE_READ, verb="agents_env",
+        )
+        from runtime.traffic import default_traffic
+
+        payload = {
+            "traffic_default": default_traffic(),
+            "identity": allowed.identity,
+            "scopes": sorted(allowed.token.scopes),
+            "workstream_pin": allowed.workstream,
+            "gateway_workstream": GATEWAY_WORKSTREAM,
+        }
+        # Audit without opening a DB when possible — still record when DB is up.
+        conn = None
+        try:
+            conn = _open("agents_env")
+            _audit(
+                conn, type=EVENT_GATEWAY_ACCESS, identity=allowed.identity,
+                verb="agents_env", scope=SCOPE_READ, status=200,
+            )
+        except Exception:  # noqa: BLE001 - env view must not fail on audit/store outage
+            logger.warning("agents_env audit skipped (store unavailable)")
+        finally:
+            if conn is not None:
+                _close(conn)
+        return payload
 
     def _held_task(conn: Any, task_id: UUID, allowed: Allowed, *, verb: str) -> Any:
         """Fetch a task this identity is allowed to act on, or raise 404/403.

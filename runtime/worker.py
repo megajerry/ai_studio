@@ -200,11 +200,38 @@ def _handle_pm_tick(
     charter: Optional[str] = None,
     overlay: Optional[str] = None,
 ) -> RunResult:
+    from runtime.tasks import block_task
+
     plan = run_pm(
         conn, task, sink, registry=model_registry, skills=skills, enqueue=enqueue,
         charter=charter, overlay=overlay,
     )
     heartbeat(conn, task.id, worker_id)
+
+    # Pushback must PARK the tick on the 🛑 approval — not merge it. Merging made
+    # human `approve <id>` a no-op for PM (resume_approved only requeues blocked
+    # tasks). Mirror the work-task 🔴 path.
+    if plan.decision == "pushback" and plan.approval_id:
+        try:
+            approval_uuid = UUID(str(plan.approval_id))
+        except (TypeError, ValueError):
+            approval_uuid = None
+        if approval_uuid is not None:
+            block_task(
+                conn, task.id,
+                approval_id=approval_uuid,
+                reason=plan.reason or "PM pushback awaiting human approval",
+            )
+            return RunResult(
+                task_id=str(task.id),
+                task_type=task.type,
+                kind="pm",
+                outcome="blocked",
+                detail=(
+                    f"pushed back (🛑 approval {plan.approval_id}): {plan.reason}"
+                ),
+            )
+
     complete(conn, task.id, result=plan.model_dump(), status=TaskStatus.MERGED)
     if plan.decision == "planned":
         detail = f"decomposed into {plan.work_item_count} work item(s): {plan.work_task_ids}"
