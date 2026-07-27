@@ -1,0 +1,9 @@
+# AI Studio task gateway — the non-LAN remote task surface (ADR-0027).
+# Small, single-purpose FastAPI service. Config/secrets come from the
+# environment at runtime (ADR-0011); nothing sensitive is baked into the image.
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+# Every handler goes through runtime.tasks (the canonical lifecycle guard), which
+# talks to Postgres. Same pin as runtime/requirements.txt.
+psycopg[binary]>=3.2,<4.0

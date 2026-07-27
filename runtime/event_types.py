@@ -246,7 +246,7 @@ EVENT_COMMS_FABRICATION_DETECTED = "comms.fabrication_detected"
 EVENT_TRUST_STRIKE = "trust.strike"
 EVENT_TRUST_CAPABILITY_REVOKED = "trust.capability_revoked"
 
-# --- Spokesman conversational interface (ADR-0026) ---------------------------
+# --- Spokesman conversational interface (ADR-0028) ---------------------------
 #: Body-free: ids / kinds / roles / task ids only — never message or goal text
 #: (those live in channel logs / task payloads / local tables; invariants 5 & 6).
 EVENT_HUMAN_MESSAGE = "human.message"
@@ -255,6 +255,19 @@ EVENT_SPOKESMAN_PREP_READY = "spokesman.prep_ready"
 EVENT_HANDOFF_PROPOSED = "handoff.proposed"
 EVENT_HANDOFF_ACTIVATED = "handoff.activated"
 EVENT_HANDOFF_ENDED = "handoff.ended"
+
+# --- Remote task gateway (gateway/, ADR-0027) --------------------------------
+#: The non-LAN remote surface's audit trail. BODY-FREE: payloads carry ONLY the
+#: token IDENTITY + the verb + the required scope + the HTTP status + a decision
+#: reason CODE — NEVER the token, the task payload, or any driver/DSN text
+#: (invariants 5 & 6, mirroring the ``policy.decision`` / ``search.denied``
+#: discipline). ``gateway.access`` = an authorized remote call was served (so a
+#: read, which changes no state, still leaves a trace); ``gateway.denied`` = an
+#: AUTHENTICATED call was refused (missing scope / wrong workstream / rate limit /
+#: not the claim owner). An UNAUTHENTICATED refusal is deliberately NOT written
+#: here — it touches no DB, so an internet-facing flood cannot exhaust connections.
+EVENT_GATEWAY_ACCESS = "gateway.access"
+EVENT_GATEWAY_DENIED = "gateway.denied"
 
 # --- Experiments (runtime.experiment) ---------------------------------------
 EVENT_PROPOSED = "experiment.proposed"

@@ -14,16 +14,16 @@ Run it::
 
 Checks (all run off-host except where noted):
 
-- **imports** — ``runtime`` + ``spokesman`` (and core submodules) import, and every
-  package declared in the ``requirements.txt`` files resolves.
+- **imports** — ``runtime`` + ``spokesman`` + ``gateway`` (and core submodules)
+  import, and every package declared in the ``requirements.txt`` files resolves.
 - **migrations** — filenames form a contiguous ``0001..000N`` sequence (no gap /
   collision) and, when a DB is reachable, every migration applies cleanly to a
   throwaway isolated schema (HOST-REQUIRED when no DB is reachable).
 - **demo** — ``python -m runtime.demo`` exits 0 (keyless; itself defers cleanly
   when no DB is reachable).
 - **config-coverage** — the high-value check. Cross-checks every env var / secret
-  NAME the runtime + spokesman actually *read* (AST scan, resolving name-constant
-  indirection) against ``.env.example`` AND ``scripts/onboarding.sh``. A
+  NAME the runtime + spokesman + gateway actually *read* (AST scan, resolving
+  name-constant indirection) against ``.env.example`` AND ``scripts/onboarding.sh``. A
   **secret-shaped** var the code reads but neither documents/collects is a FAIL
   ("code needs X but cold-start never asks for it"); undocumented non-secret knobs
   (with code defaults) are reported informationally. Only NAMES are ever printed,
@@ -198,7 +198,7 @@ def scan_env_reads_source(source: str) -> dict[str, bool]:
     return found
 
 
-def scan_env_reads(bases: Iterable[str] = ("runtime", "spokesman"),
+def scan_env_reads(bases: Iterable[str] = ("runtime", "spokesman", "gateway"),
                    root: Path = REPO_ROOT) -> dict[str, bool]:
     """Aggregate :func:`scan_env_reads_source` over every non-test source file."""
     out: dict[str, bool] = {}
@@ -292,7 +292,8 @@ _DEP_IMPORT_NAME = {
 
 def _declared_deps(root: Path) -> set[str]:
     deps: set[str] = set()
-    for req in ("runtime/requirements.txt", "spokesman/requirements.txt"):
+    for req in ("runtime/requirements.txt", "spokesman/requirements.txt",
+                "gateway/requirements.txt"):
         path = root / req
         if not path.exists():
             continue
@@ -313,7 +314,8 @@ def check_imports(root: Path = REPO_ROOT) -> CheckResult:
     failures: list[str] = []
 
     for mod in ("runtime", "spokesman", "runtime.db", "runtime.migrate",
-                "runtime.models", "runtime.demo", "spokesman.app"):
+                "runtime.models", "runtime.demo", "spokesman.app",
+                "gateway.app", "gateway.client"):
         try:
             importlib.import_module(mod)
         except Exception as exc:  # noqa: BLE001 - report any import failure
@@ -486,11 +488,11 @@ def check_compose_coherence(root: Path = REPO_ROOT) -> CheckResult:
         if ref not in bootstrap_text and "healthcheck.sh" not in bootstrap_text:
             missing.append(f"bootstrap does not invoke {ref}")
 
-    # Spokesman build context Dockerfile referenced by compose.
-    if "spokesman/Dockerfile" in compose.read_text("utf-8") and not (
-        root / "spokesman" / "Dockerfile"
-    ).exists():
-        missing.append("compose references spokesman/Dockerfile which is missing")
+    # Every build-context Dockerfile compose references must exist.
+    for m in re.finditer(r"dockerfile:\s*([^\s#]+)", compose.read_text("utf-8")):
+        dockerfile = m.group(1).strip().strip('"').strip("'")
+        if not (root / dockerfile).exists():
+            missing.append(f"compose references {dockerfile} which is missing")
 
     if missing:
         details.extend(missing)

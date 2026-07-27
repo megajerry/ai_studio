@@ -1,0 +1,4 @@
+# Dev/test dependencies (superset of runtime). Install with:
+#   pip install -r gateway/requirements-dev.txt
+-r requirements.txt
+pytest>=8.0,<10.0
