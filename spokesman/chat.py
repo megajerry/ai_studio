@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from typing import Any, Optional
 
 
 def _js_string(value: str) -> str:
@@ -37,12 +38,37 @@ def extract_embedded_token(page_html: str) -> str:
     return json.loads(literal)
 
 
-def render_chat(*, channel: str, dry_run: bool, token: str) -> str:
+def _model_banner(model_mode: Optional[dict[str, Any]]) -> str:
+    """HTML-escaped MODEL indicator for the header (ADR-0026).
+
+    Distinct from the CHANNEL indicator: it says whether the Spokesman's *brain* is
+    a real provider or the keyless dry-run stub, so a stubbed brain can't hide
+    behind a LIVE channel banner. ``model_mode`` is the dict from
+    :func:`spokesman.context.spokesman_model_mode`; ``None`` degrades to STUB.
+    """
+    if not model_mode or model_mode.get("dry_run", True):
+        return "model: STUB (dry-run — set ANTHROPIC_API_KEY)"
+    model_id = str(model_mode.get("model") or "unknown")
+    return f"model: LIVE ({model_id})"
+
+
+def render_chat(
+    *,
+    channel: str,
+    dry_run: bool,
+    token: str,
+    model_mode: Optional[dict[str, Any]] = None,
+) -> str:
     """Return the chat page. ``token`` is embedded for same-origin API calls only
-    (the page is itself token-gated via ``?token=``)."""
+    (the page is itself token-gated via ``?token=``).
+
+    ``model_mode`` (from :func:`spokesman.context.spokesman_model_mode`) drives a
+    distinct MODEL indicator in the header (real provider vs dry-run stub); ``None``
+    degrades to STUB — see :func:`_model_banner` (ADR-0026)."""
     mode = "DRY-RUN" if dry_run else "LIVE"
     esc_token = html.escape(token, quote=True)
     esc_channel = html.escape(channel, quote=True)
+    esc_model = html.escape(_model_banner(model_mode), quote=True)
     token_js = _js_string(token)
     return f"""\
 <!doctype html>
@@ -102,7 +128,7 @@ def render_chat(*, channel: str, dry_run: bool, token: str) -> str:
   <header>
     <div>
       <h1>AI Studio · Spokesman</h1>
-      <div class="meta">{esc_channel} · {mode} · web fallback</div>
+      <div class="meta">{esc_channel} · {mode} · web fallback · {esc_model}</div>
     </div>
     <div class="meta"><a href="/dashboard?token={esc_token}">Dashboard</a></div>
   </header>

@@ -366,11 +366,18 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict:
+        # `dry_run`/`channel` describe the CHANNEL (SMS/WhatsApp). The `model` block
+        # describes the BRAIN: which model converse would use and whether it is a
+        # real provider or the keyless dry-run stub (ADR-0026). Non-secret — the
+        # helper never returns a key. Makes no model call.
+        from .context import spokesman_model_mode
+
         return {
             "status": "ok",
             "dry_run": settings.dry_run,
             "channel": settings.channel,
             "pending_digest": notifier.pending_count,
+            "model": spokesman_model_mode(),
         }
 
     @app.get("/privacy", response_class=HTMLResponse)
@@ -393,11 +400,14 @@ def create_app(
         require_dashboard_token(token=token, x_spokesman_token=x_spokesman_token)
         # Prefer query token so the page can call the API without a header UI.
         page_token = token or x_spokesman_token or ""
+        from .context import spokesman_model_mode
+
         return HTMLResponse(
             render_chat(
                 channel=settings.channel,
                 dry_run=settings.dry_run,
                 token=page_token,
+                model_mode=spokesman_model_mode(),
             )
         )
 

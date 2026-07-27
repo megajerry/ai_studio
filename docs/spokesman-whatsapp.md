@@ -18,6 +18,22 @@ All secrets/config come from the environment; nothing sensitive is committed
 (ADR-0011). The service runs with **no live credentials** in dry-run mode
 (`SPOKESMAN_DRY_RUN=1`) — outbound sends are logged instead of called out.
 
+### Model key required (ADR-0026)
+
+The Spokesman is now a **model-first agent** — it thinks with a real LLM, not a
+scripted keyword matcher. That means it needs a **model-provider key**
+(`ANTHROPIC_API_KEY`, or a fallback provider's key) available **inside its
+container**. `docker-compose.yml` forwards these to the `spokesman` service and
+`scripts/onboarding.sh` collects them into `.env`. Without one, the chat brain
+silently degrades to a limited keyword-only stub — and, crucially, this is now
+**visible**: `/health` (`model` block) and the web-chat header banner both report
+`model: STUB` when no key is present versus `model: LIVE (<model-id>)` when a
+provider is wired.
+
+Note this is **independent of the channel dry-run.** `SPOKESMAN_DRY_RUN` /
+`LIVE` in the banner describes only the SMS/WhatsApp **channel**; a "LIVE" channel
+with a stubbed brain is exactly the silent gap this indicator closes.
+
 ---
 
 ## 0. Prerequisites
@@ -98,7 +114,9 @@ Note the public URL, e.g. `https://spokesman.example.com`. Your webhook URL is
 docker compose --profile spokesman up -d spokesman
 # health check:
 curl -s http://localhost:${SPOKESMAN_PORT:-8080}/health
-# -> {"status":"ok","dry_run":false,"pending_digest":0}
+# -> {"status":"ok","dry_run":false,"channel":"...","pending_digest":0,
+#     "model":{"task":"converse","provider":"anthropic","model":"claude-sonnet-5","dry_run":false}}
+# (model.dry_run=true + provider "dryrun" means no model key is wired — the brain is a stub.)
 ```
 
 The `spokesman` service is behind a **compose profile**, so a plain
@@ -186,7 +204,7 @@ on an interval (cron / the scheduler) alongside a periodic `POST /digest/flush`.
 
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
-| GET | `/health` | public | liveness + dry-run + pending digest count |
+| GET | `/health` | public | liveness + channel dry-run + pending digest count + `model` mode block (ADR-0026) |
 | GET | `/webhook` | public | Meta verification handshake |
 | POST | `/webhook` | HMAC signature | inbound messages: `status` / `approve <id>` / `deny <id>` (HMAC-SHA256 verified) |
 | POST | `/notify` | `X-Spokesman-Token` | `{"kind":"approve\|inform\|alarm","text":"…"}` → classify + route |
