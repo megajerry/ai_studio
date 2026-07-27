@@ -177,13 +177,16 @@ def _default_fail_exhausted(
 ) -> Optional[Task]:
     """Force-fail a task that has exhausted its re-kicks; emit the audit event.
 
-    Guarded to ``in_progress``: the automatic exhausted-fail must NOT clobber a
-    task that self-completed (reached ``done``/``failed``) in the scan→write
-    window (``find_stale_tasks`` → here). Like :func:`runtime.tasks.rekick_task`,
-    we finalize only a task still ``in_progress``; if it already reached a
-    terminal state ``complete_task`` (unforced) leaves it untouched and returns
-    ``None``, and this returns ``None`` (the sweep logs a skip). ``force`` on
-    :func:`complete_task` stays available for genuine manual use.
+    Guarded to the actively-held states (``claimed``/``in_progress``, matching
+    ``find_stale_tasks``): the automatic exhausted-fail must NOT clobber a task that
+    self-completed (reached a terminal state) in the scan→write window
+    (``find_stale_tasks`` → here), but it MUST still terminalize a task that died in
+    the grab→start window and is stuck ``claimed`` (otherwise it livelocks here
+    forever, breaking "no task silently dropped"). Like
+    :func:`runtime.tasks.rekick_task`, we finalize only a task still held; if it
+    already reached a terminal state ``complete_task`` (unforced) leaves it
+    untouched and returns ``None``, and this returns ``None`` (the sweep logs a
+    skip). ``force`` on :func:`complete_task` stays available for genuine manual use.
 
     On a real fail, ``complete_task`` finalizes the row and emits
     ``task.finished``; we additionally emit ``task.failed_exhausted`` so the
@@ -195,6 +198,7 @@ def _default_fail_exhausted(
             conn,
             task.id,
             status=TaskStatus.ABANDONED,
+            expected_from=(TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS),
             result={
                 "reason": "max_retries_exhausted",
                 "retries": task.retries,
@@ -315,7 +319,7 @@ def sweep(
                     )
                 else:
                     log.info(
-                        "skipped stuck-escalation of task %s: no longer in_progress "
+                        "skipped stuck-escalation of task %s: no longer held "
                         "(self-completed before sweep)", task.id,
                     )
             elif task.retries >= max_retries:
@@ -328,7 +332,7 @@ def sweep(
                     )
                 else:
                     log.info(
-                        "skipped exhausted-fail of task %s: no longer in_progress "
+                        "skipped exhausted-fail of task %s: no longer held "
                         "(self-completed before sweep)", task.id,
                     )
             else:
