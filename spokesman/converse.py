@@ -253,12 +253,25 @@ def handle_conversation(
     msg: Any,
     *,
     notifier: Any = None,
+    session_key: Optional[str] = None,
 ) -> ConverseOutcome:
-    """Run the Spokesman agent on one inbound free-text message."""
+    """Run the Spokesman agent on one inbound free-text message.
+
+    ``session_key`` scopes conversation memory (migration 0018): the web client
+    passes a stable per-conversation id; SMS/WhatsApp fall back to the sender id.
+    Prior turns for this session are loaded and threaded into the model prompt so
+    the Spokesman is no longer amnesiac across turns, and both this human turn and
+    the reply are persisted. Degrade-safe: if the DB is down there is simply no
+    history and nothing is persisted — the Spokesman still replies (ADR-0026: this
+    surface must work when other things are down).
+    """
     del notifier  # reserved: future grounded outbound from agent claims
     text = (msg.text or "").strip()
     to = getattr(msg, "sender", None) or None
     workstream = getattr(settings, "workstream", None) or "productivity"
+    # Session key: explicit (web) → sender id (SMS/WhatsApp) → stable fallback so a
+    # keyless/older client is still ONE coherent session rather than amnesiac.
+    session = (session_key or "").strip() or (getattr(msg, "sender", None) or "").strip() or "web"
 
     conn = None
     sink: EventSink = NullEventSink()
@@ -287,8 +300,14 @@ def handle_conversation(
         workstream=workstream,
     )
 
+    # Thread bounded per-session history (ADR-0013) so turn N sees turns 1..N-1.
+    # history_messages is degrade-safe (returns [] if the DB is unavailable).
+    from .conversation import history_messages, record_turn
+
+    history = history_messages(conn, session)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
+        *history,
         {"role": "user", "content": text},
     ]
     replies: list[str] = []
@@ -357,6 +376,16 @@ def handle_conversation(
             else:
                 final_reply = "I'm here — what should we focus on?"
             replies.append(final_reply)
+
+        # Persist this exchange (human turn + Spokesman reply) so the NEXT message
+        # in this session can see it. Body lives ONLY here (invariant 6), never on
+        # an event. Best-effort: a persistence failure must never break the reply.
+        if conn is not None:
+            try:
+                record_turn(conn, session, "human", text)
+                record_turn(conn, session, "spokesman", replies[-1])
+            except Exception:  # noqa: BLE001 - memory is a nicety, the reply is not
+                logger.warning("record_turn failed; reply sent, turn not remembered")
 
         # Send once (last reply is the one for the human this turn).
         client.send_text(replies[-1], to=to)
@@ -448,6 +477,23 @@ def build_dry_run_spokesman_turn(
     text = (user_text or "").strip()
     lower = text.lower()
 
+    # Memory demonstration (keyless): if the human asks for their name and an
+    # EARLIER turn in this session stated it, recall it from threaded history.
+    # This proves conversation memory end-to-end without a real provider key; a
+    # real model does the same from the same threaded messages.
+    if re.search(r"\b(what'?s|what is)\b.*\bmy name\b", lower) or lower in {
+        "what's my name?",
+        "what is my name?",
+        "what's my name",
+    }:
+        recalled = _recall_name_from_history(messages)
+        if recalled:
+            return {"tool_calls": [], "reply": f"Your name is {recalled}."}
+        return {
+            "tool_calls": [],
+            "reply": "I don't have your name yet — tell me and I'll remember it.",
+        }
+
     # Action-shaped → use tools (model-first dry-run still "chooses" tools).
     if re.search(
         r"\b(please |pls )?(build|implement|create|ship|fix|add|enqueue|"
@@ -510,6 +556,23 @@ def build_dry_run_spokesman_turn(
             "like me to do with this?"
         ),
     }
+
+
+def _recall_name_from_history(
+    messages: Optional[list[dict[str, Any]]],
+) -> Optional[str]:
+    """Scan threaded history for an earlier ``my name is <X>`` (dry-run recall)."""
+    for msg in messages or []:
+        if str(msg.get("role")) != "user":
+            continue
+        m = re.search(
+            r"\bmy name'?s?\s+(?:is\s+)?([A-Z][a-zA-Z'\-]{1,30})",
+            str(msg.get("content") or ""),
+            re.I,
+        )
+        if m:
+            return m.group(1).strip().capitalize()
+    return None
 
 
 def _dry_run_reply_after_tools(tool_results_content: str) -> dict[str, Any]:
