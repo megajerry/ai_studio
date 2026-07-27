@@ -47,6 +47,66 @@ from .tasks import enqueue_task
 from .worker import build_registry, run_once
 
 
+#: The exact workstreams THIS demo run creates. Populated by :func:`_new_ws` and
+#: wiped by :func:`_cleanup_workstreams` in ``main()``'s finally, so the demo is a
+#: valid go-live smoke test that leaves NO residue in ANY database — including the
+#: LIVE studio DB (ADR-0028). We delete ONLY these exact strings, never a pattern.
+_created_workstreams: list[str] = []
+
+
+def _new_ws(prefix: str) -> str:
+    """Mint a demo workstream and RECORD it for scoped self-cleanup (ADR-0028)."""
+    ws = f"{prefix}-{uuid4().hex[:8]}"
+    _created_workstreams.append(ws)
+    return ws
+
+
+def _cleanup_workstreams(conn, workstreams: list[str]) -> int:
+    """Delete every row the demo created, scoped to its OWN exact workstreams.
+
+    Introspects the schema for every table with a ``workstream`` column and deletes
+    only rows matching the demo's exact workstream strings, plus the child rows tied
+    to those tasks (``task_transitions`` / ``approvals`` by ``task_id``;
+    ``trajectory_steps`` cascade on ``trajectories`` delete). ``tasks`` is deleted
+    LAST so FK-referencing rows are gone first. NEVER a global TRUNCATE/DELETE and
+    never a LIKE pattern — only the exact workstreams in ``workstreams``.
+    """
+    if not workstreams:
+        return 0
+    deleted = 0
+    with conn.cursor() as cur:
+        # Discover workstream-scoped tables (future-proof as migrations are added).
+        cur.execute(
+            "SELECT table_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND column_name = 'workstream'"
+        )
+        ws_tables = [r["table_name"] for r in cur.fetchall()]
+
+        # Child rows keyed by the demo's tasks (no workstream column of their own).
+        demo_tasks = "SELECT id FROM tasks WHERE workstream = ANY(%s)"
+        for child in ("task_transitions", "approvals"):
+            if child in ws_tables:  # defensive: they don't carry workstream
+                continue
+            cur.execute(
+                f"DELETE FROM {child} WHERE task_id IN ({demo_tasks})",
+                (workstreams,),
+            )
+            deleted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        # All workstream-scoped tables, with ``tasks`` deleted LAST (FK targets).
+        ordered = [t for t in ws_tables if t != "tasks"] + (
+            ["tasks"] if "tasks" in ws_tables else []
+        )
+        for table in ordered:
+            cur.execute(
+                f"DELETE FROM {table} WHERE workstream = ANY(%s)", (workstreams,)
+            )
+            deleted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    if not conn.autocommit:
+        conn.commit()
+    return deleted
+
+
 def _count_work_tasks(conn, workstream: str) -> int:
     """How many ``work.*`` tasks the PM enqueued for this workstream (decomposition)."""
     with conn.cursor() as cur:
@@ -84,7 +144,7 @@ def _demonstrate_learning(conn, registry, config, worker_id: str) -> bool:
     """Show the learning loop end-to-end: a work task fails → Retro distills a
     lesson into Knowledge memory → the NEXT PM prompt for that workstream is shown
     to INCLUDE the recalled lesson (deterministic apply-the-lesson step)."""
-    ws = f"learn-{uuid4().hex[:8]}"
+    ws = _new_ws("learn")
     sink = DbEventSink(conn)
     query = "work.demo verification success criterion marker"
     base = _PM_BASE_PROMPT.format(goal="prove the studio learns")
@@ -149,7 +209,7 @@ def _demonstrate_review(conn, registry, config, scratch: str) -> bool:
     clean episode and FLAGS a hallucinated-success one (a done/verified CLAIM whose
     real artifact lacks the marker) — escalating with 🚨 review.alarm + a 🛑 approval.
     The verdict rests on the ACTUAL artifact evidence, never a claim (ADR-0014)."""
-    ws = f"review-{uuid4().hex[:8]}"
+    ws = _new_ws("review")
     sink = DbEventSink(conn)
     print(f"\n=== reviewer / whistle-blower demo (workstream={ws}) ===")
 
@@ -195,7 +255,7 @@ def _demonstrate_research(conn, registry, config, worker_id: str) -> bool:
     → search runs through the policy-gated cached gateway (net.fetch, keyless
     dry-run) → findings are distilled into recallable Knowledge lessons. The
     research task enqueues NOTHING (no research-loop)."""
-    ws = f"research-{uuid4().hex[:8]}"
+    ws = _new_ws("research")
     sink = DbEventSink(conn)
     print(f"\n=== researcher demo (workstream={ws}) ===")
 
@@ -227,7 +287,7 @@ def _demonstrate_critic(conn, skills) -> bool:
     consensus and decomposes; (2) on an unresolved genuine disagreement the loop is
     BOUNDED and escalates a 🛑 pushback to the stakeholder (never an infinite loop).
     Distinct from the after-the-fact Reviewer: it critiques BEFORE commitment."""
-    ws = f"critic-{uuid4().hex[:8]}"
+    ws = _new_ws("critic")
     sink = DbEventSink(conn)
     print(f"\n=== critic / PM↔Critic consensus demo (workstream={ws}) ===")
 
@@ -269,8 +329,8 @@ def _demonstrate_workstream_config(conn, scratch: str) -> bool:
     from .workstream import bootstrap_workstream, resolve_workstream_config
     from .worker import run_once
 
-    ws = f"vconfig-{uuid4().hex[:8]}"
-    other = f"vother-{uuid4().hex[:8]}"
+    ws = _new_ws("vconfig")
+    other = _new_ws("vother")
     base_dir = Path(tempfile.mkdtemp(prefix="ai_studio_ws_"))
     (base_dir / ws).mkdir()
     (base_dir / ws / "config.yaml").write_text(
@@ -374,7 +434,7 @@ def _demonstrate_failure_analyst(conn, scratch: str) -> bool:
     )
     from .tools import FilesystemTool, ToolRegistry
 
-    ws = f"fail-{uuid4().hex[:8]}"
+    ws = _new_ws("fail")
     sink = DbEventSink(conn)
     reg = ToolRegistry()
     reg.register(FilesystemTool(root=scratch))
@@ -451,7 +511,7 @@ def _demonstrate_curator(conn, scratch: str) -> bool:
     from .tools import FilesystemTool, ToolRegistry
     from .trajectory import add_step, close_trajectory, start_trajectory
 
-    ws = f"curate-{uuid4().hex[:8]}"
+    ws = _new_ws("curate")
     sink = DbEventSink(conn)
     reg = ToolRegistry()
     reg.register(FilesystemTool(root=scratch))
@@ -516,6 +576,8 @@ def _demonstrate_curator(conn, scratch: str) -> bool:
 def main() -> int:
     # Keyless by construction — dry-run every model call.
     os.environ.setdefault("MODELS_DRY_RUN", "1")
+    # Fresh ledger of this run's own workstreams (for scoped self-cleanup).
+    _created_workstreams.clear()
 
     if not db.can_connect(timeout=2.0):
         print(
@@ -526,7 +588,7 @@ def main() -> int:
         )
         return 0
 
-    workstream = f"demo-{uuid4().hex[:8]}"
+    workstream = _new_ws("demo")
     scratch = tempfile.mkdtemp(prefix="ai_studio_demo_")
     registry = build_registry(scratch)
     config = load_policy()
@@ -602,6 +664,17 @@ def main() -> int:
 
         return 0 if (ok and learned and reviewed and researched and configured and critiqued and healed and curated) else 1
     finally:
+        # Self-cleanup (ADR-0028): leave NO residue in ANY database — including the
+        # LIVE studio DB — so `python -m runtime.demo` stays a safe go-live smoke
+        # test. Scoped to the demo's OWN exact workstreams; guarded so a cleanup
+        # hiccup never crashes the run or flips the exit code.
+        try:
+            removed = _cleanup_workstreams(conn, list(_created_workstreams))
+            print(f"runtime.demo: self-cleanup removed {removed} row(s) across "
+                  f"{len(_created_workstreams)} demo workstream(s) — no residue left")
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the demo result
+            print(f"runtime.demo: WARNING self-cleanup failed ({type(exc).__name__}: "
+                  f"{exc}); demo's synthetic workstreams may remain")
         conn.close()
 
 

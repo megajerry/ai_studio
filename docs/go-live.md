@@ -43,7 +43,11 @@ gate — do not proceed to "bring up infra" while it reports a `FAIL`.
       lines are the checks only the target Mac can confirm (below) — they are not
       failures.
 - [ ] **Full test suite passes** — `make test` (runtime + spokesman + evals),
-      all keyless; DB-backed tests skip cleanly when no Postgres is reachable.
+      all keyless; DB-backed tests skip cleanly when no Postgres is reachable, and
+      **refuse to run against a non-disposable DB** (ADR-0028) — `make test` opts in
+      via `AI_STUDIO_TEST_DB=1` for a throwaway/`*_test` DB. Do NOT run `make test`
+      against the live studio DB; `python -m runtime.demo` is the go-live smoke test
+      and is safe on the host — it self-cleans its own workstreams (no residue).
 
 ---
 

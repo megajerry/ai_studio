@@ -34,3 +34,4 @@ these for detail; this file is the index.
 | [0025](0025-async-decisions.md) | Async open-ended decisions | Park → free worker → resume on free-text/option answers (open-ended sibling of approvals). |
 | [0026](0026-spokesman-conversational-interface.md) | Spokesman conversational interface | Full human↔studio NL loop; goals → `pm.tick` via queue; prep cache; approval-gated handoffs. |
 | [0027](0027-build-vs-buy-agile-adoption.md) | Build vs. buy/borrow + agile adoption | PM operating principle (not a cron): weigh building in-house vs adopting a mature component; stay agile on better paradigms without churn. |
+| [0028](0028-disposable-db-test-guard.md) | Keep the live DB sacred | DB-backed tests skip unless the target DB is disposable (`AI_STUDIO_TEST_DB` opt-in or `*_test` name); `runtime.demo` self-cleans its own workstreams. |
