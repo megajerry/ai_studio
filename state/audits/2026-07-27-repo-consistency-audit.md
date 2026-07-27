@@ -35,3 +35,19 @@ producer↔consumer, config/secret coverage complete, docker-compose coherent. `
 Verified explicitly clean: state-machine edges + no ad-hoc status writes, model routing (every task_type
 resolves), gateway auth/scope/workstream/ownership gates, body-free `EVENT_HUMAN_MESSAGE`, conversation-memory
 schema, all runtime signatures the spokesman/gateway call.
+
+## Stakeholder decisions on the flagged items (2026-07-27)
+1. **Dormant roles → generic dispatcher (BUILD).** All roles must be exposed to the PM, and the PM must be
+   able to enqueue tasks for them. The worker's agent dispatcher should be **role-agnostic** (one dispatch
+   path via a task_type→handler registry), not one bespoke branch per type. Roles are PM-enqueued by
+   judgment, NOT put on autonomous crons (see #3). Needs an ADR.
+2. **Event-log free-text → separate free-form field (BUILD).** Do NOT redact `goal`/`reason`/verifier
+   rationale — RELOCATE it out of `events.payload` (which stays body-free, invariant #6) into a dedicated
+   free-form field/store, explicitly retained as **self-improvement training data**. Needs a migration + ADR.
+3. **Router budget-downshift → deferred (NO ACTION).** Intended future state. The workstream is **not
+   self-sufficient yet and requires the off-host agent's active intervention**; wiring autonomous downshift
+   is premature. Leave the mechanism as future scaffolding.
+
+**Sequencing:** land the 8 audit-fix branches first (several touch `worker.py`/`pm.py`/migrations); then build
+#1 (generic dispatcher — generalizes the `feature_request` branch + registers the dormant roles) and #2
+(free-form training-data field) on clean merged `main`, each ADR'd + independently reviewed.
