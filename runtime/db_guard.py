@@ -14,8 +14,12 @@ A database is **disposable** iff:
 
 1. The operator explicitly opts in via a truthy ``AI_STUDIO_TEST_DB`` env var
    (the sanctioned "yes, this box's DB is a throwaway" declaration), **or**
-2. the target database *name* looks like a test database (case-insensitive: ends
-   with ``_test`` or contains ``test``).
+2. the target database *name* ends with ``_test`` (case-insensitive).
+
+The name rule is deliberately a strict ``_test`` **suffix**, NOT a loose "contains
+``test``" substring — otherwise production-ish names like ``attestation`` /
+``latest`` / ``contest`` would be silently treated as throwaway. When in doubt,
+the opt-in env var is the explicit escape hatch.
 
 Otherwise it is treated as production and DB-backed tests must skip loudly (see
 the repo-root ``conftest.py``). No secrets ever appear in the returned reason —
@@ -93,9 +97,8 @@ def require_disposable_db(
             f"as disposable — set {OPT_IN_ENV}=1 or use a *_test database"
         )
 
-    low = dbname.lower()
-    if low.endswith("_test") or "test" in low:
-        return True, f"database name {dbname!r} matches the test pattern"
+    if dbname.lower().endswith("_test"):
+        return True, f"database name {dbname!r} ends with '_test' (disposable)"
 
     return False, (
         f"refusing to run DB-backed tests against non-disposable DB {dbname!r}; "

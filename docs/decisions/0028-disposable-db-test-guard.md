@@ -28,8 +28,10 @@ non-disposable database, and `runtime.demo` self-cleans.**
 1. **A single guard** — `runtime/db_guard.py::require_disposable_db()` returns
    `(is_disposable, reason)`. A database is **disposable** iff:
    - env `AI_STUDIO_TEST_DB` is truthy (explicit operator opt-in), **or**
-   - the target database *name* matches a test pattern (case-insensitive: ends with
-     `_test` or contains `test`).
+   - the target database *name* **ends with `_test`** (case-insensitive). This is a
+     strict suffix, NOT a loose "contains `test`" substring — otherwise production-ish
+     names like `attestation` / `latest` / `contest` would be silently treated as
+     throwaway. When in doubt, the opt-in env var is the explicit escape hatch.
 
    The name is extracted robustly from the resolved dsn (URL form incl. query params,
    or libpq `dbname=` keyword form; falls back to `POSTGRES_*` via
@@ -50,18 +52,33 @@ non-disposable database, and `runtime.demo` self-cleans.**
    connects inline, all self-gating on `can_connect`. The lower-risk structural
    chokepoint is therefore **collection** (one repo-root conftest) rather than editing
    48 modules. A DB-backed item is detected structurally: it requests a connection
-   fixture (`conn`/`live_conn`/`setup_conn`) OR its module references `can_connect`
-   (exactly how every DB suite gates).
+   fixture (`conn`/`live_conn`/`setup_conn`) OR its module CALLS `can_connect(`
+   (exactly how every DB suite gates — matching the call form, not a bare mention,
+   so the guard's own unit tests are not self-flagged).
 
-3. **Demo self-containment** — `runtime.demo` tracks the exact workstreams it creates
-   (`_new_ws`) and, in `main()`'s `finally`, deletes **only those exact workstreams**
-   (`_cleanup_workstreams`): it introspects `information_schema` for every
-   workstream-scoped table plus the child rows tied to its own tasks
-   (`task_transitions` / `approvals`; `trajectory_steps` cascade), with `tasks` deleted
-   last. **Never** a global `TRUNCATE`/`DELETE`, never a `LIKE` pattern, never a row it
-   did not create. This keeps `python -m runtime.demo` a valid go-live smoke test that
-   leaves **zero residue in any database** — including the live studio DB — preserving
-   its keyless/dry-run/exit-0 semantics.
+   *CI note:* a bare `pytest` (not `make test`) against a reachable non-disposable DB
+   skips the whole DB suite yet exits 0 — an all-skipped run must not read as green.
+   CI therefore runs `make test` (which sets the opt-in) or asserts zero unexpected
+   skips.
+
+3. **Demo self-containment** — `runtime.demo` tracks the exact rows it creates and, in
+   `main()`'s `finally`, deletes **only those** (`_cleanup_workstreams`). It introspects
+   `information_schema` for every workstream-scoped table and deletes by exact
+   workstream, plus rows that have NO workstream column, tracked by exact id/key as the
+   demo creates them:
+   - child rows tied to its own tasks (`task_transitions`; `trajectory_steps` cascade);
+   - `approvals` — both those reachable via a demo task's `task_id` **and** the two
+     parentless ones the demo raises directly: the reviewer `review` approval (whose
+     `task_id` points at a synthetic Task never inserted) and the experiment
+     `experiment.scale` approval (`task_id IS NULL`), tracked by exact `approvals.id`;
+   - `search_cache` — the researcher step's cached row(s), tracked by exact
+     (`query_hash`,`provider`,`k`) key via a tight before/after snapshot.
+
+   FK-safe order: `spokesman_handoffs` (its `approval_id → approvals` is `NO ACTION`)
+   before `approvals`; `tasks` deleted LAST. **Never** a global `TRUNCATE`/`DELETE`,
+   never a `LIKE` pattern, never a row it did not create. Verified: two consecutive
+   `python -m runtime.demo` runs leave **zero net rows in EVERY table** (incl.
+   `approvals` / `search_cache`), preserving keyless/dry-run/exit-0 semantics.
 
 4. **Sanctioned invocation** — the `Makefile` `test` / `coverage` / `evals` targets set
    `AI_STUDIO_TEST_DB=1` inline (scoped to those targets only; never exported), so the

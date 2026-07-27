@@ -45,9 +45,13 @@ def test_test_suffixed_db_is_disposable_without_opt_in():
     assert "aistudio_test" in reason
 
 
-def test_db_name_containing_test_is_disposable():
-    ok, _ = require_disposable_db("postgresql://u@h/testing_ground", env={})
-    assert ok is True
+def test_loose_test_substring_is_NOT_disposable():
+    # Production-ish names that merely CONTAIN "test" must NOT be auto-disposable
+    # (only the strict ``_test`` suffix or the explicit opt-in qualifies).
+    for name in ("attestation", "latest", "contest", "testbed", "test_fixtures"):
+        ok, reason = require_disposable_db(f"postgresql://u@h/{name}", env={})
+        assert ok is False, name
+        assert "refusing" in reason.lower()
 
 
 def test_production_db_without_opt_in_is_not_disposable():

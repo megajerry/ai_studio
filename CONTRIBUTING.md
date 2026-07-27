@@ -62,6 +62,9 @@ Any actor that intends to change this repo follows this loop:
   database. Never set `AI_STUDIO_TEST_DB` on a host that runs the real studio.
   `python -m runtime.demo` is exempt — it self-cleans its own workstreams and is
   safe to run on the host.
+  - **CI must use `make test`** (or assert zero unexpected skips). A bare `pytest`
+    against a reachable non-disposable DB skips the whole DB suite yet still exits 0,
+    so an all-skipped run could otherwise be mistaken for a green pass.
 - **Respect the invariants** in [`CLAUDE.md`](CLAUDE.md). A change that breaks one
   must carry an ADR justifying it.
 - **Self-sufficiency.** A change isn't done until a fresh `git clone` on the
