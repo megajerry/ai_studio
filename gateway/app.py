@@ -160,7 +160,7 @@ class ClaimRequest(BaseModel):
     #: tasks, so a remote never steals work explicitly pinned to the host.
     assignee: Optional[str] = Assignee.OFFHOST.value
 
-    @field_validator("workstream", "agent_type", "assignee")
+    @field_validator("workstream", "agent_type")
     @classmethod
     def _identifier_or_none(cls, v: Optional[str]) -> Optional[str]:
         if v is None or not str(v).strip():
@@ -168,6 +168,35 @@ class ClaimRequest(BaseModel):
         value = str(v).strip().lower()
         if not is_identifier(value):
             raise ValueError("must match [a-z0-9][a-z0-9._-]{0,63}")
+        return value
+
+    @field_validator("assignee")
+    @classmethod
+    def _offhost_only(cls, v: Optional[str]) -> str:
+        """A remote may ONLY ever grab from the ``offhost`` pool (or unassigned).
+
+        The pool the queue grabs from is ``(assignee IS NULL OR assignee = value)``
+        (``runtime.tasks.grab_task``) — and a ``None`` assignee drops that clause
+        entirely, so the grab spans EVERY pool including ``host``. That makes both
+        ``host`` *and* a blank/``null`` assignee steal host-pinned work, exactly
+        what ADR-0028 forbids ("Cannot: claim work pinned to host").
+
+        So this validator NEVER yields ``None``: an omitted key uses the field
+        default (``offhost``), and an explicit ``null``/blank (which still runs the
+        validator, bypassing the default) is coerced to ``offhost`` too. Anything
+        other than ``offhost`` — ``host`` or any unknown value — is rejected at
+        validation with a 422, so an out-of-range string can never reach
+        ``Assignee(...)`` and blow up as an ungraceful 500. The model therefore
+        always carries ``offhost``, and the handler never passes ``None`` on.
+        """
+        if v is None or not str(v).strip():
+            return Assignee.OFFHOST.value
+        value = str(v).strip().lower()
+        if value != Assignee.OFFHOST.value:
+            raise ValueError(
+                f"assignee must be {Assignee.OFFHOST.value!r} "
+                "(a remote may not grab from the host pool)"
+            )
         return value
 
 
@@ -560,10 +589,14 @@ def create_app(
         )
         conn = _open("claim")
         try:
+            # ``req.assignee`` is validated to be ``offhost`` and never blank/None
+            # (see ClaimRequest._offhost_only), so a remote is ALWAYS constrained to
+            # the offhost pool — passing ``assignee=None`` here would drop the pool
+            # clause and grab host-pinned work (ADR-0028).
             task = claim_task(
                 conn,
                 worker_id=allowed.identity,
-                assignee=Assignee(req.assignee) if req.assignee else None,
+                assignee=Assignee(req.assignee),
                 workstream=allowed.workstream,
                 # Bookkeeping label only — does not filter which types are grabbable.
                 # Remotes pass agent_type=pm (etc.) when acting as that role.

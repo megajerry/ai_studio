@@ -442,12 +442,10 @@ def main(argv: Optional[list] = None) -> int:
         dest="agent_type",
         help="role label recorded on the claim (pm, executor, remote, …)",
     )
-    p_claim.add_argument(
-        "--assignee",
-        choices=["host", "offhost"],
-        default="offhost",
-        help="pool filter (default offhost|unassigned; never steals host-pinned)",
-    )
+    # A remote may only grab from the ``offhost`` pool (or unassigned) — targeting
+    # ``host`` would steal host-pinned work, which the gateway rejects with a 422
+    # (ADR-0028). Only ``offhost`` is offered so the client never mints such a call.
+    p_claim.add_argument("--assignee", choices=["offhost"], default="offhost")
 
     p_agents = sub.add_parser(
         "agents", help="who is running what (in-flight tasks + heartbeats)"

@@ -260,6 +260,50 @@ def test_identifier_shaped_input_only(body: dict) -> None:
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("assignee", ["host", "HOST", " host ", "bogus", "root", "!!"])
+def test_claim_refuses_any_assignee_but_offhost(assignee: str) -> None:
+    """A ``claim``-scoped remote may only target the ``offhost`` pool.
+
+    ``host`` (the steal vector — ADR-0028's "Cannot: claim work pinned to host")
+    and any unknown value are rejected at VALIDATION with a 422, BEFORE the handler
+    opens a connection — so ``exploding_connect`` is never reached (no 503, and,
+    crucially for ``bogus``, no ungraceful 500 from ``Assignee(...)``).
+    """
+    resp = _client().post(
+        "/v1/tasks/claim", json={"assignee": assignee}, headers=bearer(FULL_SECRET)
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"assignee": "offhost"}, {"assignee": None}, {"assignee": ""},
+     {"assignee": "   "}, {"assignee": "\t"}],
+)
+def test_claim_accepts_offhost_and_default(body: dict) -> None:
+    """The allowed shapes clear validation and reach the store (a 503 here proves
+    the request passed the body gate — ``exploding_connect`` fails only afterward).
+
+    Note ``null``/blank are ACCEPTED (they coerce to ``offhost``, not rejected) —
+    the pool-scoping that keeps them safe is asserted end-to-end against a live DB
+    in ``test_gateway_db.py`` (a blank assignee must not steal host-pinned work)."""
+    resp = _client().post("/v1/tasks/claim", json=body, headers=bearer(FULL_SECRET))
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"] == DB_UNAVAILABLE_DETAIL
+
+
+def test_claim_coerces_blank_assignee_to_offhost() -> None:
+    """Unit-level proof of the coercion: an explicit ``null``/blank assignee (which
+    bypasses the field default) resolves to ``offhost`` on the model, so the handler
+    never passes ``assignee=None`` (= any pool, incl. host) to the queue."""
+    from gateway.app import ClaimRequest
+    from runtime.models import Assignee
+
+    for raw in (None, "", "   ", "\t"):
+        assert ClaimRequest(assignee=raw).assignee == Assignee.OFFHOST.value
+    assert ClaimRequest().assignee == Assignee.OFFHOST.value  # omitted key
+
+
 def test_complete_rejects_a_non_terminal_status() -> None:
     resp = _client().post(
         "/v1/tasks/11111111-1111-1111-1111-111111111111/complete",
