@@ -191,13 +191,13 @@ class TaskGatewayClient:
         *,
         workstream: Optional[str] = None,
         agent_type: Optional[str] = None,
-        assignee: Optional[str] = None,
+        assignee: Optional[str] = "offhost",
     ) -> dict:
         """Claim the next grabbable task.
 
         Remotes may act as any role (pass ``agent_type=pm`` etc.). ``assignee``
-        defaults to unset so host- and offhost-pool work are both visible; pass
-        ``offhost`` / ``host`` to narrow deliberately.
+        defaults to ``offhost`` (also matches unassigned) so host-pinned work is
+        not stolen; pass ``host`` only when deliberately taking host-pool work.
         """
         return self._request(
             "POST", "/v1/tasks/claim",
@@ -445,8 +445,8 @@ def main(argv: Optional[list] = None) -> int:
     p_claim.add_argument(
         "--assignee",
         choices=["host", "offhost"],
-        default=None,
-        help="optional pool filter; omit to claim any grabbable task",
+        default="offhost",
+        help="pool filter (default offhost|unassigned; never steals host-pinned)",
     )
 
     p_agents = sub.add_parser(

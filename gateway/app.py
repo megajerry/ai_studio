@@ -147,15 +147,18 @@ class EnqueueRequest(BaseModel):
 class ClaimRequest(BaseModel):
     """Grab + start the next grabbable task for this identity.
 
-    Remotes may act as **any** role (PM, executor, …): claim any grabbable task
-    type. ``assignee`` defaults to ``None`` (unassigned **or** any pool) so a
-    remote is not confined to the offhost slice — pass ``assignee=offhost`` /
-    ``host`` to narrow deliberately.
+    Remotes may act as **any** role (PM, executor, …) via ``agent_type`` — that
+    is a bookkeeping label, not a pool filter. ``assignee`` defaults to
+    ``offhost`` (also matches unassigned) so a remote never steals work
+    explicitly pinned to ``host``; pass ``assignee=host`` only when deliberately
+    taking host-pool work.
     """
 
     workstream: Optional[str] = None
     agent_type: Optional[str] = None
-    assignee: Optional[str] = None
+    #: Which pool to grab from; ``offhost`` (the default) also matches unassigned
+    #: tasks, so a remote never steals work explicitly pinned to the host.
+    assignee: Optional[str] = Assignee.OFFHOST.value
 
     @field_validator("workstream", "agent_type", "assignee")
     @classmethod
@@ -654,10 +657,11 @@ def create_app(
         try:
             from spokesman.runtime_bridge import studio_status as _studio_status
 
-            snap = _studio_status(conn)
+            snap = _studio_status(conn, workstream=allowed.workstream)
             _audit(
                 conn, type=EVENT_GATEWAY_ACCESS, identity=allowed.identity,
                 verb="studio_status", scope=SCOPE_READ, status=200,
+                workstream=allowed.workstream,
             )
             return {
                 "queued": snap.queued,
@@ -668,6 +672,7 @@ def create_app(
                 "pending_approvals": snap.pending_approvals,
                 "spent_tokens": snap.spent_tokens,
                 "open_tasks": snap.open_tasks,
+                "workstream": allowed.workstream,
             }
         finally:
             _close(conn)

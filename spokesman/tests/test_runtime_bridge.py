@@ -230,8 +230,14 @@ def test_studio_status_returns_real_counts(conn, ws) -> None:
     assert after_noise.queued == before.queued
     assert after_noise.open_tasks == before.open_tasks
 
-    # A real vertical + real type does.
-    enqueue_task(conn, workstream="productivity", type="work.task", payload={"goal": "live"})
+    # A real vertical + real type does (explicit prod traffic — under
+    # AI_STUDIO_TRAFFIC=test the auto-tag would otherwise hide it).
+    enqueue_task(
+        conn,
+        workstream="productivity",
+        type="work.task",
+        payload={"goal": "live", "traffic": "prod"},
+    )
     after = studio_status(conn)
     assert after.queued == before.queued + 1
     assert after.open_tasks == before.open_tasks + 1

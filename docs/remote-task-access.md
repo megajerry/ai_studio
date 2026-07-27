@@ -106,7 +106,8 @@ python3 -m gateway.client events --limit 20            # recent event types/ids
 python3 -m gateway.client agents-env                   # non-secret host markers
 python3 -m gateway.client enqueue --workstream productivity --type work.docs \
     --payload '{"goal": "draft the remote-access runbook"}'
-# Act as PM (or any role) — do not default-narrow to the offhost pool:
+# Act as PM (or any role) — still defaults to the offhost|unassigned pool so
+# host-pinned work is not stolen; pass --assignee host only deliberately:
 python3 -m gateway.client claim --workstream productivity --agent-type pm
 python3 -m gateway.client heartbeat <task-id>       # while working
 python3 -m gateway.client complete <task-id> --status merged --result '{"summary": "…"}'
@@ -151,7 +152,7 @@ curl -s -X POST "$TASK_GATEWAY_URL/v1/tasks" \
 | List ready / waiting / for-review tasks, read one by id | Run SQL, see payloads on other verticals when pinned |
 | Pull agent status, studio pulse, recent event types, non-secret env markers (`read`) | Read event bodies, DSNs, tokens, or API keys |
 | Enqueue a task (priority/budget/payload all clamped) | Outrank host work, mint an unbounded budget, write a status directly |
-| Claim + start any grabbable task as its own identity (any role via `--agent-type`) | Claim while its identity is revoked / quarantined |
+| Claim + start unassigned/offhost work as its own identity (any role via `--agent-type`) | Claim while its identity is revoked / quarantined; steal host-pinned work by default |
 | Heartbeat / complete a task **it holds** | Touch a task another worker holds |
 
 A claimed remote task is an ordinary queue row: the supervisor re-kicks it if the

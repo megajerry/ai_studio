@@ -830,9 +830,12 @@ def run_pm_tick(
     pushback_fp = compute_fingerprint(
         task.id, "pm.plan", [], workstream=task.workstream, args={},
     )
-    human_override = find_grant(conn, pushback_fp) is not None
+    human_override = False
+    if conn is not None:
+        human_override = find_grant(conn, pushback_fp) is not None
+        if human_override:
+            consume_grant(conn, pushback_fp)
     if human_override:
-        consume_grant(conn, pushback_fp)
         plan = plan.model_copy(update={"feasible": True})
         _traj_step(
             conn, tid, "decide",
