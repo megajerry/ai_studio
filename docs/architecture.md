@@ -268,6 +268,17 @@ unavailable, and remote DB access is host-restricted by an allowlist
 ([ADR-0017](decisions/0017-db-resilience-and-remote-access.md)); the lifecycle
 state machine (§4) is deliberately DB-free so the fleet still knows the rules
 during an outage.
+
+### Remote access is a verb, not a database connection
+
+A session that is **not on the LAN** never gets a DB credential: a credential
+would grant full SQL authority and so bypass the lifecycle guard (§4) and put a
+host secret in a less-trusted environment. Instead the host runs a small
+**task gateway** ([ADR-0027](decisions/0027-remote-task-access-gateway.md),
+[`remote-task-access.md`](remote-task-access.md)) that exposes only the queue
+verbs — list / enqueue / claim / heartbeat / complete — behind a scoped,
+rate-limited, hash-stored bearer token on the authenticated tunnel, with every
+handler routed through `runtime.tasks`. Postgres stays bound to loopback.
 - **MinIO** — object storage
 - **Reverse proxy / tunnel** — remote access for the stakeholder channel (§9)
 
@@ -361,6 +372,12 @@ non-urgent, host-resource-free work (research, design, docs, code drafting,
 review) via `state/offhost/requests/` and collects results from
 `state/offhost/results/`. The host **never blocks on it** — every delegated item
 has a local fallback and a timeout.
+
+When such a remote *is* online it can also work the **real queue** through the
+task gateway (§8) instead of the git substrate — claiming and heartbeating actual
+rows, so the supervisor and lifecycle telemetry see remote work live
+([ADR-0027](decisions/0027-remote-task-access-gateway.md)). Git remains the
+fallback for a remote that cannot reach the gateway.
 
 ## 12. "Assemble, don't build" — candidate components
 

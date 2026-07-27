@@ -16,7 +16,11 @@ Its defining properties:
 - **Intermittent** — not always active or responsive; may act hours or days after
   a request, or not at all.
 - **Git-only** — it can neither see the host's running services/DB nor hold host
-  secrets; it works entirely from what's committed to the repo.
+  secrets; it works entirely from what's committed to the repo. *(Amended by
+  [ADR-0027](0027-remote-task-access-gateway.md): a remote session may now also
+  reach the **task queue** through the token-gated task gateway — a scoped verb
+  API, still **no DB credential and no host secret**. Git stays the fallback and
+  the host still never blocks on a remote.)*
 - **Compute-elastic** — useful to **offload work when the host is compute-
   constrained**, or for work that needs no host-local resources (research, design,
   doc/spec authoring, code drafting, code review).
@@ -49,5 +53,7 @@ host-local (services/secrets/deploy) work on the host.
 - Requests must be written to survive long latency and total context loss — which
   reinforces the "repo is self-sufficient memory" principle.
 - A claim/heartbeat convention is needed to avoid duplicate work and to reclaim
-  abandoned claims (the supervisor can expire stale off-host claims).
+  abandoned claims (the supervisor can expire stale off-host claims). *(For a
+  remote that can reach the gateway this is no longer a convention to invent: it
+  claims and heartbeats the real queue rows — ADR-0027.)*
 - Merge review still applies: off-host work lands via reviewed PRs like any other.
