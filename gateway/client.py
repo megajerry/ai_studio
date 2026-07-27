@@ -286,7 +286,10 @@ def main(argv: Optional[list] = None) -> int:
     p_claim = sub.add_parser("claim", help="grab + start the next task")
     p_claim.add_argument("--workstream")
     p_claim.add_argument("--agent-type", dest="agent_type")
-    p_claim.add_argument("--assignee", choices=["host", "offhost"], default="offhost")
+    # A remote may only grab from the ``offhost`` pool (or unassigned) — targeting
+    # ``host`` would steal host-pinned work, which the gateway rejects with a 422
+    # (ADR-0028). Only ``offhost`` is offered so the client never mints such a call.
+    p_claim.add_argument("--assignee", choices=["offhost"], default="offhost")
 
     p_hb = sub.add_parser("heartbeat", help="refresh a held task's heartbeat")
     p_hb.add_argument("task_id")

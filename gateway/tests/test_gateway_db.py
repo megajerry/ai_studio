@@ -284,10 +284,48 @@ def test_a_pinned_token_cannot_claim_outside_its_workstream(conn, ws) -> None:
 
 
 def test_a_remote_does_not_steal_host_pinned_work(client, conn, ws) -> None:
-    enqueue_task(conn, workstream=ws, type="work.remote", assignee=Assignee.HOST)
+    host_task = enqueue_task(
+        conn, workstream=ws, type="work.remote", assignee=Assignee.HOST
+    )
+    # Default claim (offhost pool) never sees host-pinned work.
     resp = client.post("/v1/tasks/claim", json={"workstream": ws},
                        headers=bearer(REMOTE_SECRET))
     assert resp.status_code == 200 and resp.json()["task"] is None
+
+    # Explicit-host BYPASS (the CVE): asking for the host pool by name is refused
+    # at validation (422) — it must NOT reach the queue, and the host task must
+    # stay grabbable by the host (unchanged, still up_for_grabs, still unclaimed).
+    bypass = client.post("/v1/tasks/claim", json={"workstream": ws, "assignee": "host"},
+                         headers=bearer(REMOTE_SECRET))
+    assert bypass.status_code == 422, bypass.text
+    still = get_task(conn, host_task.id)
+    assert still.status is TaskStatus.UP_FOR_GRABS
+    assert still.claimed_by is None
+
+
+def test_a_bogus_assignee_is_422_not_500(client, conn, ws) -> None:
+    """An out-of-range assignee is rejected cleanly (422), never an ungraceful 500
+    from ``Assignee(<bad>)`` — the runtime store is never even opened."""
+    enqueue_task(conn, workstream=ws, type="work.remote")
+    resp = client.post("/v1/tasks/claim", json={"workstream": ws, "assignee": "bogus"},
+                       headers=bearer(REMOTE_SECRET))
+    assert resp.status_code == 422, resp.text
+
+
+def test_default_offhost_claim_grabs_unassigned_and_offhost_work(client, conn, ws) -> None:
+    """The permitted pool is unchanged: default (``offhost``) still grabs both an
+    unassigned task and an explicitly ``offhost``-pinned one."""
+    unassigned = enqueue_task(conn, workstream=ws, type="work.remote")
+    first = client.post("/v1/tasks/claim", json={"workstream": ws},
+                        headers=bearer(REMOTE_SECRET))
+    assert first.status_code == 200 and first.json()["task"]["id"] == str(unassigned.id)
+
+    offhost = enqueue_task(
+        conn, workstream=ws, type="work.remote", assignee=Assignee.OFFHOST
+    )
+    second = client.post("/v1/tasks/claim", json={"workstream": ws, "assignee": "offhost"},
+                         headers=bearer(REMOTE_SECRET))
+    assert second.status_code == 200 and second.json()["task"]["id"] == str(offhost.id)
 
 
 def test_dependencies_still_gate_a_remote_claim(client, conn, ws) -> None:

@@ -151,7 +151,7 @@ class ClaimRequest(BaseModel):
     #: tasks, so a remote never steals work explicitly pinned to the host.
     assignee: Optional[str] = Assignee.OFFHOST.value
 
-    @field_validator("workstream", "agent_type", "assignee")
+    @field_validator("workstream", "agent_type")
     @classmethod
     def _identifier_or_none(cls, v: Optional[str]) -> Optional[str]:
         if v is None or not str(v).strip():
@@ -159,6 +159,29 @@ class ClaimRequest(BaseModel):
         value = str(v).strip().lower()
         if not is_identifier(value):
             raise ValueError("must match [a-z0-9][a-z0-9._-]{0,63}")
+        return value
+
+    @field_validator("assignee")
+    @classmethod
+    def _offhost_only(cls, v: Optional[str]) -> Optional[str]:
+        """A remote may only grab from the ``offhost`` pool (or unassigned).
+
+        The pool the queue grabs from is ``(assignee IS NULL OR assignee = value)``
+        (``runtime.tasks.grab_task``). Allowing anything but ``offhost`` here would
+        let a ``claim``-scoped remote target ``assignee = 'host'`` and STEAL
+        host-pinned work — exactly what ADR-0028 forbids ("Cannot: claim work
+        pinned to host"). So we reject ``host`` and any unknown value at validation
+        (a 422), rather than let an out-of-range string reach ``Assignee(...)`` and
+        blow up as an ungraceful 500. ``None``/blank falls back to the default.
+        """
+        if v is None or not str(v).strip():
+            return None
+        value = str(v).strip().lower()
+        if value != Assignee.OFFHOST.value:
+            raise ValueError(
+                f"assignee must be {Assignee.OFFHOST.value!r} "
+                "(a remote may not grab from the host pool)"
+            )
         return value
 
 

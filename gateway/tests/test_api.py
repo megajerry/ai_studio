@@ -260,6 +260,30 @@ def test_identifier_shaped_input_only(body: dict) -> None:
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("assignee", ["host", "HOST", " host ", "bogus", "root", "!!"])
+def test_claim_refuses_any_assignee_but_offhost(assignee: str) -> None:
+    """A ``claim``-scoped remote may only target the ``offhost`` pool.
+
+    ``host`` (the steal vector — ADR-0028's "Cannot: claim work pinned to host")
+    and any unknown value are rejected at VALIDATION with a 422, BEFORE the handler
+    opens a connection — so ``exploding_connect`` is never reached (no 503, and,
+    crucially for ``bogus``, no ungraceful 500 from ``Assignee(...)``).
+    """
+    resp = _client().post(
+        "/v1/tasks/claim", json={"assignee": assignee}, headers=bearer(FULL_SECRET)
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize("body", [{}, {"assignee": "offhost"}, {"assignee": None}])
+def test_claim_accepts_offhost_and_default(body: dict) -> None:
+    """The allowed shapes clear validation and reach the store (a 503 here proves
+    the request passed the body gate — ``exploding_connect`` fails only afterward)."""
+    resp = _client().post("/v1/tasks/claim", json=body, headers=bearer(FULL_SECRET))
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"] == DB_UNAVAILABLE_DETAIL
+
+
 def test_complete_rejects_a_non_terminal_status() -> None:
     resp = _client().post(
         "/v1/tasks/11111111-1111-1111-1111-111111111111/complete",
