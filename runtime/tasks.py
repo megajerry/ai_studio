@@ -16,7 +16,8 @@ runtime loop uses. Tasks with unmet prerequisites are never grabbed — see
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from collections.abc import Iterable
+from typing import Any, Optional, Union
 from uuid import UUID
 
 import psycopg
@@ -191,6 +192,30 @@ def _emit(conn: psycopg.Connection, task: Task, event_type: EventType, **payload
 # --- The single guarded transition ------------------------------------------
 
 
+#: ``expected_from`` accepts a single source status OR a collection of them — the
+#: latter lets one guarded write terminalize a task from any of several
+#: actively-held states (e.g. the supervisor's recovery rungs abandoning a stale
+#: task that may be ``claimed`` OR ``in_progress``). ``None`` means "any source".
+ExpectedFrom = Union[TaskStatus, str, Iterable[Union[TaskStatus, str]], None]
+
+
+def _norm_expected(expected_from: ExpectedFrom) -> "frozenset[str] | None":
+    """Normalize ``expected_from`` to a frozenset of status strings (or ``None``).
+
+    A single ``TaskStatus``/``str`` becomes a one-element set; an iterable of them
+    becomes the set of their values; ``None`` stays ``None`` ("any source state").
+    """
+    if expected_from is None:
+        return None
+    if isinstance(expected_from, (TaskStatus, str)):
+        return frozenset({_expected_val(expected_from)})
+    return frozenset(_expected_val(s) for s in expected_from)
+
+
+def _expected_val(status) -> str:
+    return status.value if isinstance(status, TaskStatus) else str(status)
+
+
 def transition(
     conn: psycopg.Connection,
     task_id: UUID,
@@ -198,7 +223,7 @@ def transition(
     *,
     agent_id: Optional[str] = None,
     agent_type: Optional[str] = None,
-    expected_from: Optional[TaskStatus] = None,
+    expected_from: ExpectedFrom = None,
     result: Any = _UNSET,
     spent_tokens: Optional[int] = None,
     claimed_by: Any = _UNSET,
@@ -215,7 +240,9 @@ def transition(
     Legal moves are defined by :mod:`runtime.task_state`; an illegal move raises
     :class:`~runtime.task_state.IllegalTransition` (unless ``force``). The UPDATE
     is guarded on the current status (so a concurrent change is a no-op → returns
-    ``None``); ``expected_from`` additionally requires a specific source state.
+    ``None``); ``expected_from`` additionally requires the source state to be a
+    specific status — or one of a collection of statuses (e.g. the recovery rungs
+    terminalizing a stale task that may be ``claimed`` OR ``in_progress``).
 
     Records a ``task_transitions`` row (with ``latency_ms`` since this task's
     previous transition) and emits a ``task.transition`` event carrying only
@@ -226,9 +253,7 @@ def transition(
     transition needs.
     """
     to_val = to.value if isinstance(to, TaskStatus) else str(to)
-    exp_val = (
-        expected_from.value if isinstance(expected_from, TaskStatus) else expected_from
-    )
+    exp_vals = _norm_expected(expected_from)
 
     with conn.transaction():
         with conn.cursor() as cur:
@@ -239,8 +264,8 @@ def transition(
             if row is None:
                 return None
             current = row["status"]
-            if exp_val is not None and current != exp_val:
-                return None  # guarded: not in the expected source state
+            if exp_vals is not None and current not in exp_vals:
+                return None  # guarded: not in an expected source state
             if current == to_val:
                 return None  # idempotent no-op (already there)
             if not force:
@@ -563,6 +588,7 @@ def complete_task(
     result: Optional[dict] = None,
     status: TaskStatus = TaskStatus.MERGED,
     spent_tokens: Optional[int] = None,
+    expected_from: ExpectedFrom = TaskStatus.IN_PROGRESS,
     force: bool = False,
 ) -> Optional[Task]:
     """Finalize an ``in_progress`` task to ``merged`` (success) or ``abandoned``.
@@ -577,8 +603,13 @@ def complete_task(
 
     By default only an ``in_progress`` task is finalized (a worker cannot finalize
     a task it no longer owns); a conflict/missing task returns ``None`` with no
-    event. ``force=True`` finalizes from whatever the current (non-terminal) state
-    is (the supervisor force-abandoning a stale task); it still emits ``task.finished``.
+    event. ``expected_from`` widens that guard when a caller legitimately finalizes
+    from more than one held state — the supervisor's terminal recovery rungs
+    abandon a stale task that may be ``claimed`` OR ``in_progress`` (a worker that
+    died in the grab→start window), passing ``(CLAIMED, IN_PROGRESS)`` so a
+    claimed-stale task is not livelocked (never terminalized, never re-queued).
+    ``force=True`` finalizes from whatever the current (non-terminal) state is (the
+    supervisor force-abandoning a stale task); it still emits ``task.finished``.
     """
     if not is_terminal(status):
         raise ValueError("complete_task status must be 'merged' or 'abandoned'")
@@ -587,7 +618,7 @@ def complete_task(
         # Auto-approve + merge an internal task through the canonical path.
         t = transition(
             conn, task_id, TaskStatus.READY_FOR_REVIEW,
-            expected_from=None if force else TaskStatus.IN_PROGRESS,
+            expected_from=None if force else expected_from,
             result=result, spent_tokens=spent_tokens, force=force,
         )
         if t is None:
@@ -599,7 +630,7 @@ def complete_task(
     else:  # ABANDONED — reachable from any non-terminal state
         task = transition(
             conn, task_id, TaskStatus.ABANDONED,
-            expected_from=None if force else TaskStatus.IN_PROGRESS,
+            expected_from=None if force else expected_from,
             result=result, spent_tokens=spent_tokens, force=force,
         )
     # transition() emits task.finished on the terminal hop, so nothing to add here.
@@ -1102,23 +1133,27 @@ def escalate_stuck_task(
 
     Guarded like :func:`runtime.supervisor._default_fail_exhausted`: the abandon is
     NOT forced, so a task that self-completed in the scan→write window is left
-    untouched and this returns ``None`` (the sweep logs a skip). ``stall_reason`` is
-    a short CODE, never body text. Runs the reason-write, the abandon, and the event
-    in one transaction so they commit atomically.
+    untouched and this returns ``None`` (the sweep logs a skip). It terminalizes any
+    ACTIVELY-HELD stale task — ``claimed`` OR ``in_progress`` (matching
+    :func:`find_stale_tasks`/:func:`rekick_task`) — so a worker that died in the
+    grab→start window (still ``claimed``) is not livelocked at this rung.
+    ``stall_reason`` is a short CODE, never body text. Runs the reason-write, the
+    abandon, and the event in one transaction so they commit atomically.
     """
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE tasks SET stall_reason = %s, updated_at = now() "
-                "WHERE id = %s AND status = 'in_progress'",
+                "WHERE id = %s AND status IN ('claimed', 'in_progress')",
                 (stall_reason, task_id),
             )
             if cur.rowcount == 0:
-                return None  # no longer in_progress (self-completed in the window)
+                return None  # no longer held (self-completed in the window)
         superseded = complete_task(
             conn,
             task_id,
             status=TaskStatus.ABANDONED,
+            expected_from=(TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS),
             result={
                 "reason": "stuck_needs_replan",
                 "stall_reason": stall_reason,

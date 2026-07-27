@@ -27,6 +27,7 @@ from runtime.tasks import (
     claim_task,
     enqueue_task,
     escalate_stuck_task,
+    grab_task,
     heartbeat,
     rekick_task,
     task_made_progress,
@@ -225,3 +226,65 @@ def test_progressing_but_slow_task_hits_max_retries_backstop(conn, ws):
     assert r["status"] == "abandoned"
     types = _types(conn, t.id)
     assert "task.failed_exhausted" in types and "task.stuck" not in types
+
+
+# --- Terminal rungs must terminalize a CLAIMED-stale task (no livelock) ------
+# A worker that dies in the grab→start window leaves the task `claimed` (never
+# `in_progress`) with a stale heartbeat. find_stale_tasks/rekick_task already
+# handle both held states, but the two TERMINAL rungs (stuck-escalation,
+# exhausted-abandon) previously acted only on `in_progress`, so a claimed-stale
+# task climbed to a terminal rung, no-op'd, and was re-scanned/skipped forever —
+# never terminalized, never returned to the pool (breaks "no task silently
+# dropped"). These two tests reproduce that setup and assert it is now recovered.
+
+
+def test_claimed_stale_task_is_escalated_not_livelocked(conn, ws):
+    """A CLAIMED (never started) stale task at the stuck threshold is escalated +
+    superseded — not left `claimed` sweep after sweep."""
+    t = enqueue_task(conn, workstream=ws, type="work.claimed_stuck")
+    # grab_task ONLY (→ claimed), NOT claim_task (which would start it).
+    grabbed = grab_task(conn, worker_id="w1", workstream=ws)
+    assert grabbed is not None and grabbed.status is TaskStatus.CLAIMED
+    _backdate_heartbeat(conn, t.id)
+    # At the stuck threshold, grace elapsed, retries below max.
+    _set(conn, t.id, no_progress_rekicks=2, retries=2, nudged_at_ago_s=120)
+    assert _row(conn, t.id, "status")["status"] == "claimed"  # precondition
+
+    res = sweep(conn, threshold_s=60, max_retries=5, nudge_grace_s=45, stuck_threshold=2)
+    assert t.id in res.stuck
+    assert t.id not in res.rekicked and t.id not in res.failed
+
+    r = _row(conn, t.id, "status", "result", "stall_reason")
+    assert r["status"] == "abandoned"  # terminalized, NOT stuck at `claimed`
+    assert r["result"]["reason"] == "stuck_needs_replan"
+    assert r["stall_reason"] == "no_progress"
+    assert "task.stuck" in _types(conn, t.id)
+
+    # A follow-up sweep finds nothing to do (it is terminal now) — no livelock.
+    res2 = sweep(conn, threshold_s=60, max_retries=5, nudge_grace_s=45, stuck_threshold=2)
+    assert t.id not in res2.stuck and _row(conn, t.id, "status")["status"] == "abandoned"
+
+
+def test_claimed_stale_task_hits_exhausted_backstop_not_livelocked(conn, ws):
+    """A CLAIMED (never started) stale task that has exhausted its retries is
+    force-abandoned by the backstop rung — not left `claimed` forever."""
+    t = enqueue_task(conn, workstream=ws, type="work.claimed_exhausted")
+    grabbed = grab_task(conn, worker_id="w1", workstream=ws)
+    assert grabbed is not None and grabbed.status is TaskStatus.CLAIMED
+    _backdate_heartbeat(conn, t.id)
+    # Retries exhausted, progressing counter below stuck threshold, grace elapsed.
+    _set(conn, t.id, no_progress_rekicks=0, retries=5, nudged_at_ago_s=120)
+    assert _row(conn, t.id, "status")["status"] == "claimed"  # precondition
+
+    res = sweep(conn, threshold_s=60, max_retries=5, nudge_grace_s=45, stuck_threshold=2)
+    assert t.id in res.failed and t.id not in res.stuck
+
+    r = _row(conn, t.id, "status", "result")
+    assert r["status"] == "abandoned"  # terminalized, NOT stuck at `claimed`
+    assert r["result"]["reason"] == "max_retries_exhausted"
+    types = _types(conn, t.id)
+    assert "task.failed_exhausted" in types and "task.stuck" not in types
+
+    # No livelock: a follow-up sweep leaves the now-terminal task untouched.
+    res2 = sweep(conn, threshold_s=60, max_retries=5, nudge_grace_s=45, stuck_threshold=2)
+    assert t.id not in res2.failed and _row(conn, t.id, "status")["status"] == "abandoned"
