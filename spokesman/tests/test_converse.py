@@ -79,6 +79,28 @@ def test_keywords_still_fast_path(tmp_path: Path) -> None:
     assert client.sent
 
 
+def test_free_text_starting_with_yes_no_reject_routes_to_converse(tmp_path: Path) -> None:
+    # "yes"/"no"/"reject" are no longer resolve verbs: matched on the FIRST token they
+    # hijacked free text ("no, cancel that" / "yes please") into a broken
+    # `<verb> <approval-id>` fast-path. Such messages must reach the converse agent.
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    (state / "status.md").write_text("# ok\n", "utf-8")
+    settings = make_settings(state)
+    client = _Capture()
+
+    def boom():
+        raise RuntimeError("no db")
+
+    for text in ("no, cancel that", "yes please", "reject that idea"):
+        client.sent.clear()
+        msg = InboundMessage(message_id="r", sender="1555", text=text, timestamp="")
+        result = handle_inbound_command(settings, client, boom, msg)
+        assert result is not None and result["command"] == "converse", text
+        assert client.sent  # a real conversational reply, not a "Usage: <verb> <id>" error
+        assert "Usage:" not in client.sent[0]
+
+
 def test_agent_greeting_conversation(tmp_path: Path) -> None:
     state = tmp_path / "state"
     state.mkdir(parents=True)
@@ -191,6 +213,63 @@ def live_conn():
         yield c
     finally:
         c.close()
+
+
+def _max_seq(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COALESCE(max(seq), 0) AS s FROM events")
+        row = cur.fetchone()
+    if not conn.autocommit:
+        conn.commit()
+    return int(row["s"])
+
+
+@pytestmark_live
+def test_conversation_turn_persists_model_call_and_accrues_spend(
+    live_conn, tmp_path: Path
+) -> None:
+    # Fix: _agent_turn threads the REAL DbEventSink into call_model, so the
+    # model.call cost event is PERSISTED and Spokesman spend accrues to the
+    # workstream (ADR-0012 / invariant 6). With the old NullEventSink the cost event
+    # was dropped while conn still reserved budget — the reservation netted to zero on
+    # release, making spend invisible and effectively unbounded. Dry-run stub calls
+    # are costed identically, so this holds with no provider key.
+    from runtime import budget
+
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    (state / "status.md").write_text("# ok\n", "utf-8")
+    settings = make_settings(state)  # workstream defaults to "productivity"
+    ws = "productivity"
+
+    before = budget.spent(live_conn, ws)
+    baseline = _max_seq(live_conn)
+    client = _Capture()
+
+    def connect():
+        return db.connect()
+
+    msg = InboundMessage(
+        message_id="spend1", sender="15550001111", text="hey there", timestamp=""
+    )
+    outcome = handle_conversation(settings, client, connect, msg)
+    assert outcome.intent == "converse" and client.sent
+
+    # A model.call cost event for this workstream was persisted past the baseline.
+    with live_conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM events "
+            "WHERE type = 'model.call' AND workstream = %s AND seq > %s",
+            (ws, baseline),
+        )
+        n_calls = int(cur.fetchone()["n"])
+    if not live_conn.autocommit:
+        live_conn.commit()
+    assert n_calls >= 1
+
+    # ...and the workstream's accrued spend (summed from model.call) increased.
+    after = budget.spent(live_conn, ws)
+    assert after.calls > before.calls
 
 
 @pytestmark_live
