@@ -19,6 +19,9 @@ x-runtime-env: &runtime-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  # Coding/agentic tier substrate (ADR: cursor-cli adapter). Keyless in-container
+  # → the cursor-cli adapter returns a dry-run stub even if the tier is selected.
+  CURSOR_API_KEY: ${CURSOR_API_KEY:-}
   MODELS_DRY_RUN: ${MODELS_DRY_RUN:-}
   AI_STUDIO_STATE_DIR: /app/state
 
