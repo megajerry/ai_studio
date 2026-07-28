@@ -334,11 +334,19 @@ def create_app(
         scope: str,
         verb: str,
         workstream: Optional[str] = None,
+        workstream_optional: bool = False,
     ) -> Allowed:
-        """Authorize one request or raise the mapped ``HTTPException``."""
+        """Authorize one request or raise the mapped ``HTTPException``.
+
+        ``workstream_optional=True`` is for the endpoints not scoped by a
+        caller-supplied workstream (whoami / read-one-task / studio-status /
+        agents-env): a token pinned to several workstreams must not be locked out
+        of them for lacking a single default (see :func:`gateway.auth.authorize`).
+        """
         decision = authorize(
             settings.tokens, limiter,
             authorization=authorization, scope=scope, workstream=workstream,
+            workstream_optional=workstream_optional,
         )
         if isinstance(decision, Denied):
             _audit_denied(decision, verb=verb, scope=scope)
@@ -391,7 +399,10 @@ def create_app(
     @app.get("/v1/whoami")
     def whoami(authorization: Optional[str] = Header(default=None)) -> dict:
         """Echo the caller's own identity/scopes — the remote's first smoke test."""
-        allowed = _gate(authorization=authorization, scope=SCOPE_ANY, verb="whoami")
+        allowed = _gate(
+            authorization=authorization, scope=SCOPE_ANY, verb="whoami",
+            workstream_optional=True,
+        )
         return {
             "identity": allowed.identity,
             "scopes": sorted(allowed.token.scopes),
@@ -493,8 +504,12 @@ def create_app(
         """One task row by id (subject to the token's workstream pinning)."""
         from runtime.tasks import get_task
 
+        # Gate loosely (any valid token with workstream access passes), then let
+        # _require_visible enforce the token's pin against THIS task's workstream —
+        # a multi-pinned token has no single default to gate on up front.
         allowed = _gate(
             authorization=authorization, scope=SCOPE_READ, verb="read_task",
+            workstream_optional=True,
         )
         conn = _open("read_task")
         try:
@@ -682,15 +697,24 @@ def create_app(
     def studio_status_view(
         authorization: Optional[str] = Header(default=None),
     ) -> dict:
-        """Aggregate studio queue pulse (``read`` scope) — test traffic filtered."""
+        """Aggregate studio queue pulse (``read`` scope) — test traffic filtered.
+
+        Scope is the token's FULL workstream pin-set, not ``allowed.workstream``:
+        a multi-pinned token has ``default_workstream() == None``, and passing that
+        as ``workstream`` would make ``studio_status`` aggregate over EVERY
+        workstream — leaking counts/spend/approvals from verticals the token is not
+        pinned to (ADR-0018/0028). Unpinned ⇒ empty pin-set ⇒ full studio view.
+        """
         allowed = _gate(
             authorization=authorization, scope=SCOPE_READ, verb="studio_status",
+            workstream_optional=True,
         )
         conn = _open("studio_status")
         try:
             from spokesman.runtime_bridge import studio_status as _studio_status
 
-            snap = _studio_status(conn, workstream=allowed.workstream)
+            pins = sorted(allowed.token.workstreams)  # [] when unpinned = full view
+            snap = _studio_status(conn, workstreams=pins or None)
             _audit(
                 conn, type=EVENT_GATEWAY_ACCESS, identity=allowed.identity,
                 verb="studio_status", scope=SCOPE_READ, status=200,
@@ -706,6 +730,7 @@ def create_app(
                 "spent_tokens": snap.spent_tokens,
                 "open_tasks": snap.open_tasks,
                 "workstream": allowed.workstream,
+                "workstreams": pins,
             }
         finally:
             _close(conn)
@@ -778,6 +803,7 @@ def create_app(
         """
         allowed = _gate(
             authorization=authorization, scope=SCOPE_READ, verb="agents_env",
+            workstream_optional=True,
         )
         from runtime.traffic import default_traffic
 

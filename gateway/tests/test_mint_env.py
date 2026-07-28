@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from gateway.auth import TokenSpecError
 from gateway.client import (
     ENV_TOKENS,
     main,
@@ -96,3 +99,60 @@ def test_mint_no_write_env_leaves_file_alone(tmp_path: Path) -> None:
     out = mint("x", ["read"], env_file=env, write_env=False)
     assert out["env_written"] is False
     assert read_dotenv_value(env, ENV_TOKENS) == "keep-me"
+
+
+# --- Validation happens BEFORE any write (a typo must not brick startup) -----
+
+
+@pytest.mark.parametrize(
+    "identity,scopes,workstreams",
+    [
+        ("offhost", ["read", "superuser"], []),   # unknown scope
+        ("offhost", [], []),                        # no scopes
+        ("Bad Identity", ["read"], []),             # non-identifier identity
+        ("offhost", ["read"], ["Bad WS"]),          # non-identifier workstream
+        ("offhost", ["re ad"], []),                 # scope with a space
+    ],
+)
+def test_mint_rejects_an_invalid_spec_and_writes_nothing(
+    tmp_path: Path, identity, scopes, workstreams
+) -> None:
+    """A bad --scopes/--identity/--workstreams is refused at mint time, BEFORE the
+    digest ever lands in .env — otherwise ``parse_token_spec`` would raise at
+    gateway startup and refuse to boot for EVERY token."""
+    env = tmp_path / ".env"
+    env.write_text("TASK_GATEWAY_TOKENS=keep-me\n", encoding="utf-8")
+    with pytest.raises(TokenSpecError):
+        mint(identity, scopes, workstreams, env_file=env, write_env=True)
+    # The file is untouched: the prior value stands, no new spec appended.
+    assert read_dotenv_value(env, ENV_TOKENS) == "keep-me"
+
+
+def test_mint_rejects_invalid_spec_even_when_env_file_is_absent(tmp_path: Path) -> None:
+    env = tmp_path / ".env"  # does not exist yet
+    with pytest.raises(TokenSpecError):
+        mint("offhost", ["read", "superuser"], env_file=env, write_env=True)
+    assert not env.exists()  # nothing created
+
+
+def test_mint_cli_rejects_invalid_scopes_without_writing(tmp_path: Path, capsys) -> None:
+    env = tmp_path / ".env"
+    env.write_text("TASK_GATEWAY_TOKENS=keep-me\n", encoding="utf-8")
+    rc = main(
+        ["mint", "--identity", "cli-id", "--scopes", "read,superuser",
+         "--env-file", str(env)]
+    )
+    assert rc == 2
+    assert "error" in capsys.readouterr().err.lower()
+    # No .env mutation on a rejected mint.
+    assert read_dotenv_value(env, ENV_TOKENS) == "keep-me"
+
+
+def test_mint_still_accepts_a_valid_spec(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    out = mint(
+        "offhost-cursor", ["read", "enqueue", "claim"],
+        ["video", "productivity"], env_file=env, write_env=True,
+    )
+    assert out["env_written"] is True
+    assert read_dotenv_value(env, ENV_TOKENS) == out["spec"]

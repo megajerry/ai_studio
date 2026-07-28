@@ -314,6 +314,7 @@ def authorize(
     authorization: Optional[str],
     scope: str,
     workstream: Optional[str] = None,
+    workstream_optional: bool = False,
 ) -> Union[Allowed, Denied]:
     """Run gates 1–5 for one request. THE single entry point used by the app.
 
@@ -321,6 +322,19 @@ def authorize(
     a pinned token that names exactly one workstream, an unspecified request
     resolves to it; a pinned token that names several must be explicit (the
     request is refused rather than silently widened).
+
+    ``workstream_optional`` marks the endpoints that are NOT scoped by a
+    caller-supplied workstream — ``/v1/whoami``, ``GET /v1/tasks/{id}``,
+    ``/v1/studio/status``, ``/v1/agents/env`` — where a single ``default_workstream``
+    must not be *required*. In that mode an unspecified request from ANY valid
+    token (unpinned, singly- or multiply-pinned) passes, resolving to
+    ``default_workstream()`` (``None`` for unpinned/multi-pinned) purely for
+    downstream narrowing. Without it, a token pinned to 2+ workstreams collapses to
+    ``default_workstream() == None`` and is wrongly refused ``workstream_denied`` on
+    those endpoints — locked out of its own smoke test. The looser gate does NOT
+    apply to the list/claim/enqueue verbs, which legitimately require an explicit
+    workstream for a multi-pinned token; per-task visibility on ``read`` is still
+    enforced separately by the caller (see ``gateway.app._require_visible``).
     """
     if len(registry) == 0:
         return Denied(503, REASON_NO_TOKENS)
@@ -346,6 +360,12 @@ def authorize(
         return Denied(403, REASON_MISSING_SCOPE, identity=token.identity)
 
     resolved = workstream if workstream is not None else token.default_workstream()
+    # Workstream-less endpoints accept any valid token: a multi-pinned token has no
+    # single default to collapse to, so requiring one would fail-closed against a
+    # credential ADR-0028 explicitly supports. Per-task/per-workstream enforcement
+    # for those endpoints is applied by the caller, not dropped.
+    if workstream_optional and workstream is None:
+        return Allowed(token=token, workstream=resolved)
     if not token.allows_workstream(resolved):
         return Denied(403, REASON_WORKSTREAM_DENIED, identity=token.identity)
 

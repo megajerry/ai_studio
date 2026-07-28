@@ -229,6 +229,41 @@ def test_unpinned_token_may_stay_unscoped() -> None:
     assert isinstance(allowed, Allowed) and allowed.workstream is None
 
 
+def test_workstream_optional_admits_a_multi_pinned_token() -> None:
+    # The workstream-less endpoints opt into a looser gate so a token pinned to
+    # 2+ workstreams is not locked out for lacking a single default_workstream().
+    reg = TokenRegistry([
+        Token(
+            identity="multi", scopes={SCOPE_READ}, digest=token_digest("multi"),
+            workstreams=frozenset({"a", "b"}),
+        )
+    ])
+    # Default (strict) mode still refuses a 2-pin token with no named workstream…
+    strict = authorize(reg, None, authorization="Bearer multi", scope=SCOPE_READ)
+    assert isinstance(strict, Denied) and strict.reason == REASON_WORKSTREAM_DENIED
+    # …but with workstream_optional it passes, resolving to None (no single pin).
+    loose = authorize(
+        reg, None, authorization="Bearer multi", scope=SCOPE_READ,
+        workstream_optional=True,
+    )
+    assert isinstance(loose, Allowed) and loose.workstream is None
+
+
+def test_workstream_optional_still_narrows_a_singly_pinned_token() -> None:
+    # A single-pin token keeps its scoped view even under the looser gate.
+    reg = TokenRegistry([
+        Token(
+            identity="one", scopes={SCOPE_READ}, digest=token_digest("one"),
+            workstreams=frozenset({"solo"}),
+        )
+    ])
+    allowed = authorize(
+        reg, None, authorization="Bearer one", scope=SCOPE_READ,
+        workstream_optional=True,
+    )
+    assert isinstance(allowed, Allowed) and allowed.workstream == "solo"
+
+
 # --- Rate limiting ----------------------------------------------------------
 
 
