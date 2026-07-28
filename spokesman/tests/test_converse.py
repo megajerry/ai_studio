@@ -151,6 +151,74 @@ def test_web_chat_casual_message(tmp_path: Path) -> None:
     assert "_Re:" not in body["replies"][0]
 
 
+def test_system_prompt_documents_ops_commands() -> None:
+    """Spokesman self-knowledge (ADR-0033): the conversational agent must know the
+    ops fast-path vocabulary so it can GUIDE the human to the exact command instead
+    of saying "I can't". It only EXPLAINS — it never gains a way to RUN ops."""
+    from spokesman.converse import SYSTEM_PROMPT
+
+    for phrase in (
+        "ops worker start",
+        "ops ps",
+        "ops logs",
+        "ops up",
+        "ops restart",
+        "ops docker",
+        "ops up scheduler",  # the documented "start the PM" recipe
+        "confirm",           # destructive ops need a trailing confirm
+    ):
+        assert phrase in SYSTEM_PROMPT, f"SYSTEM_PROMPT must mention {phrase!r}"
+    # Accurate, non-over-promising note on what handoff actually is.
+    assert "handoff" in SYSTEM_PROMPT.lower()
+
+
+def test_start_worker_question_surfaces_ops_guidance_with_fake_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A "how do I start the worker?" question surfaces `ops worker start` guidance.
+
+    The fake model asserts it RECEIVES the ops vocabulary in the system prompt
+    (so the fix actually reaches the model) and replies with the command. This is
+    guidance only: the model is never given a way to execute ops."""
+    import spokesman.converse as mod
+
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    (state / "status.md").write_text("# ok\n", "utf-8")
+    settings = make_settings(state)
+    client = _Capture()
+
+    class _FakeCompletion:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    captured: dict = {}
+
+    def fake_call_model(role, task_type, messages, **kw):  # type: ignore[no-untyped-def]
+        captured["system"] = messages[0]["content"]
+        # The model can only guide because the prompt carries the ops vocabulary.
+        assert "ops worker start" in captured["system"]
+        return _FakeCompletion(
+            '{"tool_calls": [], "reply": "To start the worker, type: '
+            'ops worker start"}'
+        )
+
+    monkeypatch.setattr(mod, "call_model", fake_call_model)
+
+    def boom():
+        raise RuntimeError("no db")
+
+    msg = InboundMessage(
+        message_id="ops-guide", sender="1555", text="how do I start the worker?",
+        timestamp="",
+    )
+    outcome = handle_conversation(settings, client, boom, msg)
+    assert outcome.intent == "converse"
+    assert client.sent
+    assert "ops worker start" in client.sent[0]
+    assert captured.get("system")  # the fake model was actually reached
+
+
 def test_converse_does_not_import_run_pm_tick() -> None:
     import inspect
 

@@ -157,6 +157,14 @@ services:
       context: .
       dockerfile: spokesman/Dockerfile
     restart: unless-stopped
+    # Human remote ops control-plane (ADR-0033): the container runs as a NON-root
+    # user (uid 10001) but must reach the root-owned host Docker socket mounted
+    # below. Add the container process to a supplementary group that can access
+    # the socket. Default `0` (root group) works on Docker Desktop for Mac, where
+    # the socket is root:root; on Linux set DOCKER_GID to the host `docker` group's
+    # gid (see .env.example). We do NOT run the container as root to fix this.
+    group_add:
+      - "${DOCKER_GID:-0}"
     environment:
       SPOKESMAN_PORT: ${SPOKESMAN_PORT:-8080}
       SPOKESMAN_DRY_RUN: ${SPOKESMAN_DRY_RUN:-0}

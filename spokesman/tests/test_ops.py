@@ -514,6 +514,26 @@ def test_converse_module_has_no_ops_capability() -> None:
         assert forbidden not in src, f"converse.py must not reference {forbidden!r}"
 
 
+def test_compose_spokesman_has_docker_group_add() -> None:
+    """ADR-0033 live-bug fix: the non-root spokesman container (uid 10001) must join
+    a supplementary group to reach the root-owned mounted docker socket — otherwise
+    `ops worker start` fails with `permission denied ... /var/run/docker.sock`.
+    Assert the compose service carries `group_add` with the `${DOCKER_GID:-0}`
+    default, still mounts the socket, and did NOT fall back to running as root."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((root / "docker-compose.yml").read_text("utf-8"))
+    spok = compose["services"]["spokesman"]
+    group_add = spok.get("group_add")
+    assert group_add, "spokesman must declare group_add for docker socket access"
+    assert any("DOCKER_GID" in str(g) for g in group_add), group_add
+    # The socket is still mounted (the whole point of the group_add).
+    assert any("/var/run/docker.sock" in str(v) for v in spok.get("volumes", []))
+    # Container stays NON-root — no `user: root` workaround.
+    assert "user" not in spok
+
+
 def test_ops_result_render_is_bounded() -> None:
     big = "x" * 10000
     res = OpsResult(ok=True, action="docker", argv=["docker", "ps"], exit_code=0,
