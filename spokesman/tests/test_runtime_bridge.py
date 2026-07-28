@@ -297,6 +297,39 @@ def test_studio_status_returns_real_counts(conn, ws) -> None:
 
 
 @pytestmark_live
+def test_studio_status_scopes_to_a_workstream_set(conn) -> None:
+    """A ``workstreams`` filter (a set — e.g. a gateway token's pin-set) confines
+    counts to exactly those verticals; a workstream OUTSIDE the set is never
+    counted. Closes the ADR-0018/0028 cross-workstream leak for a MULTI-pinned
+    token (whose ``default_workstream()`` is ``None`` — which must NOT mean 'all').
+    Non-noise, prod-tagged workstreams so the rows are stakeholder-visible; deltas
+    so residue on a shared DB is irrelevant.
+    """
+    a = f"scopea-{uuid4().hex[:8]}-live"
+    b = f"scopeb-{uuid4().hex[:8]}-live"
+    foreign = f"scopef-{uuid4().hex[:8]}-live"
+
+    scoped_before = studio_status(conn, workstreams=[a, b]).queued
+    all_before = studio_status(conn).queued
+    for w in (a, b, foreign):
+        enqueue_task(conn, workstream=w, type="work.task", payload={"traffic": "prod"})
+
+    scoped_after = studio_status(conn, workstreams=[a, b]).queued
+    all_after = studio_status(conn).queued
+    # {a, b} scope counts the two pinned workstreams' tasks, NOT the foreign one…
+    assert scoped_after - scoped_before == 2
+    # …while the unscoped (all-workstream) view counts all three.
+    assert all_after - all_before == 3
+    # Empty set / None ⇒ no filter (full view), and the single-ws param still works
+    # and agrees with the one-element set form (back-compat).
+    assert studio_status(conn, workstreams=[]).queued == all_after
+    assert (
+        studio_status(conn, workstream=a).queued
+        == studio_status(conn, workstreams=[a]).queued
+    )
+
+
+@pytestmark_live
 def test_inbound_approve_resolves_and_resumes_blocked_task(conn, ws) -> None:
     # 1. A task is claimed (in_progress), then blocked on a 🔴 approval.
     task = enqueue_task(conn, workstream=ws, type="work.demo", payload={})

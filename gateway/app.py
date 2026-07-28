@@ -697,7 +697,14 @@ def create_app(
     def studio_status_view(
         authorization: Optional[str] = Header(default=None),
     ) -> dict:
-        """Aggregate studio queue pulse (``read`` scope) — test traffic filtered."""
+        """Aggregate studio queue pulse (``read`` scope) — test traffic filtered.
+
+        Scope is the token's FULL workstream pin-set, not ``allowed.workstream``:
+        a multi-pinned token has ``default_workstream() == None``, and passing that
+        as ``workstream`` would make ``studio_status`` aggregate over EVERY
+        workstream — leaking counts/spend/approvals from verticals the token is not
+        pinned to (ADR-0018/0028). Unpinned ⇒ empty pin-set ⇒ full studio view.
+        """
         allowed = _gate(
             authorization=authorization, scope=SCOPE_READ, verb="studio_status",
             workstream_optional=True,
@@ -706,7 +713,8 @@ def create_app(
         try:
             from spokesman.runtime_bridge import studio_status as _studio_status
 
-            snap = _studio_status(conn, workstream=allowed.workstream)
+            pins = sorted(allowed.token.workstreams)  # [] when unpinned = full view
+            snap = _studio_status(conn, workstreams=pins or None)
             _audit(
                 conn, type=EVENT_GATEWAY_ACCESS, identity=allowed.identity,
                 verb="studio_status", scope=SCOPE_READ, status=200,
@@ -722,6 +730,7 @@ def create_app(
                 "spent_tokens": snap.spent_tokens,
                 "open_tasks": snap.open_tasks,
                 "workstream": allowed.workstream,
+                "workstreams": pins,
             }
         finally:
             _close(conn)

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 from uuid import UUID
 
 import psycopg
@@ -344,10 +344,32 @@ class StudioStatus:
         )
 
 
+def _workstream_scope(
+    workstream: Optional[str],
+    workstreams: Optional[Iterable[str]],
+) -> list[str]:
+    """Normalize the single + set workstream filters into a sorted, deduped list.
+
+    Empty list ⇒ no filter (full, all-workstream access — the correct behaviour
+    for the all-workstream Spokesman and for an UNPINNED gateway token). A
+    non-empty list scopes the read to exactly those workstreams: a gateway token
+    pinned to one OR several verticals must never see counts/spend/approvals from a
+    workstream it is not pinned to (ADR-0018 vertical isolation, ADR-0028 amendment
+    "pinned tokens get workstream-SCOPED studio status").
+    """
+    scope: set[str] = set()
+    if workstream:
+        scope.add(workstream)
+    if workstreams:
+        scope.update(w for w in workstreams if w)
+    return sorted(scope)
+
+
 def studio_status(
     conn: psycopg.Connection,
     *,
     workstream: Optional[str] = None,
+    workstreams: Optional[Iterable[str]] = None,
 ) -> StudioStatus:
     """Summarize live task-queue counts + pending approvals + spend from the DB.
 
@@ -359,18 +381,25 @@ def studio_status(
     …) so stakeholder ``status`` / chat tools match the dashboard. See
     :mod:`spokesman.noise`.
 
-    When ``workstream`` is set (e.g. a gateway token pinned to one vertical),
-    counts are restricted to that workstream (ADR-0018).
+    ``workstream`` (single) and ``workstreams`` (a set/list, e.g. a gateway token's
+    full workstream PIN-SET) both restrict the read; they are unioned. When the
+    combined scope is empty the read spans all workstreams (the all-workstream
+    Spokesman, and an unpinned token). When it is non-empty — a token pinned to one
+    OR several verticals — counts/spend/approvals are confined to that scope so a
+    multi-pinned token can never read a workstream it is not pinned to (ADR-0018 /
+    ADR-0028). A ``None`` default_workstream (which a 2+ pin token has) must NOT be
+    conflated with "all": pass the pin-set here, not ``None``.
     """
     from .noise import REAL_TASK_SQL
 
+    scope = _workstream_scope(workstream, workstreams)
     counts: dict[str, int] = {}
     spent = 0
     clauses = [REAL_TASK_SQL]
     params: list[object] = []
-    if workstream:
-        clauses.append("workstream = %s")
-        params.append(workstream)
+    if scope:
+        clauses.append("workstream = ANY(%s)")
+        params.append(scope)
     where = " AND ".join(clauses)
     with conn.cursor() as cur:
         cur.execute(
@@ -400,7 +429,9 @@ def studio_status(
         blocked=counts.get("blocked", 0),
         done=counts.get("merged", 0),
         failed=counts.get("abandoned", 0),
-        pending_approvals=len(_pending_approvals_real(conn, workstream=workstream)),
+        pending_approvals=len(
+            _pending_approvals_real(conn, workstreams=scope)
+        ),
         spent_tokens=spent,
     )
 
@@ -409,16 +440,23 @@ def _pending_approvals_real(
     conn: psycopg.Connection,
     *,
     workstream: Optional[str] = None,
+    workstreams: Optional[Iterable[str]] = None,
 ):
-    """Pending approvals whose linked task is real (not test/demo noise)."""
+    """Pending approvals whose linked task is real (not test/demo noise).
+
+    ``workstream``/``workstreams`` scope the same way as :func:`studio_status`
+    (unioned; empty ⇒ all workstreams) so a pinned gateway token never counts an
+    approval from a workstream it is not pinned to.
+    """
     from .noise import real_task_sql
 
+    scope = _workstream_scope(workstream, workstreams)
     # Approvals without a task_id cannot be proven real — omit from stakeholder feed.
     clauses = [f"a.status = 'pending'", f"({real_task_sql('t')})"]
     params: list[object] = []
-    if workstream:
-        clauses.append("t.workstream = %s")
-        params.append(workstream)
+    if scope:
+        clauses.append("t.workstream = ANY(%s)")
+        params.append(scope)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT a.id, a.task_id, a.role, a.tool, a.tier, a.reason, a.created_at "

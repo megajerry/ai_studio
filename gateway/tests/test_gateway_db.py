@@ -310,6 +310,54 @@ def test_a_multi_pinned_token_is_not_locked_out(conn, ws) -> None:
     ).status_code == 403
 
 
+def test_multi_pinned_studio_status_is_scoped_not_studio_wide(conn) -> None:
+    """studio_status for a multi-pinned token must aggregate ONLY its pinned
+    workstreams — never the whole studio (the cross-workstream leak).
+
+    Root cause the fix closes: ``default_workstream()`` returns ``None`` for BOTH
+    an unpinned token (=full access, correct) and a 2+ pin token (must be scoped),
+    conflating them. Passing that ``None`` as ``workstream`` made studio_status
+    aggregate over EVERY workstream. The gateway now threads the token's PIN-SET.
+
+    Uses non-noise, prod-tagged workstreams so the rows are stakeholder-visible
+    (under AI_STUDIO_TEST_DB=1 the auto-tag would otherwise hide them), and asserts
+    on before/after DELTAS so residual rows on a shared DB don't matter.
+    """
+    a, b, foreign = "gwscope-alpha", "gwscope-beta", "gwscope-gamma"
+
+    # A token pinned to {a, b}; OTHER_SECRET is unpinned = the full-studio view.
+    multi = TestClient(
+        create_app(
+            make_settings(tokens=_registry(workstreams=frozenset({a, b}))),
+            connect=db.connect,
+        )
+    )
+
+    def queued(secret: str) -> tuple[int, dict]:
+        resp = multi.get("/v1/studio/status", headers=bearer(secret))
+        assert resp.status_code == 200, resp.text
+        return resp.json()["queued"], resp.json()
+
+    scoped_before, scoped_body = queued(REMOTE_SECRET)
+    full_before, _ = queued(OTHER_SECRET)
+    # The pinned token reports exactly its pin-set as the applied scope.
+    assert scoped_body["workstreams"] == [a, b]
+
+    # Seed one grabbable (queued) prod task in each pinned ws AND the foreign one.
+    for w in (a, b, foreign):
+        enqueue_task(conn, workstream=w, type="work.remote", payload={"traffic": "prod"})
+    if not conn.autocommit:
+        conn.commit()
+
+    scoped_after, _ = queued(REMOTE_SECRET)
+    full_after, _ = queued(OTHER_SECRET)
+
+    # Pinned token sees ONLY its two workstreams' new tasks (+2), NOT the foreign
+    # gamma one — the leak is closed. Unpinned sees all three (+3).
+    assert scoped_after - scoped_before == 2, (scoped_before, scoped_after)
+    assert full_after - full_before == 3, (full_before, full_after)
+
+
 def test_a_pinned_token_cannot_claim_outside_its_workstream(conn, ws) -> None:
     other_ws = f"{ws}-other"
     enqueue_task(conn, workstream=other_ws, type="work.remote")
