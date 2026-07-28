@@ -269,6 +269,17 @@ EVENT_HANDOFF_ENDED = "handoff.ended"
 EVENT_GATEWAY_ACCESS = "gateway.access"
 EVENT_GATEWAY_DENIED = "gateway.denied"
 
+# --- Human remote ops control-plane (spokesman.ops, ADR-0033) ---------------
+#: Emitted for EVERY invocation of the token-gated `ops` control-plane (worker
+#: start/stop/scale, ps/logs/restart/up, and the arbitrary `docker` escape
+#: hatch). Operational audit only — the payload carries the REDACTED docker/
+#: compose argv (env values stripped), the exit code, the destructive/blocked
+#: flags, and the human identity. It NEVER carries stdout/stderr, env, or any
+#: secret value (invariants 5 & 6). A destructive op blocked for missing `confirm`
+#: still emits this with ``blocked: true`` and no exit code — the attempt is
+#: audited even though nothing ran.
+EVENT_OPS_INVOKED = "ops.invoked"
+
 # --- Experiments (runtime.experiment) ---------------------------------------
 EVENT_PROPOSED = "experiment.proposed"
 EVENT_STARTED = "experiment.started"

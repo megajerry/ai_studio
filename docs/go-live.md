@@ -155,6 +155,42 @@ real LLM — see the Troubleshooting section in the Spokesman runbook); a test
 `/notify` (with the `X-Spokesman-Token` header) is delivered (or logged in
 dry-run).
 
+### 9. Runtime services + remote ops control-plane (ADR-0033)  *(HOST-REQUIRED)*
+
+The event-driven core (`worker` / `scheduler` / `supervisor` /
+`trajectory-worker`) now runs as compose services behind the **`runtime`
+profile** — this is what receives the DB credential + model keys (the launchd
+plists never did). Start them after migrate:
+
+```bash
+docker compose --profile runtime up -d              # start the runtime core
+docker compose --profile runtime ps                 # verify they're up
+```
+
+> The launchd worker approach is **superseded** by this compose profile
+> (ADR-0033). It is the supported, remotely-controllable path; existing
+> scheduler/supervisor/trajectory launchd plists may stay but compose is canonical.
+
+**Remote ops control-plane (temporary scaffolding).** So a remote stakeholder can
+start/scale/inspect the runtime without SSH, the Spokesman container mounts the
+host Docker socket and exposes a **token-gated, human-fast-path, audited** `ops`
+control-plane. Enable it by recreating the Spokesman **with `--build`** (picks up
+the socket mount + docker CLI):
+
+```bash
+docker compose --profile spokesman up -d --build spokesman
+# then, over an authenticated (non-public) path:
+curl -XPOST localhost:8080/ops -H "X-Spokesman-Token: $SPOKESMAN_API_TOKEN" \
+  -H 'content-type: application/json' -d '{"args":"worker start"}'
+```
+
+This grants the container host-daemon control — an **ACCEPTED, explicitly
+temporary** posture, safe only because ops are token-gated, human-fast-path only
+(the conversational LLM can never invoke them), destructive-confirm guarded,
+audited (`ops.invoked`), and **kept off the public tunnel**. Full detail +
+command list: [`docs/spokesman-whatsapp.md`](spokesman-whatsapp.md) and
+[ADR-0033](decisions/0033-human-remote-ops-controlplane.md).
+
 ---
 
 ## What only the host can verify (HOST-REQUIRED)

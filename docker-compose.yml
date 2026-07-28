@@ -5,6 +5,23 @@
 
 name: ai-studio
 
+# Shared env for the runtime services (ADR-0033). Mirrors the DB + model-key
+# block the `spokesman` service already uses, so the worker/scheduler/supervisor/
+# trajectory-worker finally receive the Postgres credential + provider keys the
+# launchd plists never got (compose substitutes ${VAR} from .env). Secrets stay
+# in the environment (ADR-0011); nothing is baked into an image.
+x-runtime-env: &runtime-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_USER: ${POSTGRES_USER:-aistudio}
+  POSTGRES_DB: ${POSTGRES_DB:-aistudio}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/onboarding.sh to set POSTGRES_PASSWORD}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  MODELS_DRY_RUN: ${MODELS_DRY_RUN:-}
+  AI_STUDIO_STATE_DIR: /app/state
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -171,12 +188,26 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-aistudio}
       POSTGRES_DB: ${POSTGRES_DB:-aistudio}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/onboarding.sh to set POSTGRES_PASSWORD}
+      # Human remote ops control-plane (ADR-0033). Where `docker compose` runs
+      # for the token-gated `ops` commands — the repo root, mounted read-only at
+      # /app/repo below. TEMPORARY scaffolding with an ACCEPTED security posture.
+      AI_STUDIO_COMPOSE_DIR: /app/repo
     ports:
       - "${SPOKESMAN_PORT:-8080}:${SPOKESMAN_PORT:-8080}"
     volumes:
       # Inbound messages / status summaries integrate with the git state tree
       # (ADR-0007). The runtime inbound log is git-ignored.
       - ./state:/app/state
+      # Human remote ops control-plane (ADR-0033) — gives THIS container control
+      # of the host Docker daemon. SECURITY: this is powerful; it stays safe ONLY
+      # because the ops path is token-gated (X-Spokesman-Token), human-fast-path
+      # only (the conversational LLM can NEVER invoke it), and kept OFF the public
+      # tunnel (see docs/spokesman-whatsapp.md security notes). Explicitly
+      # temporary scaffolding until the studio is self-sufficient.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Repo (incl. .env) mounted read-only so `docker compose` resolves the
+      # project + ${VAR} substitution from AI_STUDIO_COMPOSE_DIR.
+      - .:/app/repo:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -227,6 +258,74 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+  # --- Runtime services (ADR-0033) -----------------------------------------
+  # The event-driven core: the worker claims + executes queue tasks, the
+  # scheduler ticks cron work, the supervisor watches heartbeats, the trajectory
+  # worker ingests reasoning traces. All four share one image (runtime/Dockerfile)
+  # and differ only by `command:`. Behind the `runtime` profile so a plain
+  # `docker compose up` (the M0 spine) is unaffected — start them with
+  # `docker compose --profile runtime up -d`. Each gets the DB + model-key env
+  # (the *runtime-env anchor) that the launchd plists never received.
+  worker:
+    profiles: ["runtime"]
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+    command: ["python", "-m", "runtime.worker"]
+    restart: unless-stopped
+    environment:
+      <<: *runtime-env
+    volumes:
+      - ./state:/app/state
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  scheduler:
+    profiles: ["runtime"]
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+    command: ["python", "-m", "runtime.scheduler"]
+    restart: unless-stopped
+    environment:
+      <<: *runtime-env
+    volumes:
+      - ./state:/app/state
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  supervisor:
+    profiles: ["runtime"]
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+    command: ["python", "-m", "runtime.supervisor"]
+    restart: unless-stopped
+    environment:
+      <<: *runtime-env
+    volumes:
+      - ./state:/app/state
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  trajectory-worker:
+    profiles: ["runtime"]
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+    command: ["python", "-m", "runtime.trajectory_worker"]
+    restart: unless-stopped
+    environment:
+      <<: *runtime-env
+    volumes:
+      - ./state:/app/state
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 # Fixed internal subnet so Postgres' pg_hba can trust the compose network by CIDR
 # (172.28.0.0/16) while keeping remote LAN access a strict allowlist (ADR-0017).
