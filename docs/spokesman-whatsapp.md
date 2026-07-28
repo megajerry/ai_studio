@@ -469,3 +469,24 @@ docker compose --profile runtime up -d                       # start worker/sche
 > profile (ADR-0033) — that is the supported, remotely-controllable path (and the
 > one that actually receives the DB + model keys). Existing scheduler/supervisor/
 > trajectory launchd plists can stay, but compose is now canonical.
+
+### Operational caveats (read before enabling)
+
+- **Prefer the `X-Spokesman-Token` HEADER, not `?token=`, for ops.** The web-chat
+  path rides the dashboard token, which `require_dashboard_token` also accepts as a
+  `?token=` **query parameter** (convenient for a mobile browser). A token in a URL
+  can leak via proxy / referrer / access logs — and that same token now grants
+  **host-daemon control**. For the `/ops` control plane, always send the token as
+  the `X-Spokesman-Token` **header** (as the `curl` examples above do), and treat a
+  `?token=` ops URL as sensitive. The off-public-tunnel requirement is the primary
+  mitigation; header-only for ops is defense in depth.
+- **Docker socket group permission (fails CLOSED).** The Spokesman container runs
+  as a non-root user (uid 10001), but `/var/run/docker.sock` is `root:docker` on the
+  host. Out of the box the ops subprocess may get `permission denied` talking to the
+  daemon — which **fails closed** (ops simply don't run; nothing unsafe happens), but
+  they also won't work until the socket is reachable. Grant it by giving the
+  container user membership in the host's `docker` group gid, e.g. add
+  `group_add: ["<docker-gid>"]` to the `spokesman` service in `docker-compose.yml`
+  (find the gid with `getent group docker` / `stat -f '%g' /var/run/docker.sock` on
+  macOS), then recreate with `--build`. Do **not** run the container as root to work
+  around this.

@@ -70,6 +70,9 @@ _SECRET_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _SECRET_HINT_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PWD|CRED)", re.IGNORECASE)
 _ENV_FLAGS = {"-e", "--env", "--env-file"}
 _PASSWORD_FLAGS = {"--password", "--password-stdin", "-p"}
+#: A single-dash short-flag bundle, e.g. ``-f`` / ``-fv`` / ``-rf`` (so a bundled
+#: flag can't smuggle ``-f``/``-v`` past an exact-token guard).
+_SHORT_FLAG_RE = re.compile(r"^-[a-z]+$")
 
 
 class OpsError(ValueError):
@@ -251,28 +254,75 @@ def build_op(tokens: Sequence[str]) -> ParsedOp:
 # --- Destructive classification ---------------------------------------------
 
 
+def _short_flag_bundles(letter: str, tokens_lower: Sequence[str]) -> bool:
+    """True if any single-dash short-flag token bundles ``letter``.
+
+    Catches ``-f`` AND ``-fv`` / ``-rf`` — so a bundled flag can't smuggle a
+    force/volume flag past an exact-``{"-f"}`` membership test.
+    """
+    return any(_SHORT_FLAG_RE.match(t) and letter in t[1:] for t in tokens_lower)
+
+
+def _has_force_flag(tokens_lower: Sequence[str]) -> bool:
+    return "--force" in tokens_lower or _short_flag_bundles("f", tokens_lower)
+
+
+def _has_volume_flag(tokens_lower: Sequence[str]) -> bool:
+    """A ``-v`` / ``--volume`` / ``--volume=...`` bind/volume mount (any form)."""
+    for t in tokens_lower:
+        if t in {"-v", "--volume"} or t.startswith("--volume="):
+            return True
+    return _short_flag_bundles("v", tokens_lower)
+
+
+def _targets_critical_service(tokens_lower: Sequence[str]) -> bool:
+    """SUBSTRING match so a real container name (``ai-studio-postgres-1``) — not
+    only the bare service token (``postgres``) — is recognized as critical."""
+    return any(crit in t for t in tokens_lower for crit in CRITICAL_SERVICES)
+
+
 def classify_destructive(argv: Sequence[str]) -> tuple[bool, str]:
     """Return ``(is_destructive, reason)`` for a resolved docker/compose argv.
 
     Destructive = can delete data or take down the whole studio. These require an
-    explicit ``confirm`` so a single message can never destroy volumes.
+    explicit ``confirm`` so a single message can never destroy volumes. Detection
+    is SUBSTRING/bundle-aware (not exact-token) so it can't be evaded by a real
+    container name or a bundled short flag (ADR-0033 security review).
     """
     lower = [t.lower() for t in argv]
     tokens = set(lower)
 
+    # `down` (bare, `-v`, `--volumes`, or `--volumes=true`) — takes down the whole
+    # project and can delete named volumes.
     if "down" in tokens:
-        if tokens & {"-v", "--volumes"}:
+        if (tokens & {"-v", "--volumes"}) or any(
+            t.startswith("--volumes") for t in lower
+        ):
             return True, "down --volumes deletes named volumes"
         return True, "down stops the whole project (including postgres)"
+
     if "prune" in tokens:
         return True, "prune bulk-deletes docker objects"
-    if "rm" in tokens and tokens & {"-f", "--force"}:
+
+    # Forced remove — bundled short flags (`-fv`, `-rf`) count, not just `-f`.
+    if "rm" in tokens and _has_force_flag(lower):
         return True, "forced remove"
-    if "volume" in tokens and tokens & {"rm", "prune"}:
+
+    if "volume" in tokens and (tokens & {"rm", "prune"}):
         return True, "volume removal"
-    stop_verbs = {"stop", "down", "kill", "rm"}
-    if any(s in tokens for s in CRITICAL_SERVICES) and (stop_verbs & tokens):
+
+    # Arbitrary bind/volume mount on `run`/`create` — the accepted-but-dangerous
+    # data path; gate it behind confirm rather than run it silently.
+    if (tokens & {"run", "create"}) and _has_volume_flag(lower):
+        return True, "volume/bind mount (-v/--volume) on run/create"
+
+    # Stopping / killing / removing / restarting a CRITICAL service — by service
+    # name OR real container name (substring), so `stop ai-studio-postgres-1` is
+    # caught, not only the bare `postgres` token.
+    stop_verbs = {"stop", "kill", "rm", "restart", "down"}
+    if (stop_verbs & tokens) and _targets_critical_service(lower):
         return True, "affects a critical service (postgres)"
+
     return False, ""
 
 

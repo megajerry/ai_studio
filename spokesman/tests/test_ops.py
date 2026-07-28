@@ -152,6 +152,79 @@ def test_confirm_token_parsed_from_message_form() -> None:
     assert tokens == ["docker", "system", "prune", "-f"]
 
 
+# --- (d bis) security-review bypasses that MUST now require confirm ----------
+# Before the fix `classify_destructive` matched exact tokens, so these slipped
+# past the confirm gate and ran silently. Each must now be blocked without
+# confirm and run only with it.
+
+_BYPASSES = [
+    # 1. Stop/kill/restart/rm the DB by its REAL container name (compose project
+    #    is `ai-studio` → container `ai-studio-postgres-1`), not the bare token.
+    ["docker", "stop", "ai-studio-postgres-1"],
+    ["docker", "kill", "ai-studio-postgres-1"],
+    ["docker", "restart", "ai-studio-postgres-1"],
+    ["docker", "rm", "ai-studio-postgres-1"],
+    # 2. Bundled short flags smuggling `-f` (`-fv`, `-rf`).
+    ["docker", "rm", "-fv", "c"],
+    ["docker", "rm", "-rf", "c"],
+    # 3. Arbitrary bind/volume mount on run/create (all flag forms).
+    ["docker", "run", "-v", "vol:/x", "img"],
+    ["docker", "run", "--volume", "vol:/x", "img"],
+    ["docker", "run", "--volume=vol:/x", "img"],
+]
+
+
+@pytest.mark.parametrize("tokens", _BYPASSES)
+def test_review_bypass_now_requires_confirm(tokens) -> None:
+    assert ops_mod.classify_destructive(tokens)[0] is True  # classified destructive
+    runner = RecordingRunner()
+    blocked = run_ops(tokens, identity="x", confirm=False, runner=runner, sink=MemoryEventSink())
+    assert blocked.needs_confirm is True and blocked.ok is False
+    assert runner.calls == []  # NOTHING ran without confirm (was: ran silently)
+
+
+@pytest.mark.parametrize("tokens", _BYPASSES)
+def test_review_bypass_runs_with_confirm(tokens) -> None:
+    runner = RecordingRunner()
+    ok = run_ops(tokens, identity="x", confirm=True, runner=runner, sink=MemoryEventSink())
+    assert ok.destructive is True and ok.needs_confirm is False
+    assert len(runner.calls) == 1  # confirmed → executed
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ["docker", "compose", "down"],
+        ["docker", "compose", "down", "-v"],
+        ["docker", "compose", "down", "--volumes=true"],
+        ["docker", "volume", "rm", "x"],
+        ["docker", "system", "prune", "-f"],
+        ["docker", "stop", "postgres"],  # bare service token still caught
+    ],
+)
+def test_previously_blocked_still_blocked(tokens) -> None:
+    assert ops_mod.classify_destructive(tokens)[0] is True
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ["worker", "start"],
+        ["worker", "stop"],  # stopping the WORKER is not critical → no confirm
+        ["worker", "scale", "3"],
+        ["restart", "spokesman"],  # restarting a non-critical svc is fine
+        ["up", "scheduler"],
+        ["ps"],
+        ["logs", "worker"],
+        ["docker", "ps", "-a"],
+        ["docker", "logs", "worker"],
+    ],
+)
+def test_non_critical_ops_stay_non_destructive(tokens) -> None:
+    argv = ops_mod.build_op(tokens).argv
+    assert ops_mod.classify_destructive(argv)[0] is False
+
+
 # --- (e) audit event is emitted with NO secrets -----------------------------
 
 
