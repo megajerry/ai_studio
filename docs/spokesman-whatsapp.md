@@ -369,10 +369,11 @@ on an interval (cron / the scheduler) alongside a periodic `POST /digest/flush`.
 | POST | `/notify` | `X-Spokesman-Token` | `{"kind":"approve\|inform\|alarm","text":"…"}` → classify + route |
 | POST | `/digest/flush` | `X-Spokesman-Token` | send the pending approve/inform digest |
 | POST | `/poll` | `X-Spokesman-Token` | one runtime-bridge pass (event log → sends), cursor advanced |
+| POST | `/ops` | `X-Spokesman-Token` | human remote ops control-plane (ADR-0033): `{"args":"worker start","confirm":false}` |
 
-`/notify`, `/digest/flush` and `/poll` are the **control plane** and require the
-`X-Spokesman-Token` header (matched against `SPOKESMAN_API_TOKEN`). They **fail
-closed**: if `SPOKESMAN_API_TOKEN` is unset, all return `401`.
+`/notify`, `/digest/flush`, `/poll` and `/ops` are the **control plane** and
+require the `X-Spokesman-Token` header (matched against `SPOKESMAN_API_TOKEN`).
+They **fail closed**: if `SPOKESMAN_API_TOKEN` is unset, all return `401`.
 
 `/digest/flush` and `/poll` are intended to be driven by the scheduler (e.g.
 `/poll` frequently, `/digest/flush` daily); until then call them manually or by
@@ -389,11 +390,103 @@ cron.
   spoofed alarms/approvals to the stakeholder.
 - **Defense in depth — restrict the tunnel.** Configure the cloudflared tunnel to
   forward only `/webhook` and `/health` publicly (e.g. per-path ingress rules);
-  keep `/notify` and `/digest/flush` reachable only on the local network. The
-  token gate is the primary control; the tunnel scoping is a second layer.
+  keep `/notify`, `/digest/flush`, `/poll`, `/chat` **and `/ops`** reachable only
+  on the local network / an authenticated private tunnel. The token gate is the
+  primary control; the tunnel scoping is a second layer. **The `/ops` control
+  plane (ADR-0033) MUST stay off the public tunnel** — see below.
 - **No personal info in git.** Inbound sender numbers are masked to the last 4
   digits and message bodies are truncated to 4000 chars before being written; the
   inbound log is git-ignored (ADR-0011). It is short-lived working state, not a
   durable record — safe to rotate/delete once messages are processed.
 - **Secrets never reach an agent.** The service (a tool) reads creds from the
   environment and calls the Graph API on the studio's behalf.
+
+## Human remote ops control-plane (ADR-0033) — TEMPORARY scaffolding
+
+Until the studio is self-sufficient, a remote stakeholder has no way to start the
+runtime on the host. ADR-0033 gives the Spokesman a **human-operated** ops
+control-plane: the host Docker socket is mounted into the Spokesman container and
+the runtime services (`worker` / `scheduler` / `supervisor` / `trajectory-worker`)
+run as compose services behind a **`runtime` profile**. This is **explicitly
+temporary** with an **ACCEPTED security posture** — mounting the socket grants the
+container host-daemon control.
+
+**Why it does not violate invariant #2 (agents don't touch the host):** ops are a
+**capability-gated tool invoked by an authenticated human**, never by an agent.
+The leading `ops` verb is parsed on a deterministic fast-path **before** any model
+call, and only on a token-gated channel; the conversational LLM has **no ops
+capability** and can never invoke it.
+
+**Commands** (`args` is the command without the leading `ops`):
+
+| Command | Effect |
+| --- | --- |
+| `ops worker start\|stop\|status` | up/stop/ps the worker service |
+| `ops worker scale <N>` | `--scale worker=<N>` |
+| `ops ps` | compose ps |
+| `ops logs <svc>` | last 200 lines for a service |
+| `ops restart <svc>` / `ops up <svc>` | restart / `up -d` a service |
+| `ops docker <args...>` | arbitrary `docker` escape hatch |
+
+**Destructive ops require confirm.** `down -v` / `--volumes`, `prune`, `rm -f`,
+and stopping `postgres` (or a bare `down`) are **blocked** unless you add a
+`confirm` (append the word `confirm` in the chat form, or `"confirm": true` on
+`/ops`). A single message can never destroy volumes.
+
+**Audit.** Every attempt — including a blocked one — emits an `ops.invoked` event
+with the **redacted** argv (env / secret values stripped), exit code, and human
+identity. **Command stdout/stderr are returned to you but never written to the
+event log.**
+
+Reach it two ways, both token-gated and both to be kept **off the public tunnel**:
+
+```bash
+# HTTP (scriptable):
+curl -XPOST localhost:8080/ops -H "X-Spokesman-Token: $SPOKESMAN_API_TOKEN" \
+  -H 'content-type: application/json' -d '{"args":"worker start"}'
+# Destructive → add confirm:
+curl -XPOST localhost:8080/ops -H "X-Spokesman-Token: $SPOKESMAN_API_TOKEN" \
+  -H 'content-type: application/json' -d '{"args":"docker system prune -f","confirm":true}'
+```
+
+Or type `ops worker start` in the token-gated web chat (`/chat?token=…`). Ops are
+**not** available over the public WhatsApp webhook (that path passes
+`ops_authorized=False`), keeping host control off the public tunnel.
+
+### One-time enablement (host)
+
+The socket mount + docker CLI are added to the image/compose, so recreating the
+Spokesman with `--build` picks them up, then start the runtime profile:
+
+```bash
+git checkout main && git pull
+python -m runtime.migrate
+docker compose --profile spokesman up -d --build spokesman   # recreate WITH the socket mount
+docker compose --profile runtime up -d                       # start worker/scheduler/supervisor/trajectory-worker
+```
+
+> The launchd worker plist approach is **superseded** by the compose `runtime`
+> profile (ADR-0033) — that is the supported, remotely-controllable path (and the
+> one that actually receives the DB + model keys). Existing scheduler/supervisor/
+> trajectory launchd plists can stay, but compose is now canonical.
+
+### Operational caveats (read before enabling)
+
+- **Prefer the `X-Spokesman-Token` HEADER, not `?token=`, for ops.** The web-chat
+  path rides the dashboard token, which `require_dashboard_token` also accepts as a
+  `?token=` **query parameter** (convenient for a mobile browser). A token in a URL
+  can leak via proxy / referrer / access logs — and that same token now grants
+  **host-daemon control**. For the `/ops` control plane, always send the token as
+  the `X-Spokesman-Token` **header** (as the `curl` examples above do), and treat a
+  `?token=` ops URL as sensitive. The off-public-tunnel requirement is the primary
+  mitigation; header-only for ops is defense in depth.
+- **Docker socket group permission (fails CLOSED).** The Spokesman container runs
+  as a non-root user (uid 10001), but `/var/run/docker.sock` is `root:docker` on the
+  host. Out of the box the ops subprocess may get `permission denied` talking to the
+  daemon — which **fails closed** (ops simply don't run; nothing unsafe happens), but
+  they also won't work until the socket is reachable. Grant it by giving the
+  container user membership in the host's `docker` group gid, e.g. add
+  `group_add: ["<docker-gid>"]` to the `spokesman` service in `docker-compose.yml`
+  (find the gid with `getent group docker` / `stat -f '%g' /var/run/docker.sock` on
+  macOS), then recreate with `--build`. Do **not** run the container as root to work
+  around this.

@@ -131,6 +131,19 @@ class ChatMessage(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000)
     session_key: str | None = Field(default=None, max_length=200)
 
+
+class OpsRequest(BaseModel):
+    """One human remote-ops command over the token-gated control plane (ADR-0033).
+
+    ``args`` is the ops command WITHOUT the leading ``ops`` verb (a leading
+    ``ops`` is tolerated and stripped), e.g. ``"worker start"`` or
+    ``"docker system prune -f"``. Destructive ops require ``confirm: true``.
+    """
+
+    args: str = Field(..., min_length=1, max_length=2000)
+    confirm: bool = False
+
+
 def run_notifier_pass(
     settings: Settings,
     notifier: Notifier,
@@ -184,6 +197,7 @@ def handle_inbound_command(
     *,
     notifier: object | None = None,
     session_key: str | None = None,
+    ops_authorized: bool = False,
 ) -> Optional[dict]:
     """Interpret one inbound message and act, or converse (ADR-0026).
 
@@ -192,6 +206,9 @@ def handle_inbound_command(
     - ``approve <id>`` /
       ``deny <id>``         → resolve the real approval via the runtime store.
     - ``decide <id> <answer>`` → answer an OPEN-ENDED decision (ADR-0025).
+    - ``ops <cmd...>``      → human remote ops control-plane (ADR-0033), ONLY when
+      ``ops_authorized`` (a token-gated channel). Parsed HERE, before the model,
+      so the conversational LLM can NEVER invoke host ops (invariant #2).
 
     Anything else is free-text converse (answer / enqueue PM goal / prep /
     handoff proposal) — never silently dropped.
@@ -307,6 +324,53 @@ def handle_inbound_command(
             return {"command": _DECIDE_VERB, "ok": False, "error": "not open"}
         client.send_text(f"Decision {decision_id} answered.", to=to)
         return {"command": _DECIDE_VERB, "ok": True, "status": decision.status}
+
+    # ADR-0033 — human remote ops control-plane. Parsed on the fast-path BEFORE
+    # the model so the conversational LLM can never reach it (invariant #2). Only
+    # runs on a token-gated channel (`ops_authorized`); the public webhook passes
+    # `ops_authorized=False` so host control stays off the public tunnel.
+    if verb == "ops":
+        from runtime.enforce import DbEventSink, NullEventSink
+
+        from . import ops as ops_mod
+
+        identity = f"{channel_tag}:{mask_number(msg.sender)}"
+        if not ops_authorized:
+            client.send_text(
+                "Ops control-plane is not available on this channel. Use the "
+                "token-gated control plane (kept off the public tunnel).",
+                to=to,
+            )
+            return {
+                "command": "ops",
+                "ok": False,
+                "error": "not authorized on this channel",
+            }
+        arg_tokens, confirm = ops_mod.parse_confirm(parts[1:])
+        # Best-effort audit sink: ops must still work during a DB outage (exactly
+        # when remote recovery matters), so fall back to a null sink.
+        ops_conn = None
+        try:
+            ops_conn = connect()
+        except Exception:  # noqa: BLE001 - audit is best-effort; ops still runs
+            logger.warning("ops: DB unreachable — running without audit sink")
+        try:
+            sink = DbEventSink(ops_conn) if ops_conn is not None else NullEventSink()
+            result = ops_mod.run_ops(
+                arg_tokens, identity=identity, confirm=confirm, sink=sink
+            )
+        finally:
+            if ops_conn is not None:
+                _close(ops_conn)
+        client.send_text(result.render(), to=to)
+        return {
+            "command": "ops",
+            "ok": result.ok,
+            "action": result.action,
+            "needs_confirm": result.needs_confirm,
+            "destructive": result.destructive,
+            "exit_code": result.exit_code,
+        }
 
     # ADR-0026 — free-text converse (never silently drop).
     from .converse import handle_conversation
@@ -442,8 +506,18 @@ def create_app(
         # per-conversation id; fall back to a fixed web key for older clients so a
         # page without a session id is still one coherent (if shared) session.
         session_key = (body.session_key or "").strip() or "web:default"
+        # The web chat is the token-gated (dashboard-token) authenticated-human
+        # UI, kept off the public tunnel — so the ops fast-path is authorized here
+        # (ADR-0033). It is still parsed before the model, so the conversational
+        # LLM can never invoke ops.
         result = handle_inbound_command(
-            settings, capture, connect, msg, notifier=notifier, session_key=session_key
+            settings,
+            capture,
+            connect,
+            msg,
+            notifier=notifier,
+            session_key=session_key,
+            ops_authorized=True,
         )
         if result is None:
             return {
@@ -610,6 +684,48 @@ def create_app(
     @app.post("/poll", dependencies=[Depends(require_api_token)])
     def poll() -> dict:
         return run_notifier_pass(settings, notifier, connect)
+
+    @app.post("/ops", dependencies=[Depends(require_api_token)])
+    def ops_endpoint(req: OpsRequest) -> dict:
+        """Human remote ops control-plane (ADR-0033) — TEMPORARY scaffolding.
+
+        Token-gated (``X-Spokesman-Token``, fail-closed via ``require_api_token``)
+        and HUMAN-only: it is a dedicated endpoint, NOT wired into the
+        conversational model, so the LLM can never invoke host ops (invariant #2).
+        Destructive ops (volume delete / prune / force-rm / stopping postgres)
+        require ``confirm: true``. Every attempt emits an ``ops.invoked`` audit
+        event with a REDACTED argv and no secrets. Keep this endpoint OFF the
+        public tunnel (see docs/spokesman-whatsapp.md).
+        """
+        from runtime.enforce import DbEventSink, NullEventSink
+
+        from . import ops as ops_mod
+
+        tokens = req.args.strip().split()
+        if tokens and tokens[0].lower() == "ops":
+            tokens = tokens[1:]  # tolerate a leading `ops` verb
+        ops_conn = None
+        try:
+            ops_conn = connect()
+        except Exception:  # noqa: BLE001 - audit best-effort; ops still runs
+            logger.warning("/ops: DB unreachable — running without audit sink")
+        try:
+            sink = DbEventSink(ops_conn) if ops_conn is not None else NullEventSink()
+            result = ops_mod.run_ops(
+                tokens, identity="control-plane", confirm=req.confirm, sink=sink
+            )
+        finally:
+            if ops_conn is not None:
+                _close(ops_conn)
+        return {
+            "ok": result.ok,
+            "action": result.action,
+            "needs_confirm": result.needs_confirm,
+            "destructive": result.destructive,
+            "exit_code": result.exit_code,
+            "argv": ops_mod.redact_argv(result.argv),
+            "reply": result.render(),
+        }
 
     return app
 
