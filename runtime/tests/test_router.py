@@ -25,13 +25,13 @@ def _registry():
 @pytest.mark.parametrize(
     "task_type,quality,expected",
     [
-        ("plan", "high", "claude-opus-4.8"),
+        ("plan", "high", "claude-opus-4-8"),
         ("plan", "low", "claude-sonnet-5"),
         ("code", "standard", "claude-sonnet-5"),
-        ("classify", "standard", "claude-haiku-4.5"),
+        ("classify", "standard", "claude-haiku-4-5"),
         ("classify", "high", "claude-sonnet-5"),
         ("embed", "standard", "text-embedding-005"),
-        ("unmapped-type", "high", "claude-opus-4.8"),  # falls to default
+        ("unmapped-type", "high", "claude-opus-4-8"),  # falls to default
     ],
 )
 def test_selection_by_task_type_and_quality(task_type, quality, expected):
@@ -56,7 +56,7 @@ def test_fallback_chain_skips_missing_model():
             ],
             "routing": {
                 "default": {"high": "pm"},
-                "tiers": {"pm": ["claude-opus-4.8", "gemini-3.1-pro"]},
+                "tiers": {"pm": ["claude-opus-4-8", "gemini-3.1-pro"]},
             },
         }
     )
@@ -87,17 +87,17 @@ def test_within_budget_does_not_downshift():
     budget = BudgetContext(spent_tokens=0, budget_tokens=1_000_000, estimated_tokens=10)
     d = route_decision("plan", "high", registry=reg, budget_ctx=budget)
     assert d.downshifted is False
-    assert d.model.id == "claude-opus-4.8"
+    assert d.model.id == "claude-opus-4-8"
 
 
 def test_route_emits_model_routed_event():
     reg = _registry()
     sink = MemoryEventSink()
     spec = route("plan", "high", registry=reg, sink=sink, workstream="productivity")
-    assert spec.id == "claude-opus-4.8"
+    assert spec.id == "claude-opus-4-8"
     assert sink.types() == [EVENT_MODEL_ROUTED]
     payload = sink.events[0].payload
-    assert payload["model"] == "claude-opus-4.8"
+    assert payload["model"] == "claude-opus-4-8"
     assert payload["provider"] == "anthropic"
     assert payload["tier"] == "pm"
     assert payload["reason"]
@@ -145,6 +145,6 @@ def test_next_candidate_walks_to_metered_fallback():
     # After the flat-rate substrate fails, the next model in the coding chain is
     # the metered fallback (Opus) — deterministic, rules-as-data.
     nxt = next_candidate(reg, Tier.CODING, "cursor-composer")
-    assert nxt is not None and nxt.id == "claude-opus-4.8"
+    assert nxt is not None and nxt.id == "claude-opus-4-8"
     # Nothing left after the last id in the chain.
-    assert next_candidate(reg, Tier.CODING, "claude-opus-4.8") is None
+    assert next_candidate(reg, Tier.CODING, "claude-opus-4-8") is None

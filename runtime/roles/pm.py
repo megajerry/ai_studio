@@ -190,6 +190,7 @@ _PLAN_PROMPT = (
     "it can run in parallel). Decompose the goal into the work items needed and set "
     "depends_on so independent items run in parallel and dependent ones wait. If the "
     "requirement is unreasonable or out of scope, set feasible=false and say why. "
+    "Respond with ONLY the JSON object — no prose, no markdown fences, no preface. "
     "Goal: {goal}"
 )
 
@@ -600,6 +601,7 @@ def _obtain_plan(
         task_id=task.id,
         sink=sink,
         workstream=task.workstream,
+        max_tokens=8192,
         **{PLAN_GOAL_OPT: goal},
     )
     return _parse_plan(getattr(completion, "text", ""), goal)

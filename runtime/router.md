@@ -33,7 +33,7 @@ engine (env → local → committed example):
 
 ```yaml
 models:
-  - id: claude-opus-4.8
+  - id: claude-opus-4-8
     provider: anthropic          # names the adapter (and thus the env key)
     tier: pm                     # pm | mid | cheap | embedding
     price_in: 5.0                # USD / 1M input tokens
@@ -50,9 +50,9 @@ routing:
     classify: {high: mid, standard: cheap, low: cheap}
   default: {high: pm, standard: mid, low: cheap}   # unmapped task_types
   tiers:                         # tier -> ordered fallback chain of model ids
-    pm: [claude-opus-4.8, gemini-3.1-pro]
+    pm: [claude-opus-4-8, gemini-3.1-pro]
     mid: [claude-sonnet-5, gemini-3.5-flash, deepseek-v4.5]
-    cheap: [claude-haiku-4.5, gemini-3.1-flash-lite]
+    cheap: [claude-haiku-4-5, gemini-3.1-flash-lite]
     embedding: [text-embedding-005]
   downshift: {pm: mid, mid: cheap}   # cheaper tier used when over budget
 ```

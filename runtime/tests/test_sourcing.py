@@ -99,7 +99,7 @@ def _base_registry() -> Registry:
             "models": [
                 {"id": "claude-sonnet-5", "provider": "anthropic", "tier": "mid",
                  "price_in": 3.0, "price_out": 15.0, "context_window": 1000000},
-                {"id": "claude-haiku-4.5", "provider": "anthropic", "tier": "cheap",
+                {"id": "claude-haiku-4-5", "provider": "anthropic", "tier": "cheap",
                  "price_in": 1.0, "price_out": 5.0, "context_window": 200000},
             ],
             "routing": {},
