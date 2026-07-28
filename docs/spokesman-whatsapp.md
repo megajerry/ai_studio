@@ -480,13 +480,20 @@ docker compose --profile runtime up -d                       # start worker/sche
   the `X-Spokesman-Token` **header** (as the `curl` examples above do), and treat a
   `?token=` ops URL as sensitive. The off-public-tunnel requirement is the primary
   mitigation; header-only for ops is defense in depth.
-- **Docker socket group permission (fails CLOSED).** The Spokesman container runs
-  as a non-root user (uid 10001), but `/var/run/docker.sock` is `root:docker` on the
-  host. Out of the box the ops subprocess may get `permission denied` talking to the
-  daemon — which **fails closed** (ops simply don't run; nothing unsafe happens), but
-  they also won't work until the socket is reachable. Grant it by giving the
-  container user membership in the host's `docker` group gid, e.g. add
-  `group_add: ["<docker-gid>"]` to the `spokesman` service in `docker-compose.yml`
-  (find the gid with `getent group docker` / `stat -f '%g' /var/run/docker.sock` on
-  macOS), then recreate with `--build`. Do **not** run the container as root to work
-  around this.
+- **Docker socket group permission (now fixed via `group_add`).** The Spokesman
+  container runs as a non-root user (uid 10001), but the mounted
+  `/var/run/docker.sock` is root-owned, so the ops subprocess would get
+  `permission denied while trying to connect to the docker API at
+  unix:///var/run/docker.sock`. The `spokesman` service therefore carries
+  `group_add: ["${DOCKER_GID:-0}"]` in `docker-compose.yml`, adding the container
+  process to a supplementary group that can read the socket:
+  - **Docker Desktop for Mac** — the socket is `root:root`, so the default
+    `DOCKER_GID=0` (root group) works out of the box; nothing to set.
+  - **Linux** — set `DOCKER_GID` in `.env` to the host `docker` group's gid,
+    found with `getent group docker | cut -d: -f3` (or, once the container is up,
+    `docker compose exec spokesman stat -c '%g' /var/run/docker.sock`), then
+    recreate with `--build`.
+
+  The container stays **non-root** — do NOT add `user: root` to work around this.
+  (If the socket is still unreachable, ops fail **closed**: they simply don't run;
+  nothing unsafe happens.)
