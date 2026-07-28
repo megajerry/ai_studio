@@ -334,11 +334,19 @@ def create_app(
         scope: str,
         verb: str,
         workstream: Optional[str] = None,
+        workstream_optional: bool = False,
     ) -> Allowed:
-        """Authorize one request or raise the mapped ``HTTPException``."""
+        """Authorize one request or raise the mapped ``HTTPException``.
+
+        ``workstream_optional=True`` is for the endpoints not scoped by a
+        caller-supplied workstream (whoami / read-one-task / studio-status /
+        agents-env): a token pinned to several workstreams must not be locked out
+        of them for lacking a single default (see :func:`gateway.auth.authorize`).
+        """
         decision = authorize(
             settings.tokens, limiter,
             authorization=authorization, scope=scope, workstream=workstream,
+            workstream_optional=workstream_optional,
         )
         if isinstance(decision, Denied):
             _audit_denied(decision, verb=verb, scope=scope)
@@ -391,7 +399,10 @@ def create_app(
     @app.get("/v1/whoami")
     def whoami(authorization: Optional[str] = Header(default=None)) -> dict:
         """Echo the caller's own identity/scopes — the remote's first smoke test."""
-        allowed = _gate(authorization=authorization, scope=SCOPE_ANY, verb="whoami")
+        allowed = _gate(
+            authorization=authorization, scope=SCOPE_ANY, verb="whoami",
+            workstream_optional=True,
+        )
         return {
             "identity": allowed.identity,
             "scopes": sorted(allowed.token.scopes),
@@ -493,8 +504,12 @@ def create_app(
         """One task row by id (subject to the token's workstream pinning)."""
         from runtime.tasks import get_task
 
+        # Gate loosely (any valid token with workstream access passes), then let
+        # _require_visible enforce the token's pin against THIS task's workstream —
+        # a multi-pinned token has no single default to gate on up front.
         allowed = _gate(
             authorization=authorization, scope=SCOPE_READ, verb="read_task",
+            workstream_optional=True,
         )
         conn = _open("read_task")
         try:
@@ -685,6 +700,7 @@ def create_app(
         """Aggregate studio queue pulse (``read`` scope) — test traffic filtered."""
         allowed = _gate(
             authorization=authorization, scope=SCOPE_READ, verb="studio_status",
+            workstream_optional=True,
         )
         conn = _open("studio_status")
         try:
@@ -778,6 +794,7 @@ def create_app(
         """
         allowed = _gate(
             authorization=authorization, scope=SCOPE_READ, verb="agents_env",
+            workstream_optional=True,
         )
         from runtime.traffic import default_traffic
 

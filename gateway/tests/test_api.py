@@ -28,6 +28,8 @@ from gateway.app import DB_UNAVAILABLE_DETAIL
 
 from .conftest import (
     FULL_SECRET,
+    MULTI_SECRET,
+    MULTI_WORKSTREAMS,
     PINNED_SECRET,
     PINNED_WORKSTREAM,
     READONLY_SECRET,
@@ -79,7 +81,7 @@ def test_health_is_public_and_leaks_nothing() -> None:
     resp = _client().get("/health")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "ok" and body["tokens_configured"] == 3
+    assert body["status"] == "ok" and body["tokens_configured"] == 4
     # The count is fine; identities/digests/tokens are not exposed.
     assert "tokens" not in body and FULL_SECRET not in resp.text
 
@@ -192,6 +194,54 @@ def test_a_blank_workstream_is_not_a_workstream() -> None:
         headers=bearer(FULL_SECRET),
     )
     assert resp.status_code == 422
+
+
+# --- Gate 4 (multi-pinned): workstream-less endpoints must not fail closed ---
+#
+# A token pinned to 2+ workstreams (supported per ADR-0028) has no single
+# default_workstream(); before the fix these endpoints collapsed to that None and
+# refused the token 403 workstream_denied — locking a legitimate credential out of
+# its own smoke test. All of these must now pass the gate.
+
+
+def test_multi_pinned_token_passes_whoami() -> None:
+    resp = _client().get("/v1/whoami", headers=bearer(MULTI_SECRET))
+    assert resp.status_code == 200  # was 403 workstream_denied before the fix
+    body = resp.json()
+    assert set(body["workstreams"]) == set(MULTI_WORKSTREAMS)
+    assert body["default_workstream"] is None  # 2+ pins → no single default
+
+
+def test_multi_pinned_token_passes_agents_env() -> None:
+    # agents_env tolerates a DB outage and still answers for a valid token.
+    resp = _client().get("/v1/agents/env", headers=bearer(MULTI_SECRET))
+    assert resp.status_code == 200
+    assert resp.json()["workstream_pin"] is None
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("GET", "/v1/studio/status", None),
+        ("GET", "/v1/tasks/11111111-1111-1111-1111-111111111111", None),
+    ],
+)
+def test_multi_pinned_token_passes_the_gate_on_db_backed_reads(
+    method: str, path: str, body
+) -> None:
+    # Past the gate the injected connect fails → 503; the point is it is NOT a
+    # 403 workstream_denied (which is what a multi-pinned token used to get here).
+    resp = _call(_client(), method, path, body, bearer(MULTI_SECRET))
+    assert resp.status_code == 503
+
+
+def test_multi_pinned_token_still_scoped_on_the_list_verbs() -> None:
+    # The looser gate must NOT leak onto the workstream-scoped list verbs: a
+    # multi-pinned token that names no workstream there is still refused (it must
+    # be explicit), preserving vertical isolation.
+    resp = _client().get("/v1/tasks/ready", headers=bearer(MULTI_SECRET))
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == REASON_WORKSTREAM_DENIED
 
 
 # --- Gate 5: rate limiting -------------------------------------------------

@@ -262,6 +262,54 @@ def test_a_pinned_token_cannot_see_another_workstreams_task(conn, ws) -> None:
     assert {t["workstream"] for t in listed.json()["tasks"]} == {ws}
 
 
+def test_a_multi_pinned_token_is_not_locked_out(conn, ws) -> None:
+    """A token pinned to 2+ workstreams (supported by ADR-0028) must still work.
+
+    Before the fix, ``default_workstream()`` returned ``None`` for a 2-pin token, so
+    the workstream-less endpoints (whoami / studio-status / agents-env / read-one)
+    all answered 403 ``workstream_denied`` — a legitimate credential locked out of
+    its own smoke test. It must now pass those and read a task in ANY of its pins,
+    while still being refused a task OUTSIDE them.
+    """
+    ws_two = f"{ws}-two"
+    outside_ws = f"{ws}-out"
+    mine = enqueue_task(conn, workstream=ws, type="work.remote")
+    also_mine = enqueue_task(conn, workstream=ws_two, type="work.remote")
+    outside = enqueue_task(conn, workstream=outside_ws, type="work.remote")
+
+    multi = TestClient(
+        create_app(
+            make_settings(tokens=_registry(workstreams=frozenset({ws, ws_two}))),
+            connect=db.connect,
+        )
+    )
+    # whoami: any valid token, no workstream gate.
+    who = multi.get("/v1/whoami", headers=bearer(REMOTE_SECRET))
+    assert who.status_code == 200, who.text
+    assert set(who.json()["workstreams"]) == {ws, ws_two}
+    assert who.json()["default_workstream"] is None  # 2 pins → no single default
+
+    # studio-status + agents-env: any valid token with workstream access → 200.
+    assert multi.get(
+        "/v1/studio/status", headers=bearer(REMOTE_SECRET)
+    ).status_code == 200
+    assert multi.get(
+        "/v1/agents/env", headers=bearer(REMOTE_SECRET)
+    ).status_code == 200
+
+    # read one task: allowed inside EITHER pinned workstream…
+    assert multi.get(
+        f"/v1/tasks/{mine.id}", headers=bearer(REMOTE_SECRET)
+    ).status_code == 200
+    assert multi.get(
+        f"/v1/tasks/{also_mine.id}", headers=bearer(REMOTE_SECRET)
+    ).status_code == 200
+    # …but refused for a task OUTSIDE the pins (per-task enforcement stands).
+    assert multi.get(
+        f"/v1/tasks/{outside.id}", headers=bearer(REMOTE_SECRET)
+    ).status_code == 403
+
+
 def test_a_pinned_token_cannot_claim_outside_its_workstream(conn, ws) -> None:
     other_ws = f"{ws}-other"
     enqueue_task(conn, workstream=other_ws, type="work.remote")

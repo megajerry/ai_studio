@@ -20,17 +20,23 @@ from gateway.config import Settings
 FULL_SECRET = "test-full-token-secret"
 READONLY_SECRET = "test-readonly-token-secret"
 PINNED_SECRET = "test-pinned-token-secret"
+MULTI_SECRET = "test-multi-pinned-token-secret"
 
 FULL_IDENTITY = "offhost-full"
 READONLY_IDENTITY = "offhost-readonly"
 PINNED_IDENTITY = "offhost-pinned"
+MULTI_IDENTITY = "offhost-multi"
 PINNED_WORKSTREAM = "pinned-vertical"
+#: A token legitimately pinned to 2+ workstreams (ADR-0028) — has no single
+#: default_workstream(), the case that used to fail-closed on the workstream-less
+#: endpoints (whoami / read-one-task / studio-status / agents-env).
+MULTI_WORKSTREAMS = frozenset({"multi-alpha", "multi-beta"})
 
 ALL_SCOPES_SET = frozenset({SCOPE_READ, SCOPE_ENQUEUE, SCOPE_CLAIM, SCOPE_COMPLETE})
 
 
 def make_registry() -> TokenRegistry:
-    """Three tokens: full authority, read-only, and one pinned to a workstream."""
+    """Four tokens: full authority, read-only, singly-pinned, and multi-pinned."""
     return TokenRegistry([
         Token(
             identity=FULL_IDENTITY,
@@ -47,6 +53,12 @@ def make_registry() -> TokenRegistry:
             scopes=ALL_SCOPES_SET,
             digest=token_digest(PINNED_SECRET),
             workstreams=frozenset({PINNED_WORKSTREAM}),
+        ),
+        Token(
+            identity=MULTI_IDENTITY,
+            scopes=ALL_SCOPES_SET,
+            digest=token_digest(MULTI_SECRET),
+            workstreams=MULTI_WORKSTREAMS,
         ),
     ])
 

@@ -360,15 +360,33 @@ def mint(
 
     Returns ``{"token", "digest", "spec", "env_file", "env_written"}``. Only
     ``spec`` (digest, never the secret) is written to ``env_file`` when
-    ``write_env`` is true — replacing any prior entry for the same identity.
-    The secret is returned for the remote once; hashing is inlined rather than
-    imported from :mod:`gateway.auth` so this file stays self-contained/copyable.
+    ``write_env`` is true — replacing any prior entry for the same identity, and
+    only AFTER the spec validates (a typo never reaches ``.env``). The secret is
+    returned for the remote once; *hashing* is inlined so the remote-facing verbs
+    stay self-contained/copyable with no import of :mod:`gateway.auth`. Minting is
+    a HOST-side verb (the remote never calls it), so its one validation import of
+    the server's own parser is fine and keeps the rules from drifting.
+
+    Raises :class:`~gateway.auth.TokenSpecError` (a ``ValueError``) on an invalid
+    scope/identity/workstream, writing nothing.
     """
     token = secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     spec = f"{identity}:{'|'.join(scopes)}:{digest}"
     if workstreams:
         spec = f"{spec}:{'|'.join(workstreams)}"
+
+    # Validate BEFORE writing anything: an unknown scope or a non-identifier
+    # identity/workstream would otherwise be persisted into .env, and then make
+    # ``parse_token_spec`` raise ``TokenSpecError`` at gateway startup — bricking
+    # boot for EVERY token, not just this one. We reuse the gateway's own parser
+    # (host-side only; ``mint`` is a HOST verb) so the rules never drift from what
+    # the server enforces. On any bad field this raises ``TokenSpecError`` (a
+    # ``ValueError``) and no file is touched. The freshly generated digest is
+    # always valid hex, so only the caller-supplied fields can fail here.
+    from .auth import parse_token_spec
+
+    parse_token_spec(spec)
 
     target = Path(env_file) if env_file is not None else default_env_file()
     env_written = False
@@ -492,13 +510,17 @@ def main(argv: Optional[list] = None) -> int:
 
     if args.command == "mint":
         env_path = Path(args.env_file).expanduser() if args.env_file else default_env_file()
-        out = mint(
-            args.identity,
-            _split_list(args.scopes),
-            _split_list(args.workstreams),
-            env_file=env_path,
-            write_env=bool(args.write_env),
-        )
+        try:
+            out = mint(
+                args.identity,
+                _split_list(args.scopes),
+                _split_list(args.workstreams),
+                env_file=env_path,
+                write_env=bool(args.write_env),
+            )
+        except ValueError as exc:  # invalid scope/identity/workstream — nothing written
+            print(f"error: refusing to mint an invalid token: {exc}", file=sys.stderr)
+            return 2
         # Machine-readable on stdout (token shown once). Never put the secret in .env.
         print(json.dumps(out, indent=2))
         if out["env_written"]:
