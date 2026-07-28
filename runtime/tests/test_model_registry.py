@@ -18,9 +18,9 @@ def test_example_registry_loads_and_seeds_shortlist():
     reg = load_registry()
     # The shortlist models from docs/model-shortlist.md are all present.
     for model_id in [
-        "claude-opus-4.8",
+        "claude-opus-4-8",
         "claude-sonnet-5",
-        "claude-haiku-4.5",
+        "claude-haiku-4-5",
         "gemini-3.1-pro",
         "gemini-3.5-flash",
         "gemini-3.1-flash-lite",
@@ -44,9 +44,9 @@ def test_resolve_path_defaults_to_example(tmp_path, monkeypatch):
 
 def test_tiers_are_assigned():
     reg = load_registry()
-    assert reg.get("claude-opus-4.8").tier is Tier.PM
+    assert reg.get("claude-opus-4-8").tier is Tier.PM
     assert reg.get("claude-sonnet-5").tier is Tier.MID
-    assert reg.get("claude-haiku-4.5").tier is Tier.CHEAP
+    assert reg.get("claude-haiku-4-5").tier is Tier.CHEAP
     assert reg.get("text-embedding-005").tier is Tier.EMBEDDING
 
 
@@ -63,7 +63,7 @@ def test_cursor_is_coding_tier_flat_rate_only():
         assert "cursor-composer" not in reg.policy.candidates(tier)
     assert reg.policy.candidates(Tier.CODING)[0] == "cursor-composer"
     # The coding chain carries a metered fallback after the flat-rate substrate.
-    assert "claude-opus-4.8" in reg.policy.candidates(Tier.CODING)
+    assert "claude-opus-4-8" in reg.policy.candidates(Tier.CODING)
 
 
 def test_coding_tier_downshifts_to_mid():
@@ -73,7 +73,7 @@ def test_coding_tier_downshifts_to_mid():
 
 def test_cost_usd_is_tokens_times_registry_price():
     reg = load_registry()
-    opus = reg.get("claude-opus-4.8")  # 5 / 25 per 1M
+    opus = reg.get("claude-opus-4-8")  # 5 / 25 per 1M
     usage = Usage(input_tokens=1_000_000, output_tokens=1_000_000)
     # 1M in * $5 + 1M out * $25 = $30.
     assert cost_usd(opus, usage) == pytest.approx(30.0)
@@ -81,7 +81,7 @@ def test_cost_usd_is_tokens_times_registry_price():
 
 def test_cost_usd_discounts_cached_input():
     reg = load_registry()
-    opus = reg.get("claude-opus-4.8")  # cache_read_multiplier 0.1
+    opus = reg.get("claude-opus-4-8")  # cache_read_multiplier 0.1
     # 1M input, all cached, no output: 1M * $5 * 0.1 = $0.50.
     usage = Usage(input_tokens=1_000_000, cached_tokens=1_000_000, output_tokens=0)
     assert cost_usd(opus, usage) == pytest.approx(0.5)
@@ -106,7 +106,7 @@ def test_policy_tier_for_and_fallback():
 def test_policy_candidates_and_downshift():
     reg = load_registry()
     pol = reg.policy
-    assert pol.candidates(Tier.PM)[0] == "claude-opus-4.8"
+    assert pol.candidates(Tier.PM)[0] == "claude-opus-4-8"
     assert pol.cheaper_tier(Tier.PM) is Tier.MID
     assert pol.cheaper_tier(Tier.MID) is Tier.CHEAP
     # cheap has no cheaper tier configured.

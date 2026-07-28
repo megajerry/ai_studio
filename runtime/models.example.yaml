@@ -21,7 +21,9 @@
 # --- models: the versioned catalog -----------------------------------------
 models:
   # PM / planner / hardest reasoning (quality first).
-  - id: claude-opus-4.8
+  # Anthropic Messages API ids use hyphens (claude-opus-4-8), not dots —
+  # a dotted id returns HTTP 404 "model was not found".
+  - id: claude-opus-4-8
     provider: anthropic
     tier: pm
     price_in: 5.0
@@ -97,7 +99,7 @@ models:
     provenance_date: "2026-07-24"
 
   # Router / classifier / extraction / high-volume (cheap & fast).
-  - id: claude-haiku-4.5
+  - id: claude-haiku-4-5
     provider: anthropic
     tier: cheap
     price_in: 1.0
@@ -192,10 +194,10 @@ routing:
   # so coding/agentic work is never blocked on Cursor. cursor-composer appears in
   # NO other tier, so it can never be selected for cheap/classify/extract/embed.
   tiers:
-    pm: [claude-opus-4.8, gemini-3.1-pro]
+    pm: [claude-opus-4-8, gemini-3.1-pro]
     mid: [claude-sonnet-5, gemini-3.5-flash, deepseek-v4.5]
-    coding: [cursor-composer, claude-opus-4.8]
-    cheap: [claude-haiku-4.5, gemini-3.1-flash-lite]
+    coding: [cursor-composer, claude-opus-4-8]
+    cheap: [claude-haiku-4-5, gemini-3.1-flash-lite]
     embedding: [text-embedding-005]
 
   # When a call would exceed budget, route down to the cheaper tier instead of

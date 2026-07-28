@@ -767,12 +767,12 @@ def test_fallback_within_budget_still_runs(conn, ws, monkeypatch):
     sink = DbEventSink(conn)
     comp = call_model("builder", "agentic", msgs, quality="high",
                       workstream=ws, registry=None, sink=sink, conn=conn)
-    assert comp.model_id == "claude-opus-4.8"  # served by the fallback
+    assert comp.model_id == "claude-opus-4-8"  # served by the fallback
     # Exactly one NEW model.call was emitted, accounted to the fallback model that
     # actually served (the other model.call is the pre-seeded "m" event).
     served = [
         e for e in read_events(conn, workstream=ws)
-        if e.type == EVENT_MODEL_CALL and e.payload["model"] == "claude-opus-4.8"
+        if e.type == EVENT_MODEL_CALL and e.payload["model"] == "claude-opus-4-8"
     ]
     assert len(served) == 1
     # It accrued (seeded call + this fallback call).

@@ -18,6 +18,7 @@ from runtime.model.providers import (
     ProviderFallback,
     get_adapter,
 )
+from runtime.model.providers.anthropic import _api_model_id
 from runtime.model.providers import cursor_cli as cursor_mod
 
 
@@ -33,10 +34,18 @@ def test_dryrun_is_always_available_and_deterministic():
     p = DryRunProvider()
     assert p.available() is True
     msgs = [{"role": "user", "content": "x" * 400}]
-    a = p.complete("claude-opus-4.8", msgs)
-    b = p.complete("claude-opus-4.8", msgs)
+    a = p.complete("claude-opus-4-8", msgs)
+    b = p.complete("claude-opus-4-8", msgs)
     assert a.text == b.text  # deterministic
     assert a.provider == "dryrun"
+
+
+def test_anthropic_api_model_id_hyphenates_dotted_versions():
+    """Anthropic Messages API rejects dotted ids (404); hyphenate them."""
+    assert _api_model_id("claude-opus-4.8") == "claude-opus-4-8"
+    assert _api_model_id("claude-haiku-4.5") == "claude-haiku-4-5"
+    assert _api_model_id("claude-sonnet-5") == "claude-sonnet-5"
+    assert _api_model_id("claude-opus-4-8") == "claude-opus-4-8"
 
 
 def test_dryrun_synthetic_tokens_scale_with_input():
@@ -244,4 +253,4 @@ def test_adapter_complete_refuses_without_key(monkeypatch):
     # Structural adapters raise (never touch httpx) when their key is absent.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(RuntimeError):
-        AnthropicProvider().complete("claude-opus-4.8", [{"role": "user", "content": "hi"}])
+        AnthropicProvider().complete("claude-opus-4-8", [{"role": "user", "content": "hi"}])

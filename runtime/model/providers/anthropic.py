@@ -13,11 +13,20 @@ import os
 from typing import Any
 
 from ..registry import Usage
-from .base import Completion, Message
+from .base import Completion, Message, ProviderFallback
 
 _API_KEY_ENV = "ANTHROPIC_API_KEY"
 _DEFAULT_BASE = "https://api.anthropic.com"
 _API_VERSION = "2023-06-01"
+
+
+def _api_model_id(model_id: str) -> str:
+    """Map registry ids to Anthropic Messages API ids.
+
+    Anthropic rejects dotted version suffixes (``claude-opus-4.8`` → 404 with a
+    hint for ``claude-opus-4-8``). Hyphenate so a stale catalog still works.
+    """
+    return (model_id or "").replace(".", "-")
 
 
 class AnthropicProvider:
@@ -36,7 +45,7 @@ class AnthropicProvider:
         return bool(os.environ.get(_API_KEY_ENV))
 
     def complete(
-        self, model_id: str, messages: list[Message], *, max_tokens: int = 1024, **opts: Any
+        self, model_id: str, messages: list[Message], *, max_tokens: int = 8192, **opts: Any
     ) -> Completion:
         api_key = os.environ.get(_API_KEY_ENV)
         if not api_key:
@@ -45,13 +54,14 @@ class AnthropicProvider:
             )
         import httpx  # lazy: keyless/dry-run path never needs httpx
 
+        api_model = _api_model_id(model_id)
         # Anthropic wants system prompts as a top-level field, not a message.
         system = "\n".join(
             str(m.get("content", "")) for m in messages if m.get("role") == "system"
         )
         chat = [m for m in messages if m.get("role") != "system"]
         body: dict[str, Any] = {
-            "model": model_id,
+            "model": api_model,
             "max_tokens": max_tokens,
             "messages": chat,
         }
@@ -65,6 +75,12 @@ class AnthropicProvider:
         resp = httpx.post(
             f"{self._base_url}/v1/messages", json=body, headers=headers, timeout=60.0
         )
+        if resp.status_code == 404:
+            # Unknown / retired model — walk the routed tier's fallback chain
+            # rather than killing the whole worker pass.
+            raise ProviderFallback(
+                f"{self.name}: model {api_model!r} not found (HTTP 404)"
+            )
         resp.raise_for_status()
         data = resp.json()
 

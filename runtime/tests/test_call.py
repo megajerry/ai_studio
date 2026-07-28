@@ -52,7 +52,7 @@ def test_model_call_event_has_correctly_computed_cost():
     comp = call_model("pm", "plan", MESSAGES, quality="high", registry=reg, sink=sink)
 
     call_ev = [e for e in sink.events if e.type == EVENT_MODEL_CALL][0]
-    spec = reg.get("claude-opus-4.8")
+    spec = reg.get("claude-opus-4-8")
     expected = cost_usd(spec, comp.usage)
     assert call_ev.payload["cost_usd"] == pytest.approx(expected)
     assert expected > 0
@@ -62,7 +62,7 @@ def test_model_call_event_has_correctly_computed_cost():
         "cached_tokens", "cost_usd", "latency_ms",
     ):
         assert key in call_ev.payload
-    assert call_ev.payload["model"] == "claude-opus-4.8"
+    assert call_ev.payload["model"] == "claude-opus-4-8"
     assert call_ev.payload["role"] == "pm"
 
 
@@ -86,7 +86,7 @@ def test_force_dry_run_overrides_even_with_key(monkeypatch):
     reg = load_registry()
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-real")
     assert isinstance(
-        select_provider(reg.get("claude-opus-4.8"), force_dry_run=True), DryRunProvider
+        select_provider(reg.get("claude-opus-4-8"), force_dry_run=True), DryRunProvider
     )
 
 
@@ -94,7 +94,7 @@ def test_env_dry_run_flag_forces_dryrun(monkeypatch):
     reg = load_registry()
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-real")
     monkeypatch.setenv("MODELS_DRY_RUN", "1")
-    assert isinstance(select_provider(reg.get("claude-opus-4.8")), DryRunProvider)
+    assert isinstance(select_provider(reg.get("claude-opus-4-8")), DryRunProvider)
 
 
 def test_coding_task_routes_to_cursor_dryrun_stub(monkeypatch):
@@ -139,9 +139,9 @@ def test_provider_fallback_falls_back_to_metered_model(monkeypatch):
 
     comp = call_model("builder", "agentic", MESSAGES, quality="high", registry=reg, sink=sink)
     # Fell back to the metered model and produced a real (dry-run) completion.
-    assert comp.model_id == "claude-opus-4.8"
+    assert comp.model_id == "claude-opus-4-8"
     call_ev = [e for e in sink.events if e.type == EVENT_MODEL_CALL][0]
-    assert call_ev.payload["model"] == "claude-opus-4.8"  # accounted to the server
+    assert call_ev.payload["model"] == "claude-opus-4-8"  # accounted to the server
     assert call_ev.payload["provider"] == "dryrun"
 
 
