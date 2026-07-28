@@ -38,14 +38,19 @@ from .conftest import API_TOKEN, make_settings
 
 
 class RecordingRunner:
-    """A mock docker runner: records the argv, never runs anything."""
+    """A mock docker runner: records the argv + timeout, never runs anything."""
 
-    def __init__(self, exit_code: int = 0, stdout: str = "", stderr: str = "") -> None:
+    def __init__(self, exit_code: int = 0, stdout: str = "", stderr: str = "",
+                 timed_out: bool = False) -> None:
         self.calls: list[list[str]] = []
-        self._result = CompletedRun(exit_code=exit_code, stdout=stdout, stderr=stderr)
+        self.timeouts: list[float] = []
+        self._result = CompletedRun(
+            exit_code=exit_code, stdout=stdout, stderr=stderr, timed_out=timed_out
+        )
 
     def __call__(self, argv, timeout):  # type: ignore[no-untyped-def]
         self.calls.append(list(argv))
+        self.timeouts.append(timeout)
         return self._result
 
 
@@ -108,6 +113,72 @@ def test_invalid_service_name_rejected() -> None:
 def test_scale_requires_integer() -> None:
     with pytest.raises(ops_mod.OpsError):
         ops_mod.build_op(["worker", "scale", "lots"])
+
+
+# --- (c bis) per-op timeout: build/up-triggering ops get the long budget -----
+# The compose `runtime` services have `build:` with no prebuilt `image:`, so the
+# FIRST up/start/scale/restart can build for minutes; the quick-op timeout would
+# spuriously return exit 124 / "TIMED OUT" on exactly the remote-start path.
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ["worker", "start"],
+        ["worker", "scale", "3"],
+        ["up", "scheduler"],
+        ["restart", "spokesman"],
+    ],
+)
+def test_build_triggering_ops_use_long_timeout(tokens) -> None:
+    op = ops_mod.build_op(tokens)
+    assert ops_mod.timeout_for(op) == ops_mod.BUILD_TIMEOUT_S
+    runner = RecordingRunner()
+    run_ops(tokens, identity="x", runner=runner, sink=MemoryEventSink())
+    # The long build budget is what actually reaches the runner (both call sites
+    # go through run_ops with no explicit timeout).
+    assert runner.timeouts == [ops_mod.BUILD_TIMEOUT_S]
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ["ps"],
+        ["logs", "worker"],
+        ["worker", "status"],
+        ["worker", "stop"],
+        ["docker", "ps", "-a"],
+    ],
+)
+def test_quick_ops_use_default_timeout(tokens) -> None:
+    op = ops_mod.build_op(tokens)
+    assert ops_mod.timeout_for(op) == ops_mod.DEFAULT_TIMEOUT_S
+    runner = RecordingRunner()
+    run_ops(tokens, identity="x", runner=runner, sink=MemoryEventSink())
+    assert runner.timeouts == [ops_mod.DEFAULT_TIMEOUT_S]
+
+
+def test_explicit_timeout_overrides_per_op_default() -> None:
+    runner = RecordingRunner()
+    run_ops(["worker", "start"], identity="x", runner=runner,
+            sink=MemoryEventSink(), timeout=5.0)
+    assert runner.timeouts == [5.0]
+
+
+def test_long_timeout_is_meaningfully_longer_than_quick() -> None:
+    # Sanity: the build budget must be well beyond the ~60s quick timeout that
+    # was tripping the cold-start use case.
+    assert ops_mod.BUILD_TIMEOUT_S >= 300.0
+    assert ops_mod.BUILD_TIMEOUT_S > ops_mod.DEFAULT_TIMEOUT_S
+
+
+def test_timed_out_render_is_clear() -> None:
+    runner = RecordingRunner(exit_code=124, timed_out=True)
+    result = run_ops(["worker", "start"], identity="x", runner=runner,
+                     sink=MemoryEventSink())
+    rendered = result.render()
+    assert "TIMED OUT" in rendered
+    assert "ops ps" in rendered  # tells the human how to check the real state
 
 
 # --- (d) destructive ops require confirm ------------------------------------
@@ -310,6 +381,43 @@ def test_ops_endpoint_destructive_needs_confirm(settings: Settings, monkeypatch)
     assert len(runner.calls) == 1
 
 
+def test_ops_endpoint_honors_trailing_confirm_token(
+    settings: Settings, monkeypatch
+) -> None:
+    """Confirm consistency with the chat fast-path: a trailing ``confirm`` token
+    in ``args`` confirms the op (and is stripped from the docker argv), instead
+    of being passed through to docker as a stray arg."""
+    runner = RecordingRunner()
+    monkeypatch.setattr(ops_mod, "_subprocess_runner", runner)
+    client = _client(settings)
+    resp = client.post(
+        "/ops",
+        json={"args": "docker system prune -f confirm"},  # no JSON confirm field
+        headers={"X-Spokesman-Token": API_TOKEN},
+    )
+    body = resp.json()
+    assert body["ok"] is True  # confirmed via the trailing token → ran
+    assert body["needs_confirm"] is False
+    # `confirm` was consumed as the confirm signal, NOT passed to docker.
+    assert runner.calls == [["docker", "system", "prune", "-f"]]
+    assert "confirm" not in runner.calls[0]
+
+
+def test_ops_endpoint_confirm_field_still_works(
+    settings: Settings, monkeypatch
+) -> None:
+    """The JSON ``confirm`` field remains a valid confirm source (either works)."""
+    runner = RecordingRunner()
+    monkeypatch.setattr(ops_mod, "_subprocess_runner", runner)
+    resp = _client(settings).post(
+        "/ops",
+        json={"args": "docker system prune -f", "confirm": True},
+        headers={"X-Spokesman-Token": API_TOKEN},
+    )
+    assert resp.json()["ok"] is True
+    assert runner.calls == [["docker", "system", "prune", "-f"]]
+
+
 # --- (b) human fast-path ONLY: the LLM can NEVER invoke ops ------------------
 
 
@@ -333,25 +441,40 @@ def test_ops_fastpath_intercepts_before_the_model(settings: Settings, monkeypatc
     assert runner.calls == [COMPOSE + ["up", "-d", "worker"]]
 
 
-def test_ops_refused_on_unauthorized_channel(settings: Settings, monkeypatch) -> None:
-    """The public webhook path (ops_authorized=False) never runs ops OR the LLM."""
+def test_ops_on_unauthorized_channel_falls_through_to_converse(
+    settings: Settings, monkeypatch
+) -> None:
+    """On an UNAUTHORIZED channel (public webhook / WhatsApp / SMS) an ``ops …``
+    message must NOT run host ops and must NOT be hijacked by a canned refusal —
+    it falls through to the conversational agent so the LLM can respond (e.g.
+    "ops, forgot to mention…"). Host ops stays impossible: the runner is never
+    touched and the model has no ops capability."""
     runner = RecordingRunner()
     monkeypatch.setattr(ops_mod, "_subprocess_runner", runner)
 
-    def _boom(*a, **k):
-        raise AssertionError("LLM path must not run for an ops command")
+    seen: dict = {}
 
-    monkeypatch.setattr("spokesman.converse.handle_conversation", _boom)
+    class _Outcome:
+        intent = "chat"
+        meta: dict = {}
+
+    def _fake_converse(*a, **k):
+        seen["called"] = True
+        return _Outcome()
+
+    monkeypatch.setattr("spokesman.converse.handle_conversation", _fake_converse)
 
     client = FakeClient()
     result = handle_inbound_command(
         settings, client, _raising_connect, _msg("ops worker start"),
         ops_authorized=False,  # default; the webhook uses this
     )
-    assert result["ok"] is False
-    assert result["error"] == "not authorized on this channel"
-    assert runner.calls == []  # nothing ran
-    assert client.sent and "not available on this channel" in client.sent[0]
+    # Reached the model, not the ops handler.
+    assert seen.get("called") is True
+    assert result["command"] == "converse"
+    assert runner.calls == []  # host ops never ran
+    # No canned "not available on this channel" refusal was emitted.
+    assert not any("not available on this channel" in s for s in client.sent)
 
 
 def test_conversational_message_never_reaches_ops(settings: Settings, monkeypatch) -> None:

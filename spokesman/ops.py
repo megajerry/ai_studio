@@ -59,8 +59,18 @@ CRITICAL_SERVICES = ("postgres",)
 
 #: Hard limits.
 DEFAULT_TIMEOUT_S = 60.0
+#: The compose ``runtime`` services declare ``build:`` with no prebuilt
+#: ``image:``, so the FIRST ``up`` / ``worker start`` / ``worker scale`` /
+#: ``restart`` triggers an image build that commonly exceeds the quick-op
+#: timeout. Give build/up-triggering ops a much longer budget so the primary
+#: remote-start use case doesn't return "TIMED OUT" on a cold host.
+BUILD_TIMEOUT_S = 600.0
 MAX_STREAM_CHARS = 4000
 DEFAULT_LOG_TAIL = 200
+
+#: Op actions that can trigger a (first-run) image build / container (re)creation
+#: and therefore need :data:`BUILD_TIMEOUT_S` instead of the quick-op timeout.
+BUILD_ACTIONS = frozenset({"worker.start", "worker.scale", "up", "restart"})
 
 #: A plausible compose service name (never starts with ``-`` so it can't be
 #: mistaken for a flag; no shell metacharacters — argv is passed without a shell).
@@ -138,6 +148,15 @@ class OpsResult:
         if self.stderr:
             body += ("\n" if body else "") + "[stderr]\n" + self.stderr
         body = body.strip()
+        if self.timed_out:
+            # A first-run build/up can outlast even the long budget; the daemon
+            # keeps working after we stop waiting, so tell the human how to check
+            # rather than implying nothing happened.
+            note = (
+                "Timed out waiting; the host may still be building/starting in "
+                "the background. Check with 'ops ps' shortly."
+            )
+            body = f"{body}\n{note}".strip() if body else note
         return f"{head}\n{body}".strip() if body else head
 
 
@@ -414,6 +433,16 @@ def _audit(
         logger.warning("ops.invoked audit emit failed for action=%s", action)
 
 
+def timeout_for(op: ParsedOp) -> float:
+    """The subprocess timeout for a resolved op.
+
+    Build/up-triggering ops (:data:`BUILD_ACTIONS`) get :data:`BUILD_TIMEOUT_S`
+    so a first-run image build on a cold host doesn't spuriously "TIME OUT";
+    quick read/stop ops (ps/logs/status/stop) stay at :data:`DEFAULT_TIMEOUT_S`.
+    """
+    return BUILD_TIMEOUT_S if op.action in BUILD_ACTIONS else DEFAULT_TIMEOUT_S
+
+
 def run_ops(
     tokens: Sequence[str],
     *,
@@ -421,7 +450,7 @@ def run_ops(
     confirm: bool = False,
     runner: Optional[DockerRunner] = None,
     sink: Optional[EventSink] = None,
-    timeout: float = DEFAULT_TIMEOUT_S,
+    timeout: Optional[float] = None,
 ) -> OpsResult:
     """Parse, guard, execute (or block) one ops command, and audit it.
 
@@ -429,6 +458,11 @@ def run_ops(
     ``identity`` is the accountable human (masked channel id / control-plane).
     Destructive ops are blocked unless ``confirm`` is true. Every path emits
     exactly one ``ops.invoked`` audit event.
+
+    ``timeout`` overrides the per-op subprocess budget; when ``None`` (the norm),
+    it is derived from the op via :func:`timeout_for` so build/up-triggering ops
+    get the long build budget and quick ops stay snappy — automatically at both
+    call sites (the chat fast-path and the ``/ops`` endpoint).
     """
     runner = runner or _subprocess_runner
     sink = sink or NullEventSink()
@@ -455,7 +489,8 @@ def run_ops(
             needs_confirm=True, error=reason,
         )
 
-    run = runner(op.argv, timeout)
+    effective_timeout = timeout if timeout is not None else timeout_for(op)
+    run = runner(op.argv, effective_timeout)
     ok = run.exit_code == 0 and not run.timed_out
     _audit(
         sink, action=op.action, argv=op.argv, identity=identity,

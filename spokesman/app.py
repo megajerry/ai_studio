@@ -327,25 +327,19 @@ def handle_inbound_command(
 
     # ADR-0033 — human remote ops control-plane. Parsed on the fast-path BEFORE
     # the model so the conversational LLM can never reach it (invariant #2). Only
-    # runs on a token-gated channel (`ops_authorized`); the public webhook passes
-    # `ops_authorized=False` so host control stays off the public tunnel.
-    if verb == "ops":
+    # short-circuits into real ops on a token-gated channel (`ops_authorized`);
+    # the public webhook passes `ops_authorized=False`, so host control stays off
+    # the public tunnel. On an UNAUTHORIZED channel we do NOT hijack the message
+    # with a canned refusal — a plain conversational line that merely starts with
+    # "ops" (e.g. "ops, forgot to mention…") falls through to converse below, so
+    # the LLM can respond naturally. (Host ops is still impossible there: it never
+    # reaches the runner, and the model has no ops capability.)
+    if verb == "ops" and ops_authorized:
         from runtime.enforce import DbEventSink, NullEventSink
 
         from . import ops as ops_mod
 
         identity = f"{channel_tag}:{mask_number(msg.sender)}"
-        if not ops_authorized:
-            client.send_text(
-                "Ops control-plane is not available on this channel. Use the "
-                "token-gated control plane (kept off the public tunnel).",
-                to=to,
-            )
-            return {
-                "command": "ops",
-                "ok": False,
-                "error": "not authorized on this channel",
-            }
         arg_tokens, confirm = ops_mod.parse_confirm(parts[1:])
         # Best-effort audit sink: ops must still work during a DB outage (exactly
         # when remote recovery matters), so fall back to a null sink.
@@ -704,6 +698,12 @@ def create_app(
         tokens = req.args.strip().split()
         if tokens and tokens[0].lower() == "ops":
             tokens = tokens[1:]  # tolerate a leading `ops` verb
+        # Confirm consistency with the chat fast-path: honor a trailing `confirm`
+        # token in ``args`` as well as the JSON ``confirm`` field, so
+        # ``args="... prune -f confirm"`` confirms the op instead of passing
+        # ``confirm`` through as a docker arg. Either source confirms.
+        tokens, confirm_token = ops_mod.parse_confirm(tokens)
+        confirm = bool(req.confirm) or confirm_token
         ops_conn = None
         try:
             ops_conn = connect()
@@ -712,7 +712,7 @@ def create_app(
         try:
             sink = DbEventSink(ops_conn) if ops_conn is not None else NullEventSink()
             result = ops_mod.run_ops(
-                tokens, identity="control-plane", confirm=req.confirm, sink=sink
+                tokens, identity="control-plane", confirm=confirm, sink=sink
             )
         finally:
             if ops_conn is not None:
