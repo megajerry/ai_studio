@@ -46,6 +46,7 @@ from .config import Settings, get_settings
 from .dashboard import render_dashboard
 from .grounding_gate import relay_claims
 from .privacy import render_privacy_policy
+from .sms_optin import render_sms_opt_in
 from .runtime_bridge import (
     answer,
     dashboard_snapshot,
@@ -458,6 +459,11 @@ def create_app(
     def terms() -> HTMLResponse:
         """Public Terms of Service URL for Twilio / messaging provider consoles."""
         return HTMLResponse(render_terms())
+
+    @app.get("/sms-opt-in", response_class=HTMLResponse)
+    def sms_opt_in() -> HTMLResponse:
+        """Public SMS CTA / consent evidence for A2P campaign review."""
+        return HTMLResponse(render_sms_opt_in())
 
     @app.get("/", response_class=HTMLResponse)
     @app.get("/chat", response_class=HTMLResponse)

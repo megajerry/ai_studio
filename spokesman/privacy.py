@@ -90,8 +90,18 @@ PRIVACY_HTML = """\
     Message transport necessarily involves the messaging provider you configure
     (for example <strong>Twilio</strong> and/or <strong>Meta WhatsApp</strong>).
     Those providers process content and phone numbers under their own terms and
-    privacy policies. We do not share your messaging data with unrelated third
-    parties for marketing.
+    privacy policies solely to deliver the service.
+  </p>
+  <p>
+    <strong>We do not share, sell, or provide your mobile phone number or
+    messaging consent data to third parties or affiliates for marketing or
+    promotional purposes.</strong>
+    We do not sell, rent, or transfer opt-in lists.
+  </p>
+  <p>
+    <strong>Message frequency varies</strong> based on studio activity (approval
+    requests, digests, and alarms).
+    <strong>Message and data rates may apply.</strong>
   </p>
 
   <h2>5. Retention</h2>

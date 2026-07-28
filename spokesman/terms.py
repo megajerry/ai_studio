@@ -79,12 +79,15 @@ TERMS_HTML = """\
 
   <h2>4. Messaging and opt-out</h2>
   <ul>
+    <li>Program name: <strong>Jerry Studio / AI Studio Spokesman</strong>.</li>
+    <li>Purpose: operational approvals, status digests, and alarms for the
+      authorized stakeholder.</li>
     <li>Message frequency varies with studio activity (alerts may be immediate;
       digests may be batched).</li>
     <li>Message and data rates may apply from your carrier.</li>
-    <li>You may opt out by asking the Operator to remove your number, and/or by
-      using provider opt-out keywords where supported (e.g. SMS <code>STOP</code>,
-      WhatsApp sandbox <code>stop</code>).</li>
+    <li>Reply <code>HELP</code> for help; reply <code>STOP</code> to cancel and
+      stop further messages from this program.</li>
+    <li>You may also opt out by asking the Operator to remove your number.</li>
   </ul>
 
   <h2>5. No warranty</h2>
