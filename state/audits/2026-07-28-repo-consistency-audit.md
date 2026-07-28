@@ -30,3 +30,13 @@ events, migrations 0001..0019, gateway security) verified clean.
   via the outer loop instead of failing it cleanly onto the recovery ladder. Worth hardening.
 
 All clean-bug fixes are review-gated; the ADR-0031 item awaits a stakeholder decision.
+
+## Outcome (end of cycle)
+All 3 fix branches independently reviewed and MERGED to main:
+- `29e6b9e` ops-controlplane-fixes (first-run timeout + verb fall-through + /ops confirm) — review APPROVE.
+- `0f1b007` runtime-image-completeness (HIGH: ship spokesman/ + workstreams/; CURSOR key; MODELS_DRY_RUN doc) — review APPROVE (transitive-dep sufficiency proven).
+- `ae8e8a6` gateway-multipin-mint (multi-pin 403 + scoped studio_status + mint validation) — TWO review rounds: first caught a `studio_status` multi-pin cross-workstream aggregate leak; fixed by scoping the aggregate to the token's pin-set; second APPROVE.
+Merged main: key modules import; non-DB suite 284 passed / 83 skipped (DB-down skips only); no regressions.
+
+STILL OPEN (stakeholder decision): ADR-0031 PM-autonomous-commissioning (wire it vs keep manual hook + fix doc) — recommend the latter.
+NOTED follow-up: `run_once` doesn't wrap `handler(ctx)` (a handler crash churns a task instead of failing it cleanly).
