@@ -62,9 +62,20 @@ def test_spokesman_prep_import_chain_resolves():
         "rich",
     }
     # Force a fresh, guarded import (a prior test may have cached these).
-    for name in list(sys.modules):
-        if name.split(".")[0] in blocked or name.split(".")[0] == "spokesman":
-            del sys.modules[name]
+    # Snapshot the modules we evict so we can restore them afterwards — otherwise
+    # this test leaks a stale, freshly-imported `spokesman.*` into `sys.modules`
+    # that no longer matches references other test files bound at collection time
+    # (e.g. `spokesman/tests/test_ops.py` monkeypatches its own `spokesman.ops`,
+    # but `spokesman.app` lazily re-imports the leaked module → the mock is
+    # bypassed and the real docker runner runs). Test-isolation only: production
+    # never surgically deletes `sys.modules`.
+    def _is_target(name: str) -> bool:
+        head = name.split(".")[0]
+        return head in blocked or head == "spokesman"
+
+    saved = {name: sys.modules[name] for name in list(sys.modules) if _is_target(name)}
+    for name in saved:
+        del sys.modules[name]
 
     real_import = builtins.__import__
 
@@ -84,6 +95,11 @@ def test_spokesman_prep_import_chain_resolves():
         assert callable(run_prep_task)
     finally:
         builtins.__import__ = real_import
+        # Drop anything imported under the guard, then restore the originals so
+        # `sys.modules` is byte-for-byte what it was before this test ran.
+        for name in [n for n in list(sys.modules) if _is_target(n)]:
+            del sys.modules[name]
+        sys.modules.update(saved)
 
 
 def _load_compose() -> dict:
